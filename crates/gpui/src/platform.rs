@@ -247,6 +247,24 @@ pub trait Platform: 'static {
     fn thermal_state(&self) -> ThermalState;
     fn on_thermal_state_change(&self, callback: Box<dyn FnMut()>);
 
+    /// Whether the operating system requests reduced motion: its accessibility
+    /// setting that turns off non-essential animation.
+    ///
+    /// A platform with no such setting returns `false`. The call returns
+    /// without waiting for the operating system: a platform that reads the
+    /// setting asynchronously returns `false` until the read completes and
+    /// then reports the value as a change. On Linux the read is a request to
+    /// the XDG desktop portal.
+    fn reduce_motion(&self) -> bool;
+
+    /// Registers the callback invoked on the main thread, outside any borrow
+    /// of the app, after the value of [`Platform::reduce_motion`] may have
+    /// changed. The platform may invoke it when the value is unchanged; the
+    /// caller compares the value with the previous one.
+    ///
+    /// A platform with no reduced-motion setting drops the callback.
+    fn on_reduce_motion_change(&self, callback: Box<dyn FnMut()>);
+
     /// Sets the application's process-wide identity and user-visible name.
     ///
     /// The identifier is used for platform identity mechanisms such as the

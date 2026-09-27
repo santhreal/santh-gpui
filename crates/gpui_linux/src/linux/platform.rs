@@ -1,4 +1,5 @@
 use std::{
+    cell::{Cell, RefCell},
     env,
     path::{Path, PathBuf},
     rc::Rc,
@@ -133,6 +134,11 @@ pub(crate) struct LinuxCommon {
     )]
     wake_sender: Sender<()>,
     wake_listener_started: bool,
+    reduce_motion: Rc<SystemReduceMotion>,
+    /// Portal answers that wait for the first read of the preference; `None`
+    /// once that read has taken them over.
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    reduce_motion_startup: Option<smol::channel::Receiver<bool>>,
 }
 
 impl LinuxCommon {
@@ -156,6 +162,8 @@ impl LinuxCommon {
         let dispatcher = Arc::new(LinuxDispatcher::new(main_sender));
 
         let background_executor = BackgroundExecutor::new(dispatcher.clone());
+        #[cfg(any(feature = "wayland", feature = "x11"))]
+        let reduce_motion_startup = Some(watch_reduced_motion_in_background(&background_executor));
 
         let common = LinuxCommon {
             background_executor,
@@ -172,6 +180,9 @@ impl LinuxCommon {
             ),
             wake_sender,
             wake_listener_started: false,
+            reduce_motion: Rc::default(),
+            #[cfg(any(feature = "wayland", feature = "x11"))]
+            reduce_motion_startup,
         };
 
         (common, main_receiver, wake_receiver)
@@ -200,7 +211,117 @@ impl LinuxCommon {
             self.callbacks.system_wake = Some(callback);
         }
     }
+
+    /// The reduced-motion preference of the system: `false` until the XDG
+    /// desktop portal answers. The first read takes an answer that has
+    /// already arrived and never waits for one; a later answer applies as a
+    /// change.
+    pub(crate) fn reduce_motion(&mut self) -> bool {
+        #[cfg(any(feature = "wayland", feature = "x11"))]
+        self.finish_reduce_motion_startup();
+        self.reduce_motion.reduce_motion.get()
+    }
+
+    /// Registers the callback invoked after the reduced-motion preference
+    /// changes, including when the first answer of the XDG desktop portal
+    /// arrives after the first read. Without the portal, which the `wayland`
+    /// and `x11` features include, the preference never changes and the
+    /// callback is dropped.
+    pub(crate) fn on_reduce_motion_change(&mut self, callback: Box<dyn FnMut()>) {
+        #[cfg(any(feature = "wayland", feature = "x11"))]
+        {
+            self.finish_reduce_motion_startup();
+            *self.reduce_motion.on_change.borrow_mut() = Some(callback);
+        }
+        #[cfg(not(any(feature = "wayland", feature = "x11")))]
+        drop(callback);
+    }
+
+    /// Hands the portal answers of [`watch_reduced_motion_in_background`] to
+    /// [`SystemReduceMotion::follow`] once, at the first read of the
+    /// preference or registration of its change callback.
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    fn finish_reduce_motion_startup(&mut self) {
+        if let Some(answers) = self.reduce_motion_startup.take() {
+            self.reduce_motion
+                .follow(answers, &self.foreground_executor);
+        }
+    }
 }
+
+/// Starts reading the reduced-motion preference of the XDG desktop portal on
+/// `executor` and returns the receiver of its answers. Started with the
+/// platform so that the portal round-trip overlaps the client setup.
+#[cfg(any(feature = "wayland", feature = "x11"))]
+fn watch_reduced_motion_in_background(
+    executor: &BackgroundExecutor,
+) -> smol::channel::Receiver<bool> {
+    let (sender, receiver) = smol::channel::unbounded();
+    executor
+        .spawn(async move {
+            if let Err(error) = crate::linux::xdg_desktop_portal::watch_reduced_motion(sender).await
+            {
+                log::debug!("no reduced-motion preference from the XDG desktop portal: {error:?}");
+            }
+        })
+        .detach();
+    receiver
+}
+
+/// The reduced-motion preference of the system as last read on the main
+/// thread, and the callback invoked when it changes.
+#[derive(Default)]
+pub(crate) struct SystemReduceMotion {
+    reduce_motion: Cell<bool>,
+    #[cfg_attr(not(any(feature = "wayland", feature = "x11")), allow(dead_code))]
+    on_change: RefCell<Option<Box<dyn FnMut()>>>,
+}
+
+#[cfg_attr(not(any(feature = "wayland", feature = "x11")), allow(dead_code))]
+impl SystemReduceMotion {
+    /// Records `reduce_motion` and invokes the change callback when it differs
+    /// from the recorded value.
+    fn set(&self, reduce_motion: bool) {
+        if self.reduce_motion.replace(reduce_motion) == reduce_motion {
+            return;
+        }
+        let callback = self.on_change.borrow_mut().take();
+        if let Some(mut callback) = callback {
+            callback();
+            self.on_change.borrow_mut().get_or_insert(callback);
+        }
+    }
+
+    /// Applies the portal `answers`: an answer that has already arrived at
+    /// once, without waiting, and every later answer on the main thread
+    /// through `executor`. The first read runs on the main thread before the
+    /// first window, and a portal that D-Bus starts on demand answers after
+    /// about 100 ms; that answer applies as a change.
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    fn follow(
+        self: &Rc<Self>,
+        answers: smol::channel::Receiver<bool>,
+        executor: &ForegroundExecutor,
+    ) {
+        if let Ok(reduce_motion) = answers.try_recv() {
+            self.set(reduce_motion);
+        }
+        let state = Rc::downgrade(self);
+        executor
+            .spawn(async move {
+                while let Ok(reduce_motion) = answers.recv().await {
+                    let Some(state) = state.upgrade() else {
+                        break;
+                    };
+                    state.set(reduce_motion);
+                }
+            })
+            .detach();
+    }
+}
+
+#[cfg(all(test, any(feature = "wayland", feature = "x11")))]
+mod reduce_motion_tests;
 
 #[cfg(all(target_os = "linux", any(feature = "wayland", feature = "x11")))]
 async fn listen_for_system_wake(wake_sender: Sender<()>) -> anyhow::Result<()> {
@@ -262,6 +383,15 @@ impl<P: LinuxClient + 'static> Platform for LinuxPlatform<P> {
 
     fn thermal_state(&self) -> ThermalState {
         ThermalState::Nominal
+    }
+
+    fn reduce_motion(&self) -> bool {
+        self.inner.with_common(|common| common.reduce_motion())
+    }
+
+    fn on_reduce_motion_change(&self, callback: Box<dyn FnMut()>) {
+        self.inner
+            .with_common(|common| common.on_reduce_motion_change(callback));
     }
 
     fn run(&self, on_finish_launching: Box<dyn FnOnce()>) {
@@ -1296,6 +1426,39 @@ mod tests {
             zero,
             Point::new(px(5.0), px(5.1))
         ),);
+    }
+
+    /// WHY: closes the class "the Linux platform reports a reduced-motion
+    /// change that did not happen, or drops the change callback after its
+    /// first call". Not caught: the portal reads, tested in
+    /// `xdg_desktop_portal`, and the delivery from the portal task to the main
+    /// thread.
+    #[test]
+    fn system_reduce_motion_calls_back_once_per_change_and_keeps_the_callback() {
+        let state = SystemReduceMotion::default();
+        let calls = Rc::new(Cell::new(0));
+        *state.on_change.borrow_mut() = Some(Box::new({
+            let calls = calls.clone();
+            move || calls.set(calls.get() + 1)
+        }));
+        // (portal preference, callback calls after it)
+        let steps = [
+            (false, 0),
+            (true, 1),
+            (true, 1),
+            (false, 2),
+            (false, 2),
+            (true, 3),
+        ];
+        for (reduce_motion, expected_calls) in steps {
+            state.set(reduce_motion);
+            assert_eq!(state.reduce_motion.get(), reduce_motion);
+            assert_eq!(
+                calls.get(),
+                expected_calls,
+                "calls after the portal reports {reduce_motion}"
+            );
+        }
     }
 
     #[cfg(any(feature = "wayland", feature = "x11"))]

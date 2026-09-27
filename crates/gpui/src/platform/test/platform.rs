@@ -16,7 +16,7 @@ use collections::VecDeque;
 use futures::channel::oneshot;
 use parking_lot::Mutex;
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     path::{Path, PathBuf},
     rc::{Rc, Weak},
     sync::Arc,
@@ -40,6 +40,8 @@ pub(crate) struct TestPlatform {
     screen_capture_sources: RefCell<Vec<TestScreenCaptureSource>>,
     pub opened_url: RefCell<Option<String>>,
     pub(crate) system_notifications: RefCell<TestSystemNotifications>,
+    reduce_motion: Cell<bool>,
+    reduce_motion_change: RefCell<Option<Box<dyn FnMut()>>>,
     pub text_system: Arc<dyn PlatformTextSystem>,
     pub expect_restart:
         RefCell<Option<oneshot::Sender<(Option<PathBuf>, Vec<std::ffi::OsString>)>>>,
@@ -158,6 +160,8 @@ impl TestPlatform {
             weak: weak.clone(),
             opened_url: Default::default(),
             system_notifications: Default::default(),
+            reduce_motion: Cell::new(false),
+            reduce_motion_change: RefCell::new(None),
             text_system,
             headless_renderer_factory,
         })
@@ -345,6 +349,22 @@ impl TestPlatform {
                 .get_or_insert(callback);
         }
     }
+
+    /// Sets the reduced-motion preference of the simulated operating system
+    /// and invokes the callback of [`Platform::on_reduce_motion_change`],
+    /// also when the preference is unchanged, as a platform that reports every
+    /// change of its accessibility settings does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn simulate_reduce_motion_change(&self, reduce_motion: bool) {
+        self.reduce_motion.set(reduce_motion);
+        let callback = self.reduce_motion_change.borrow_mut().take();
+        if let Some(mut callback) = callback {
+            callback();
+            self.reduce_motion_change
+                .borrow_mut()
+                .get_or_insert(callback);
+        }
+    }
 }
 
 impl Platform for TestPlatform {
@@ -374,6 +394,14 @@ impl Platform for TestPlatform {
 
     fn thermal_state(&self) -> ThermalState {
         ThermalState::Nominal
+    }
+
+    fn reduce_motion(&self) -> bool {
+        self.reduce_motion.get()
+    }
+
+    fn on_reduce_motion_change(&self, callback: Box<dyn FnMut()>) {
+        *self.reduce_motion_change.borrow_mut() = Some(callback);
     }
 
     fn run(&self, _on_finish_launching: Box<dyn FnOnce()>) {

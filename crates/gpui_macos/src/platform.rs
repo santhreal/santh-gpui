@@ -158,6 +158,11 @@ unsafe fn build_classes() {
                 on_system_wake as extern "C" fn(&mut Object, Sel, id),
             );
 
+            decl.add_method(
+                sel!(onReduceMotionChange:),
+                on_reduce_motion_change as extern "C" fn(&mut Object, Sel, id),
+            );
+
             decl.register()
         }
     }
@@ -177,6 +182,7 @@ pub(crate) struct MacPlatformState {
     on_keyboard_layout_change: Option<Box<dyn FnMut()>>,
     on_thermal_state_change: Option<Box<dyn FnMut()>>,
     on_system_wake: Option<Box<dyn FnMut()>>,
+    on_reduce_motion_change: Option<Box<dyn FnMut()>>,
     system_wake_observer_registered: bool,
     quit: Option<Box<dyn FnMut() -> bool>>,
     menu_command: Option<Box<dyn FnMut(&dyn Action)>>,
@@ -233,6 +239,7 @@ impl MacPlatform {
             on_keyboard_layout_change: None,
             on_thermal_state_change: None,
             on_system_wake: None,
+            on_reduce_motion_change: None,
             system_wake_observer_registered: false,
             menus: None,
             keyboard_mapper,
@@ -1001,6 +1008,21 @@ impl Platform for MacPlatform {
         }
     }
 
+    fn reduce_motion(&self) -> bool {
+        // SAFETY: sharedWorkspace returns the process-wide NSWorkspace, which
+        // responds to accessibilityDisplayShouldReduceMotion on macOS 10.12
+        // and later.
+        unsafe {
+            let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+            let reduce_motion: BOOL = msg_send![workspace, accessibilityDisplayShouldReduceMotion];
+            reduce_motion == YES
+        }
+    }
+
+    fn on_reduce_motion_change(&self, callback: Box<dyn FnMut()>) {
+        self.0.lock().on_reduce_motion_change = Some(callback);
+    }
+
     fn show_system_notification(&self, notification: gpui::SystemNotification) {
         let mut state = self.0.lock();
         let executor = state.foreground_executor.clone();
@@ -1300,6 +1322,16 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
             object: process_info
         ];
 
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let workspace_center: *mut Object = msg_send![workspace, notificationCenter];
+        let accessibility_name =
+            ns_string("NSWorkspaceAccessibilityDisplayOptionsDidChangeNotification");
+        let _: () = msg_send![workspace_center, addObserver: this as id
+            selector: sel!(onReduceMotionChange:)
+            name: accessibility_name
+            object: nil
+        ];
+
         let observer = this as *mut Object as id;
         let platform = get_mac_platform(this);
         let callback = {
@@ -1410,6 +1442,34 @@ extern "C" fn on_system_wake(this: &mut Object, _: Sel, _: id) {
             drop(lock);
             callback();
             platform.0.lock().on_system_wake.get_or_insert(callback);
+        }
+    }
+}
+
+extern "C" fn on_reduce_motion_change(this: &mut Object, _: Sel, _: id) {
+    // SAFETY: this is the registered app delegate carrying MAC_PLATFORM_IVAR.
+    let platform = unsafe { get_mac_platform(this) };
+    let platform_ptr = platform as *const MacPlatform as *mut c_void;
+    // The notification center delivers the notification synchronously, possibly
+    // while the App RefCell is borrowed; the callback runs on the next run loop
+    // iteration.
+    // SAFETY: platform lives for the process lifetime while callbacks are registered.
+    unsafe {
+        DispatchQueue::main().exec_async_f(platform_ptr, on_reduce_motion_change);
+    }
+
+    extern "C" fn on_reduce_motion_change(context: *mut c_void) {
+        // SAFETY: context is the MacPlatform pointer queued above.
+        let platform = unsafe { &*(context as *const MacPlatform) };
+        let mut lock = platform.0.lock();
+        if let Some(mut callback) = lock.on_reduce_motion_change.take() {
+            drop(lock);
+            callback();
+            platform
+                .0
+                .lock()
+                .on_reduce_motion_change
+                .get_or_insert(callback);
         }
     }
 }

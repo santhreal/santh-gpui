@@ -899,6 +899,23 @@ impl App {
             }
         }));
 
+        let mut system_reduce_motion = platform.reduce_motion();
+        app.borrow_mut().set_reduce_motion(system_reduce_motion);
+        platform.on_reduce_motion_change(Box::new({
+            let app = Rc::downgrade(&app);
+            move || {
+                if let Some(app) = app.upgrade() {
+                    let cx = &mut app.borrow_mut();
+                    let reduce_motion = cx.platform.reduce_motion();
+                    // A flag the app set holds until the system preference changes.
+                    if reduce_motion != system_reduce_motion {
+                        system_reduce_motion = reduce_motion;
+                        cx.update(|cx| cx.set_reduce_motion(reduce_motion));
+                    }
+                }
+            }
+        }));
+
         platform.on_system_wake(Box::new({
             let app = Rc::downgrade(&app);
             move || {

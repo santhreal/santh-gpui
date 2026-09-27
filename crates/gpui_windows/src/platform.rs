@@ -86,6 +86,7 @@ struct PlatformCallbacks {
     validate_app_menu_command: Cell<Option<Box<dyn FnMut(&dyn Action) -> bool>>>,
     keyboard_layout_change: Cell<Option<Box<dyn FnMut()>>>,
     system_wake: Cell<Option<Box<dyn FnMut()>>>,
+    reduce_motion_change: Cell<Option<Box<dyn FnMut()>>>,
 }
 
 impl WindowsPlatformState {
@@ -442,6 +443,22 @@ impl Platform for WindowsPlatform {
 
     fn thermal_state(&self) -> ThermalState {
         ThermalState::Nominal
+    }
+
+    fn reduce_motion(&self) -> bool {
+        system_reduce_motion()
+    }
+
+    /// Registers `callback` for changes of the "Show animations in Windows"
+    /// setting. The message-only platform window receives no broadcast
+    /// `WM_SETTINGCHANGE`, so each open window forwards the change; a change
+    /// while no window is open invokes no callback.
+    fn on_reduce_motion_change(&self, callback: Box<dyn FnMut()>) {
+        self.inner
+            .state
+            .callbacks
+            .reduce_motion_change
+            .set(Some(callback));
     }
 
     fn run(&self, on_finish_launching: Box<dyn 'static + FnOnce()>) {
@@ -1006,6 +1023,7 @@ impl WindowsPlatformInner {
             | WM_GPUI_DOCK_MENU_ACTION
             | WM_GPUI_KEYBOARD_LAYOUT_CHANGED
             | WM_GPUI_GPU_DEVICE_LOST
+            | WM_GPUI_REDUCE_MOTION_CHANGED
             | WM_GPUI_END_SESSION => self.handle_gpui_events(msg, wparam, lparam),
             WM_POWERBROADCAST => self.handle_power_broadcast(wparam),
             _ => None,
@@ -1030,6 +1048,7 @@ impl WindowsPlatformInner {
             WM_GPUI_TASK_DISPATCHED_ON_MAIN_THREAD => self.run_foreground_task(),
             WM_GPUI_DOCK_MENU_ACTION => self.handle_dock_action_event(lparam.0 as _),
             WM_GPUI_KEYBOARD_LAYOUT_CHANGED => self.handle_keyboard_layout_change(),
+            WM_GPUI_REDUCE_MOTION_CHANGED => self.handle_reduce_motion_change(),
             WM_GPUI_GPU_DEVICE_LOST => self.handle_device_lost(lparam),
             WM_GPUI_END_SESSION => self.handle_end_session(),
             _ => unreachable!(),
@@ -1158,6 +1177,14 @@ impl WindowsPlatformInner {
     fn handle_keyboard_layout_change(&self) -> Option<isize> {
         self.with_callback(
             |callbacks| &callbacks.keyboard_layout_change,
+            |callback| callback(),
+        );
+        Some(0)
+    }
+
+    fn handle_reduce_motion_change(&self) -> Option<isize> {
+        self.with_callback(
+            |callbacks| &callbacks.reduce_motion_change,
             |callback| callback(),
         );
         Some(0)

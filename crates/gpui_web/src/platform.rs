@@ -50,6 +50,7 @@ pub struct WebPlatform {
     cursor_visible: Rc<Cell<bool>>,
     last_cursor_css: Rc<Cell<&'static str>>,
     _cursor_restore_listeners: Vec<EventListenerHandle>,
+    reduce_motion_listener: RefCell<Option<EventListenerHandle>>,
 }
 
 struct PreparedWebWindow {
@@ -170,6 +171,7 @@ impl WebPlatform {
             cursor_visible,
             last_cursor_css,
             _cursor_restore_listeners: cursor_restore_listeners,
+            reduce_motion_listener: RefCell::new(None),
         }
     }
 
@@ -185,6 +187,18 @@ impl WebPlatform {
     ) -> anyhow::Result<FetchHttpClient> {
         FetchHttpClient::with_user_agent(self.dispatcher.clone(), user_agent)
     }
+}
+
+/// The media query that matches when the browser requests reduced motion.
+const REDUCED_MOTION_QUERY: &str = "(prefers-reduced-motion: reduce)";
+
+/// The [`REDUCED_MOTION_QUERY`] list of `browser_window`, or `None` when the
+/// browser does not evaluate media queries.
+fn reduced_motion_query(browser_window: &web_sys::Window) -> Option<web_sys::MediaQueryList> {
+    browser_window
+        .match_media(REDUCED_MOTION_QUERY)
+        .ok()
+        .flatten()
 }
 
 async fn initialize_graphics(
@@ -490,6 +504,25 @@ impl Platform for WebPlatform {
 
     fn on_thermal_state_change(&self, callback: Box<dyn FnMut()>) {
         self.callbacks.borrow_mut().thermal_state_change = Some(callback);
+    }
+
+    fn reduce_motion(&self) -> bool {
+        reduced_motion_query(&self.browser_window).is_some_and(|query| query.matches())
+    }
+
+    /// Registers `callback` as the `change` listener of the
+    /// `(prefers-reduced-motion: reduce)` media query. A browser that does not
+    /// evaluate media queries reports no preference, registers nothing, and
+    /// drops `callback`.
+    fn on_reduce_motion_change(&self, mut callback: Box<dyn FnMut()>) {
+        let Some(query) = reduced_motion_query(&self.browser_window) else {
+            return;
+        };
+        *self.reduce_motion_listener.borrow_mut() = Some(EventListenerHandle::add(
+            query.as_ref(),
+            "change",
+            move |_event: JsValue| callback(),
+        ));
     }
 
     fn compositor_name(&self) -> &'static str {

@@ -9,7 +9,8 @@
 //! - The app-wide [`MotionPolicy`], read with
 //!   [`App::motion_policy`](crate::App::motion_policy) and set with
 //!   [`App::set_motion_policy`](crate::App::set_motion_policy).
-//!   [`App::reduce_motion`](crate::App::reduce_motion) reads its reduced flag.
+//!   [`App::reduce_motion`](crate::App::reduce_motion) reads its reduced flag,
+//!   which follows the reduced-motion preference of the operating system.
 //! - [`MotionDriver`], [`MotionFrame`], and [`Advance`]: frame driving for a
 //!   view. The view requests the next animation frame while one of its motion
 //!   values moves and requests none once every value is at rest. A value
@@ -37,6 +38,8 @@
 mod clock;
 mod drive;
 mod policy;
+#[cfg(test)]
+mod system_preference_tests;
 #[cfg(test)]
 mod tests;
 

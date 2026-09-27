@@ -261,4 +261,15 @@ impl Platform for VisualTestPlatform {
     }
 
     fn on_thermal_state_change(&self, _callback: Box<dyn FnMut()>) {}
+
+    /// Visual tests capture full motion on every host, whatever the host's
+    /// reduced-motion preference. A test that captures reduced motion sets it
+    /// with [`App::set_reduce_motion`](crate::App::set_reduce_motion).
+    fn reduce_motion(&self) -> bool {
+        false
+    }
+
+    /// The host preference does not reach visual tests, so the callback is
+    /// dropped.
+    fn on_reduce_motion_change(&self, _callback: Box<dyn FnMut()>) {}
 }

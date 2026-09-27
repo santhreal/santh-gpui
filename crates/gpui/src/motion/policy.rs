@@ -11,8 +11,18 @@ impl Global for AppMotionPolicy {}
 
 impl App {
     /// The motion policy of the app: reduced motion and the duration scale.
-    /// [`MotionPolicy::DEFAULT`], full motion at authored speed, until
-    /// [`App::set_motion_policy`] sets another.
+    ///
+    /// The reduced flag follows the reduced-motion preference of the
+    /// operating system, read with [`Platform::reduce_motion`]: the app starts
+    /// with the flag set to the system preference, and each change of the
+    /// preference sets the flag to the new value and keeps the duration scale.
+    /// On Linux the app starts with the flag unset when the XDG desktop portal
+    /// has not answered yet; the answer of the portal applies as a change.
+    /// [`App::set_reduce_motion`] and [`App::set_motion_policy`] set the flag
+    /// until the next change of the system preference. The duration scale is
+    /// 1 until [`App::set_motion_policy`] sets another.
+    ///
+    /// [`Platform::reduce_motion`]: crate::Platform::reduce_motion
     pub fn motion_policy(&self) -> MotionPolicy {
         self.try_global::<AppMotionPolicy>()
             .map_or(MotionPolicy::DEFAULT, |policy| policy.0)

@@ -189,3 +189,162 @@ fn window_appearance_from_color_scheme(cs: ColorScheme) -> WindowAppearance {
         ColorScheme::NoPreference => WindowAppearance::Light,
     }
 }
+
+const APPEARANCE_NAMESPACE: &str = "org.freedesktop.appearance";
+const REDUCED_MOTION_KEY: &str = "reduced-motion";
+const GNOME_INTERFACE_NAMESPACE: &str = "org.gnome.desktop.interface";
+const ENABLE_ANIMATIONS_KEY: &str = "enable-animations";
+
+/// The portal settings that select the reduced-motion preference.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MotionSettings {
+    /// `org.freedesktop.appearance` `reduced-motion`, when the portal has the
+    /// key: `1` requests reduced motion, any other value requests none.
+    pub(crate) reduced_motion: Option<u32>,
+    /// `org.gnome.desktop.interface` `enable-animations`, when the portal has
+    /// the key: `false` requests reduced motion.
+    pub(crate) enable_animations: Option<bool>,
+}
+
+/// A new value of one of the [`MotionSettings`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MotionSetting {
+    ReducedMotion(u32),
+    EnableAnimations(bool),
+}
+
+impl MotionSettings {
+    /// Whether the settings request reduced motion. `reduced-motion` takes
+    /// precedence over `enable-animations`; with neither key the result is
+    /// `false`.
+    pub(crate) fn reduce_motion(self) -> bool {
+        match (self.reduced_motion, self.enable_animations) {
+            (Some(reduced_motion), _) => reduced_motion == 1,
+            (None, Some(enable_animations)) => !enable_animations,
+            (None, None) => false,
+        }
+    }
+
+    /// Records `setting` and returns the reduced-motion preference when the
+    /// new value changed it.
+    pub(crate) fn apply(&mut self, setting: MotionSetting) -> Option<bool> {
+        let before = self.reduce_motion();
+        match setting {
+            MotionSetting::ReducedMotion(value) => self.reduced_motion = Some(value),
+            MotionSetting::EnableAnimations(value) => self.enable_animations = Some(value),
+        }
+        let after = self.reduce_motion();
+        (after != before).then_some(after)
+    }
+}
+
+/// Sends the reduced-motion preference of the portal to `sender`: the
+/// preference once the portal answers, then each change of it. Returns an
+/// error when the portal is unavailable or `sender` has no receiver, and
+/// returns `Ok` when the portal stops sending changes.
+pub(crate) async fn watch_reduced_motion(
+    sender: smol::channel::Sender<bool>,
+) -> anyhow::Result<()> {
+    let settings = Settings::new().await?;
+    // Subscribing before the reads keeps a change made between the two.
+    let reduced_motion_changed = settings
+        .receive_setting_changed_with_args::<u32>(APPEARANCE_NAMESPACE, REDUCED_MOTION_KEY)
+        .await?
+        .map(|value| value.map(MotionSetting::ReducedMotion));
+    let enable_animations_changed = settings
+        .receive_setting_changed_with_args::<bool>(GNOME_INTERFACE_NAMESPACE, ENABLE_ANIMATIONS_KEY)
+        .await?
+        .map(|value| value.map(MotionSetting::EnableAnimations));
+    let mut changes = std::pin::pin!(reduced_motion_changed.or(enable_animations_changed));
+
+    let mut motion = MotionSettings {
+        reduced_motion: settings
+            .read::<u32>(APPEARANCE_NAMESPACE, REDUCED_MOTION_KEY)
+            .await
+            .ok(),
+        enable_animations: settings
+            .read::<bool>(GNOME_INTERFACE_NAMESPACE, ENABLE_ANIMATIONS_KEY)
+            .await
+            .ok(),
+    };
+    sender.send(motion.reduce_motion()).await?;
+
+    while let Some(setting) = changes.next().await {
+        match setting {
+            Ok(setting) => {
+                if let Some(reduce_motion) = motion.apply(setting) {
+                    sender.send(reduce_motion).await?;
+                }
+            }
+            Err(error) => {
+                log::warn!("ignoring a reduced-motion setting of the XDG desktop portal: {error}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    //! WHY: closes the class "the portal settings select the wrong
+    //! reduced-motion preference": a misread value, the GNOME key overriding
+    //! the freedesktop key, a missing key read as a request, and a change of
+    //! either key that is dropped or reported without altering the
+    //! preference. Not caught: the D-Bus reads and subscriptions of
+    //! [`watch_reduced_motion`], which need a running portal.
+
+    use super::{MotionSetting, MotionSettings};
+
+    #[test]
+    fn the_freedesktop_key_takes_precedence_and_absent_keys_request_no_reduction() {
+        // (reduced-motion, enable-animations, reduce motion)
+        let cases = [
+            (None, None, false),
+            (None, Some(true), false),
+            (None, Some(false), true),
+            (Some(0), None, false),
+            (Some(1), None, true),
+            (Some(2), None, false),
+            (Some(0), Some(false), false),
+            (Some(0), Some(true), false),
+            (Some(1), Some(true), true),
+            (Some(1), Some(false), true),
+            (Some(2), Some(false), false),
+            (Some(u32::MAX), Some(false), false),
+        ];
+        for (reduced_motion, enable_animations, expected) in cases {
+            let settings = MotionSettings {
+                reduced_motion,
+                enable_animations,
+            };
+            assert_eq!(settings.reduce_motion(), expected, "{settings:?}");
+        }
+    }
+
+    #[test]
+    fn a_change_reports_the_preference_only_when_it_alters_it() {
+        let mut settings = MotionSettings::default();
+        // (setting, reported preference)
+        let steps = [
+            (MotionSetting::EnableAnimations(true), None),
+            (MotionSetting::EnableAnimations(false), Some(true)),
+            (MotionSetting::EnableAnimations(false), None),
+            // The freedesktop key appears and overrides the GNOME key.
+            (MotionSetting::ReducedMotion(0), Some(false)),
+            (MotionSetting::EnableAnimations(true), None),
+            (MotionSetting::EnableAnimations(false), None),
+            (MotionSetting::ReducedMotion(1), Some(true)),
+            (MotionSetting::EnableAnimations(true), None),
+            (MotionSetting::ReducedMotion(2), Some(false)),
+            (MotionSetting::ReducedMotion(0), None),
+        ];
+        for (step, (setting, reported)) in steps.into_iter().enumerate() {
+            let before = settings;
+            assert_eq!(
+                settings.apply(setting),
+                reported,
+                "step {step}: {setting:?} applied to {before:?}"
+            );
+        }
+    }
+}

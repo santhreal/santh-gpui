@@ -397,6 +397,15 @@ impl TestAppContext {
             .simulate_system_notification_response(response);
     }
 
+    /// Simulates the operating system reporting its reduced-motion preference
+    /// as `reduce_motion`. A preference that differs from the previous report
+    /// sets the reduced flag of [`App::motion_policy`] and redraws every
+    /// window; a repeated one has no effect.
+    pub fn simulate_reduce_motion_change(&self, reduce_motion: bool) {
+        self.test_platform
+            .simulate_reduce_motion_change(reduce_motion);
+    }
+
     /// Simulates the user resizing the window to the new size.
     pub fn simulate_window_resize(&self, window_handle: AnyWindowHandle, size: Size<Pixels>) {
         self.test_window(window_handle).simulate_resize(size);
