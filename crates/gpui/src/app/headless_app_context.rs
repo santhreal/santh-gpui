@@ -18,6 +18,8 @@ use crate::{
 };
 use anyhow::Result;
 use image::RgbaImage;
+#[cfg(any(test, feature = "test-support"))]
+use std::rc::Weak;
 use std::{future::Future, rc::Rc, sync::Arc, time::Duration};
 
 /// A cross-platform headless app context for tests that need real text shaping.
@@ -46,9 +48,10 @@ pub struct HeadlessAppContext {
     dispatcher: TestDispatcher,
     text_system: Arc<TextSystem>,
     /// The platform the app runs on, kept to simulate operating-system
-    /// reports.
+    /// reports. Weak, because the platform holds the windows and their input
+    /// handlers, and it must drop with the app before the leak detector runs.
     #[cfg(any(test, feature = "test-support"))]
-    platform: Rc<TestPlatform>,
+    platform: Weak<TestPlatform>,
 }
 
 impl HeadlessAppContext {
@@ -93,7 +96,7 @@ impl HeadlessAppContext {
 
         let http_client = Arc::new(crate::app::NullHttpClient);
         #[cfg(any(test, feature = "test-support"))]
-        let test_platform = platform.clone();
+        let test_platform = Rc::downgrade(&platform);
         let app = App::new_app(platform, asset_source, http_client);
         app.borrow_mut().mode = GpuiMode::Production;
         // The one text system every window in this app shapes through, so a
@@ -163,7 +166,9 @@ impl HeadlessAppContext {
     /// window; a repeated one has no effect.
     #[cfg(any(test, feature = "test-support"))]
     pub fn simulate_reduce_motion_change(&self, reduce_motion: bool) {
-        self.platform.simulate_reduce_motion_change(reduce_motion);
+        if let Some(platform) = self.platform.upgrade() {
+            platform.simulate_reduce_motion_change(reduce_motion);
+        }
     }
 
     /// Updates app state.
@@ -354,5 +359,35 @@ impl AppContext for HeadlessAppContext {
     {
         let app = self.app.borrow();
         app.read_global(callback)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{rc::Rc, sync::Arc};
+
+    use super::HeadlessAppContext;
+    use crate::NoopTextSystem;
+
+    /// WHY: closes the class "the headless context keeps the platform alive
+    /// after the app": the platform holds the windows and their input
+    /// handlers, so a platform that outlives the app keeps the entities those
+    /// handlers hold, and the leak detector panics when the app drops. The app
+    /// drops before the fields declared after it, so a second strong owner
+    /// anywhere in the context is enough. Not caught: a reference the app
+    /// itself leaks.
+    #[test]
+    fn the_app_is_the_only_owner_of_its_platform() {
+        let cx = HeadlessAppContext::new(Arc::new(NoopTextSystem));
+        cx.simulate_reduce_motion_change(true);
+        let owners = Rc::strong_count(&cx.app.borrow().platform);
+        assert_eq!(owners, 1, "something besides the app holds the platform");
+        assert!(cx.app.borrow().reduce_motion());
+        let platform = Rc::downgrade(&cx.app.borrow().platform);
+        drop(cx);
+        assert!(
+            platform.upgrade().is_none(),
+            "the platform outlived the headless context that ran it"
+        );
     }
 }
