@@ -37,11 +37,16 @@ impl From<bool> for PaddedBool32 {
     }
 }
 
-/// One `(z_index, order)` pair per enclosing scope, root first. A layer's
-/// children extend the layer's own key, so they sort after it and before the
-/// next sibling of the layer; two primitives in one scope that do not overlap
-/// share an order and keep batching together.
-type SortKey = SmallVec<[(i32, DrawOrder); 4]>;
+/// One `(z_index, order)` pair per enclosing scope, root first, each packed
+/// by `sort_step`. A layer's children extend the layer's own key, so they
+/// sort after it and before the next sibling of the layer; two primitives in
+/// one scope that do not overlap share an order and keep batching together.
+type SortKey = SmallVec<[u64; 4]>;
+
+/// `(z_index, order)` as one integer that orders as the pair does.
+fn sort_step(z_index: i32, order: DrawOrder) -> u64 {
+    (u64::from(z_index.cast_unsigned() ^ 0x8000_0000) << 32) | u64::from(order)
+}
 
 /// The paint scope a primitive is inserted into: the root, or one layer.
 struct Scope {
@@ -58,6 +63,9 @@ struct Scope {
 struct Rank {
     key: SortKey,
     kind: PrimitiveKind,
+    /// The atlas tile that orders sprites of one draw order; zero for every
+    /// other kind.
+    tile: u32,
     index: u32,
 }
 
@@ -69,6 +77,9 @@ pub struct Scene {
     scopes: Vec<Scope>,
     z_index_stack: Vec<i32>,
     ranks: Vec<Rank>,
+    /// Scratch for `finish`: per kind, the position each primitive moves to,
+    /// indexed by its position before the move.
+    destinations: [Vec<u32>; PrimitiveKind::ALL.len()],
     pub shadows: Vec<Shadow>,
     pub quads: Vec<Quad>,
     pub paths: Vec<Path<ScaledPixels>>,
@@ -133,7 +144,7 @@ impl Scene {
         let z_index = scope.z_index;
         let mut key = scope.prefix.clone();
         let order = self.bounds_trees[tree].insert(bounds);
-        key.push((z_index, order));
+        key.push(sort_step(z_index, order));
         key
     }
 
@@ -197,31 +208,18 @@ impl Scene {
     pub fn push_layer_mask(&mut self, mask: LayerMask) {
         self.open_scope(mask.bounds());
         let key = self.scope_edge_key(i32::MIN, DrawOrder::MIN);
-        let index = self.start_layer_masks.len() as u32;
-        self.ranks.push(Rank {
-            key,
-            kind: PrimitiveKind::StartLayerMask,
-            index,
-        });
-        self.start_layer_masks.push(StartLayerMask {
-            order: 0,
-            mask: mask.clone(),
-        });
-        self.paint_operations
-            .push(PaintOperation::StartLayerMask(mask));
+        let index = self.start_layer_masks.len();
+        self.start_layer_masks
+            .push(StartLayerMask { order: 0, mask });
+        self.record(key, PrimitiveKind::StartLayerMask, 0, index);
     }
 
     /// End the innermost masked subtree.
     pub fn pop_layer_mask(&mut self) {
         let key = self.scope_edge_key(i32::MAX, DrawOrder::MAX);
-        let index = self.end_layer_masks.len() as u32;
-        self.ranks.push(Rank {
-            key,
-            kind: PrimitiveKind::EndLayerMask,
-            index,
-        });
+        let index = self.end_layer_masks.len();
         self.end_layer_masks.push(EndLayerMask { order: 0 });
-        self.paint_operations.push(PaintOperation::EndLayerMask);
+        self.record(key, PrimitiveKind::EndLayerMask, 0, index);
         self.close_scope();
     }
 
@@ -230,116 +228,129 @@ impl Scene {
     /// when it is the maximum, whatever the children's z-indices and bounds.
     fn scope_edge_key(&mut self, z_index: i32, order: DrawOrder) -> SortKey {
         let mut key = self.scope().prefix.clone();
-        key.push((z_index, order));
+        key.push(sort_step(z_index, order));
         key
     }
 
     pub fn insert_primitive(&mut self, primitive: impl Into<Primitive>) {
-        let mut primitive = primitive.into();
-        let clipped_bounds = primitive
-            .transformation()
-            .apply_to_bounds(*primitive.bounds())
-            .intersect(&primitive.content_mask().bounds);
-
-        if clipped_bounds.is_empty() {
-            return;
+        match primitive.into() {
+            Primitive::Shadow(shadow) => self.store(shadow),
+            Primitive::Quad(quad) => self.store(quad),
+            Primitive::Path(path) => self.store(path),
+            Primitive::Underline(underline) => self.store(underline),
+            Primitive::MonochromeSprite(sprite) => self.store(sprite),
+            Primitive::SubpixelSprite(sprite) => self.store(sprite),
+            Primitive::PolychromeSprite(sprite) => self.store(sprite),
+            Primitive::Surface(surface) => self.store(surface),
+            Primitive::BackdropBlur(blur) => self.store(blur),
         }
+    }
 
+    /// Moves `primitive` into the vector of its kind and logs a reference to
+    /// it, unless its content mask clips it away.
+    fn store<P: Stored>(&mut self, primitive: P) {
+        let clipped_bounds = primitive.clipped_bounds();
+        if !clipped_bounds.is_empty() {
+            self.store_visible(primitive, clipped_bounds);
+        }
+    }
+
+    fn store_visible<P: Stored>(&mut self, mut primitive: P, clipped_bounds: Bounds<ScaledPixels>) {
         let key = self.key_for(clipped_bounds);
-        // Orders are provisional until `finish` derives dense draw orders from
-        // the keys; this value only has to be a valid placeholder.
-        let order = 0;
-        let (kind, index) = match &primitive {
-            Primitive::Shadow(_) => (PrimitiveKind::Shadow, self.shadows.len()),
-            Primitive::Quad(_) => (PrimitiveKind::Quad, self.quads.len()),
-            Primitive::Path(_) => (PrimitiveKind::Path, self.paths.len()),
-            Primitive::Underline(_) => (PrimitiveKind::Underline, self.underlines.len()),
-            Primitive::MonochromeSprite(_) => (
-                PrimitiveKind::MonochromeSprite,
-                self.monochrome_sprites.len(),
-            ),
-            Primitive::SubpixelSprite(_) => {
-                (PrimitiveKind::SubpixelSprite, self.subpixel_sprites.len())
-            }
-            Primitive::PolychromeSprite(_) => (
-                PrimitiveKind::PolychromeSprite,
-                self.polychrome_sprites.len(),
-            ),
-            Primitive::Surface(_) => (PrimitiveKind::Surface, self.surfaces.len()),
-            Primitive::BackdropBlur(_) => (PrimitiveKind::BackdropBlur, self.backdrop_blurs.len()),
-        };
+        let tile = primitive.tile();
+        let stored = P::stored_mut(self);
+        let index = stored.len();
+        primitive.stored_at(index);
+        stored.push(primitive);
+        self.record(key, P::KIND, tile, index);
+    }
+
+    /// Ranks the primitive of `kind` at `index` by `key`, and logs a
+    /// reference to it.
+    ///
+    /// Each primitive is stored once, in the vector of its kind. The log holds
+    /// eight bytes per primitive rather than a second copy, and a range of it
+    /// replays from the vectors of the scene that recorded it.
+    fn record(&mut self, key: SortKey, kind: PrimitiveKind, tile: u32, index: usize) {
+        let index = index as u32;
         self.ranks.push(Rank {
             key,
             kind,
-            index: index as u32,
+            tile,
+            index,
         });
-        match &mut primitive {
-            Primitive::Shadow(shadow) => {
-                shadow.order = order;
-                self.shadows.push(*shadow);
-            }
-            Primitive::Quad(quad) => {
-                quad.order = order;
-                self.quads.push(*quad);
-            }
-            Primitive::Path(path) => {
-                path.order = order;
-                path.id = PathId(self.paths.len());
-                self.paths.push(path.clone());
-            }
-            Primitive::Underline(underline) => {
-                underline.order = order;
-                self.underlines.push(*underline);
-            }
-            Primitive::MonochromeSprite(sprite) => {
-                sprite.order = order;
-                self.monochrome_sprites.push(*sprite);
-            }
-            Primitive::SubpixelSprite(sprite) => {
-                sprite.order = order;
-                self.subpixel_sprites.push(*sprite);
-            }
-            Primitive::PolychromeSprite(sprite) => {
-                sprite.order = order;
-                self.polychrome_sprites.push(*sprite);
-            }
-            Primitive::Surface(surface) => {
-                surface.order = order;
-                self.surfaces.push(surface.clone());
-            }
-            Primitive::BackdropBlur(blur) => {
-                blur.order = order;
-                self.backdrop_blurs.push(*blur);
-            }
-        }
         self.paint_operations
-            .push(PaintOperation::Primitive(primitive));
+            .push(PaintOperation::Primitive(PrimitiveRef { kind, index }));
     }
 
     pub fn replay(&mut self, range: Range<usize>, prev_scene: &Scene) {
         for operation in &prev_scene.paint_operations[range] {
-            match operation {
-                PaintOperation::Primitive(primitive) => self.insert_primitive(primitive.clone()),
-                PaintOperation::StartLayer(bounds) => self.push_layer(*bounds),
+            match *operation {
+                PaintOperation::Primitive(PrimitiveRef { kind, index }) => match kind {
+                    PrimitiveKind::Shadow => self.replay_stored::<Shadow>(index, prev_scene),
+                    PrimitiveKind::Quad => self.replay_stored::<Quad>(index, prev_scene),
+                    PrimitiveKind::Path => {
+                        self.replay_stored::<Path<ScaledPixels>>(index, prev_scene)
+                    }
+                    PrimitiveKind::Underline => self.replay_stored::<Underline>(index, prev_scene),
+                    PrimitiveKind::MonochromeSprite => {
+                        self.replay_stored::<MonochromeSprite>(index, prev_scene)
+                    }
+                    PrimitiveKind::SubpixelSprite => {
+                        self.replay_stored::<SubpixelSprite>(index, prev_scene)
+                    }
+                    PrimitiveKind::PolychromeSprite => {
+                        self.replay_stored::<PolychromeSprite>(index, prev_scene)
+                    }
+                    PrimitiveKind::Surface => self.replay_stored::<PaintSurface>(index, prev_scene),
+                    PrimitiveKind::BackdropBlur => {
+                        self.replay_stored::<BackdropBlur>(index, prev_scene)
+                    }
+                    PrimitiveKind::StartLayerMask => self
+                        .push_layer_mask(prev_scene.start_layer_masks[index as usize].mask.clone()),
+                    PrimitiveKind::EndLayerMask => self.pop_layer_mask(),
+                },
+                PaintOperation::StartLayer(bounds) => self.push_layer(bounds),
                 PaintOperation::EndLayer => self.pop_layer(),
-                PaintOperation::PushZIndex(z) => self.push_z_index(*z),
+                PaintOperation::PushZIndex(z_index) => self.push_z_index(z_index),
                 PaintOperation::PopZIndex => self.pop_z_index(),
-                PaintOperation::StartLayerMask(mask) => self.push_layer_mask(mask.clone()),
-                PaintOperation::EndLayerMask => self.pop_layer_mask(),
             }
         }
     }
 
+    /// Clones the primitive at `index` of `prev_scene` straight into the
+    /// vector of its kind. It reached the log of `prev_scene`, so its content
+    /// mask does not clip it away.
+    fn replay_stored<P: Stored>(&mut self, index: u32, prev_scene: &Scene) {
+        let source = &P::stored(prev_scene)[index as usize];
+        self.store_visible(source.clone(), source.clipped_bounds());
+    }
+
     pub fn finish(&mut self) {
-        self.ranks.sort_unstable_by(|a, b| a.key.cmp(&b.key));
+        // The key fixes the draw order. The sort is stable, so primitives of
+        // one kind keep paint order within a key, except that sprites order
+        // by atlas tile first. The position of every primitive is then its
+        // rank among the primitives of its kind.
+        self.ranks
+            .sort_by(|a, b| a.key.cmp(&b.key).then(a.tile.cmp(&b.tile)));
+        let mut destinations = std::mem::take(&mut self.destinations);
+        for kind in PrimitiveKind::ALL {
+            let moves = &mut destinations[kind as usize];
+            moves.clear();
+            moves.resize(self.stored_len(kind), 0);
+        }
+        let mut next = [0u32; PrimitiveKind::ALL.len()];
         let mut order: DrawOrder = 0;
-        let mut previous_key: Option<&SortKey> = None;
-        for rank in &self.ranks {
-            if previous_key.is_some_and(|previous| previous != &rank.key) {
+        for position in 0..self.ranks.len() {
+            if position > 0 && self.ranks[position - 1].key != self.ranks[position].key {
                 order += 1;
             }
-            previous_key = Some(&rank.key);
+            let rank = &mut self.ranks[position];
             let index = rank.index as usize;
+            let destination = &mut next[rank.kind as usize];
+            destinations[rank.kind as usize][index] = *destination;
+            rank.index = *destination;
+            *destination += 1;
             match rank.kind {
                 PrimitiveKind::Shadow => self.shadows[index].order = order,
                 PrimitiveKind::Quad => self.quads[index].order = order,
@@ -355,20 +366,50 @@ impl Scene {
             }
         }
 
-        self.shadows.sort_by_key(|shadow| shadow.order);
-        self.quads.sort_by_key(|quad| quad.order);
-        self.paths.sort_by_key(|path| path.order);
-        self.underlines.sort_by_key(|underline| underline.order);
-        self.monochrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.subpixel_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.polychrome_sprites
-            .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
-        self.surfaces.sort_by_key(|surface| surface.order);
-        self.backdrop_blurs.sort_by_key(|blur| blur.order);
-        self.start_layer_masks.sort_by_key(|mask| mask.order);
-        self.end_layer_masks.sort_by_key(|mask| mask.order);
+        // A reference moves with its primitive, so a finished scene, which is
+        // the one a later frame replays from, resolves every reference to the
+        // primitive it was logged for.
+        for operation in &mut self.paint_operations {
+            if let PaintOperation::Primitive(reference) = operation {
+                reference.index = destinations[reference.kind as usize][reference.index as usize];
+            }
+        }
+        for kind in PrimitiveKind::ALL {
+            self.move_to_destinations(kind, &mut destinations[kind as usize]);
+        }
+        self.destinations = destinations;
+    }
+
+    fn stored_len(&self, kind: PrimitiveKind) -> usize {
+        match kind {
+            PrimitiveKind::Shadow => self.shadows.len(),
+            PrimitiveKind::Quad => self.quads.len(),
+            PrimitiveKind::Path => self.paths.len(),
+            PrimitiveKind::Underline => self.underlines.len(),
+            PrimitiveKind::MonochromeSprite => self.monochrome_sprites.len(),
+            PrimitiveKind::SubpixelSprite => self.subpixel_sprites.len(),
+            PrimitiveKind::PolychromeSprite => self.polychrome_sprites.len(),
+            PrimitiveKind::Surface => self.surfaces.len(),
+            PrimitiveKind::BackdropBlur => self.backdrop_blurs.len(),
+            PrimitiveKind::StartLayerMask => self.start_layer_masks.len(),
+            PrimitiveKind::EndLayerMask => self.end_layer_masks.len(),
+        }
+    }
+
+    fn move_to_destinations(&mut self, kind: PrimitiveKind, destinations: &mut [u32]) {
+        match kind {
+            PrimitiveKind::Shadow => permute(&mut self.shadows, destinations),
+            PrimitiveKind::Quad => permute(&mut self.quads, destinations),
+            PrimitiveKind::Path => permute(&mut self.paths, destinations),
+            PrimitiveKind::Underline => permute(&mut self.underlines, destinations),
+            PrimitiveKind::MonochromeSprite => permute(&mut self.monochrome_sprites, destinations),
+            PrimitiveKind::SubpixelSprite => permute(&mut self.subpixel_sprites, destinations),
+            PrimitiveKind::PolychromeSprite => permute(&mut self.polychrome_sprites, destinations),
+            PrimitiveKind::Surface => permute(&mut self.surfaces, destinations),
+            PrimitiveKind::BackdropBlur => permute(&mut self.backdrop_blurs, destinations),
+            PrimitiveKind::StartLayerMask => permute(&mut self.start_layer_masks, destinations),
+            PrimitiveKind::EndLayerMask => permute(&mut self.end_layer_masks, destinations),
+        }
     }
 
     #[cfg_attr(
@@ -427,14 +468,66 @@ pub(crate) enum PrimitiveKind {
     EndLayerMask,
 }
 
+impl PrimitiveKind {
+    /// Every kind, with `ALL[kind as usize] == kind`.
+    const ALL: [PrimitiveKind; 11] = [
+        PrimitiveKind::StartLayerMask,
+        PrimitiveKind::Shadow,
+        PrimitiveKind::Quad,
+        PrimitiveKind::Path,
+        PrimitiveKind::Underline,
+        PrimitiveKind::MonochromeSprite,
+        PrimitiveKind::SubpixelSprite,
+        PrimitiveKind::PolychromeSprite,
+        PrimitiveKind::Surface,
+        PrimitiveKind::BackdropBlur,
+        PrimitiveKind::EndLayerMask,
+    ];
+}
+
+const _: () = {
+    let mut index = 0;
+    while index < PrimitiveKind::ALL.len() {
+        assert!(PrimitiveKind::ALL[index] as usize == index);
+        index += 1;
+    }
+};
+
+/// Moves `items[i]` to `items[destinations[i]]` for every `i`, in place.
+///
+/// `destinations` is a permutation of `0..items.len()` and is left as the
+/// identity. Every swap puts one item where it belongs, and an item that is
+/// where it belongs never moves again, so this makes fewer than
+/// `items.len()` swaps even when `destinations` is not a permutation.
+fn permute<T>(items: &mut [T], destinations: &mut [u32]) {
+    debug_assert_eq!(items.len(), destinations.len());
+    for start in 0..items.len() {
+        loop {
+            let destination = destinations[start] as usize;
+            if destination == start || destinations[destination] as usize == destination {
+                debug_assert_eq!(destination, start, "destinations is not a permutation");
+                break;
+            }
+            items.swap(start, destination);
+            destinations.swap(start, destination);
+        }
+    }
+}
+
+/// A primitive or layer mask marker recorded in the paint log: the kind of
+/// vector it is stored in, and its position there.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct PrimitiveRef {
+    kind: PrimitiveKind,
+    index: u32,
+}
+
 pub(crate) enum PaintOperation {
-    Primitive(Primitive),
+    Primitive(PrimitiveRef),
     StartLayer(Bounds<ScaledPixels>),
     EndLayer,
     PushZIndex(i32),
     PopZIndex,
-    StartLayerMask(LayerMask),
-    EndLayerMask,
 }
 
 #[derive(Clone)]
@@ -494,6 +587,81 @@ impl Primitive {
             Primitive::Surface(_) => TransformationMatrix::unit(),
             Primitive::BackdropBlur(blur) => blur.transformation,
         }
+    }
+}
+
+/// A primitive a scene stores in a vector of its kind.
+trait Stored: Clone {
+    const KIND: PrimitiveKind;
+    fn stored(scene: &Scene) -> &Vec<Self>;
+    fn stored_mut(scene: &mut Scene) -> &mut Vec<Self>;
+    /// The region of the window the primitive can draw into: its bounds
+    /// after its transformation, within its content mask.
+    fn clipped_bounds(&self) -> Bounds<ScaledPixels>;
+    /// The atlas tile that orders sprites of one draw order; zero for every
+    /// other kind.
+    fn tile(&self) -> u32 {
+        0
+    }
+    /// Records that the primitive is stored at `index` of its vector.
+    fn stored_at(&mut self, _index: usize) {}
+}
+
+macro_rules! impl_stored {
+    ($primitive:ty, $kind:ident, $field:ident { $($extra:tt)* }) => {
+        impl Stored for $primitive {
+            const KIND: PrimitiveKind = PrimitiveKind::$kind;
+            fn stored(scene: &Scene) -> &Vec<Self> {
+                &scene.$field
+            }
+            fn stored_mut(scene: &mut Scene) -> &mut Vec<Self> {
+                &mut scene.$field
+            }
+            fn clipped_bounds(&self) -> Bounds<ScaledPixels> {
+                self.transformation
+                    .apply_to_bounds(self.bounds)
+                    .intersect(&self.content_mask.bounds)
+            }
+            $($extra)*
+        }
+    };
+}
+
+impl_stored!(Shadow, Shadow, shadows {});
+impl_stored!(Quad, Quad, quads {});
+impl_stored!(Path<ScaledPixels>, Path, paths {
+    fn stored_at(&mut self, index: usize) {
+        self.id = PathId(index);
+    }
+});
+impl_stored!(Underline, Underline, underlines {});
+impl_stored!(MonochromeSprite, MonochromeSprite, monochrome_sprites {
+    fn tile(&self) -> u32 {
+        self.tile.tile_id.0
+    }
+});
+impl_stored!(SubpixelSprite, SubpixelSprite, subpixel_sprites {
+    fn tile(&self) -> u32 {
+        self.tile.tile_id.0
+    }
+});
+impl_stored!(PolychromeSprite, PolychromeSprite, polychrome_sprites {
+    fn tile(&self) -> u32 {
+        self.tile.tile_id.0
+    }
+});
+impl_stored!(BackdropBlur, BackdropBlur, backdrop_blurs {});
+
+impl Stored for PaintSurface {
+    const KIND: PrimitiveKind = PrimitiveKind::Surface;
+    fn stored(scene: &Scene) -> &Vec<Self> {
+        &scene.surfaces
+    }
+    fn stored_mut(scene: &mut Scene) -> &mut Vec<Self> {
+        &mut scene.surfaces
+    }
+    fn clipped_bounds(&self) -> Bounds<ScaledPixels> {
+        self.bounds.intersect(&self.content_mask.bounds)
     }
 }
 
@@ -1579,6 +1747,9 @@ mod transformed_bounds_tests;
 
 #[cfg(test)]
 mod layer_mask_tests;
+
+#[cfg(test)]
+mod paint_log_tests;
 
 #[cfg(test)]
 mod tests {

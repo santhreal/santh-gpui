@@ -5,9 +5,10 @@
 //! window space: a primitive transformed into the content mask dropped as
 //! empty, one transformed out of it kept, and one transformed over an earlier
 //! primitive batched under it. Covers every primitive kind with a
-//! transformation; `Primitive::transformation` is an exhaustive match, so a
-//! new kind does not compile until it states its transformation. Does not
-//! catch a renderer that draws a primitive at the wrong window position.
+//! transformation; a kind is stored only through `Stored`, whose
+//! `clipped_bounds` each kind implements, so a new kind does not compile until
+//! it states its window-space bounds. Does not catch a renderer that draws a
+//! primitive at the wrong window position.
 
 use super::*;
 use crate::{
