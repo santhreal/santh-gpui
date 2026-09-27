@@ -4,8 +4,9 @@
 //! WHY: closes the classes "the app starts with full motion while the system
 //! requests reduced motion", "a change of the system preference does not reach
 //! the app motion policy", "a system change resets the duration scale", "a
-//! system change leaves windows drawn with the previous policy", and "a
-//! repeated system report overrides the reduced flag the app set". Every case
+//! system change leaves windows drawn with the previous policy", "a
+//! repeated system report overrides the reduced flag the app set", and "an
+//! app that sets its own flag can no longer read the system preference". Every case
 //! runs through the test platform, which reports the preference through
 //! [`crate::Platform::on_reduce_motion_change`] also when it is unchanged, as
 //! the platform contract allows. Not caught: a platform that reads its
@@ -65,6 +66,11 @@ fn the_app_starts_with_the_reduced_flag_of_the_system() {
             app.borrow().motion_policy(),
             MotionPolicy::DEFAULT.with_reduced(reduce_motion),
             "an app started while the system reduce-motion preference is {reduce_motion}"
+        );
+        assert_eq!(
+            app.borrow().system_reduce_motion(),
+            reduce_motion,
+            "an app started while the system reduce-motion preference is {reduce_motion} reads it"
         );
     }
 }
@@ -135,6 +141,29 @@ fn the_reduced_flag_the_app_sets_holds_until_the_system_preference_changes(
             cx.update(|cx| cx.reduce_motion()),
             system,
             "the next system change sets the flag to the system preference {system}"
+        );
+    }
+}
+
+#[gpui::test]
+fn the_system_preference_reads_the_last_report_whatever_flag_the_app_set(cx: &mut TestAppContext) {
+    for system in [true, false, true] {
+        cx.simulate_reduce_motion_change(system);
+        cx.run_until_parked();
+        cx.update(|cx| cx.set_reduce_motion(!system));
+        assert_eq!(
+            cx.update(|cx| (cx.system_reduce_motion(), cx.reduce_motion())),
+            (system, !system),
+            "the app flag {} leaves the system preference {system} readable",
+            !system
+        );
+
+        cx.simulate_reduce_motion_change(system);
+        cx.run_until_parked();
+        assert_eq!(
+            cx.update(|cx| (cx.system_reduce_motion(), cx.reduce_motion())),
+            (system, !system),
+            "a repeated system report of {system} changes neither value"
         );
     }
 }

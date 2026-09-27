@@ -45,6 +45,10 @@ pub struct HeadlessAppContext {
     pub foreground_executor: ForegroundExecutor,
     dispatcher: TestDispatcher,
     text_system: Arc<TextSystem>,
+    /// The platform the app runs on, kept to simulate operating-system
+    /// reports.
+    #[cfg(any(test, feature = "test-support"))]
+    platform: Rc<TestPlatform>,
 }
 
 impl HeadlessAppContext {
@@ -88,6 +92,8 @@ impl HeadlessAppContext {
         );
 
         let http_client = Arc::new(crate::app::NullHttpClient);
+        #[cfg(any(test, feature = "test-support"))]
+        let test_platform = platform.clone();
         let app = App::new_app(platform, asset_source, http_client);
         app.borrow_mut().mode = GpuiMode::Production;
         // The one text system every window in this app shapes through, so a
@@ -100,6 +106,8 @@ impl HeadlessAppContext {
             background_executor,
             foreground_executor,
             dispatcher,
+            #[cfg(any(test, feature = "test-support"))]
+            platform: test_platform,
             text_system,
         }
     }
@@ -147,6 +155,15 @@ impl HeadlessAppContext {
     /// Disables parking mode, returning to deterministic test execution.
     pub fn forbid_parking(&self) {
         self.dispatcher.forbid_parking();
+    }
+
+    /// Simulates the operating system reporting its reduced-motion preference
+    /// as `reduce_motion`. A preference that differs from the previous report
+    /// sets the reduced flag of [`App::motion_policy`] and redraws every
+    /// window; a repeated one has no effect.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn simulate_reduce_motion_change(&self, reduce_motion: bool) {
+        self.platform.simulate_reduce_motion_change(reduce_motion);
     }
 
     /// Updates app state.

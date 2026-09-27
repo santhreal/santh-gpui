@@ -9,6 +9,12 @@ struct AppMotionPolicy(MotionPolicy);
 
 impl Global for AppMotionPolicy {}
 
+/// The last reduced-motion preference the operating system reported. Private
+/// so that every report goes through [`App::report_system_reduce_motion`].
+struct SystemReduceMotion(bool);
+
+impl Global for SystemReduceMotion {}
+
 impl App {
     /// The motion policy of the app: reduced motion and the duration scale.
     ///
@@ -20,7 +26,9 @@ impl App {
     /// has not answered yet; the answer of the portal applies as a change.
     /// [`App::set_reduce_motion`] and [`App::set_motion_policy`] set the flag
     /// until the next change of the system preference. The duration scale is
-    /// 1 until [`App::set_motion_policy`] sets another.
+    /// 1 until [`App::set_motion_policy`] sets another. An app that combines
+    /// its own setting with the system preference reads the preference with
+    /// [`App::system_reduce_motion`].
     ///
     /// [`Platform::reduce_motion`]: crate::Platform::reduce_motion
     pub fn motion_policy(&self) -> MotionPolicy {
@@ -48,5 +56,26 @@ impl App {
     /// [`App::motion_policy`].
     pub fn set_reduce_motion(&mut self, reduce_motion: bool) {
         self.set_motion_policy(self.motion_policy().with_reduced(reduce_motion));
+    }
+
+    /// The last reduced-motion preference the operating system reported,
+    /// independent of the flag [`App::set_reduce_motion`] set. `false` until
+    /// the platform reports a preference.
+    pub fn system_reduce_motion(&self) -> bool {
+        self.try_global::<SystemReduceMotion>()
+            .is_some_and(|preference| preference.0)
+    }
+
+    /// Records a report of the system preference. A preference that differs
+    /// from the recorded one, or the first report, sets the reduced flag to the
+    /// preference; a repeated report keeps the flag the app set.
+    pub(crate) fn report_system_reduce_motion(&mut self, reduce_motion: bool) {
+        let recorded = self
+            .try_global::<SystemReduceMotion>()
+            .map(|preference| preference.0);
+        if recorded != Some(reduce_motion) {
+            self.set_global(SystemReduceMotion(reduce_motion));
+            self.set_reduce_motion(reduce_motion);
+        }
     }
 }
