@@ -1008,6 +1008,32 @@ fragment float4 path_clip_composite_fragment(
   return layer.sample(layer_sampler, input.texture_coords) * coverage;
 }
 
+// Composites an edge-faded layer onto its parent target: the premultiplied
+// layer color scaled by `r * r`, with `r` the fade ratio documented on
+// `EdgeFadeMask` in gpui's scene.rs. `input.position` is the pixel center.
+fragment float4 edge_fade_composite_fragment(
+    PathSpriteVertexOutput input [[stage_in]],
+    constant EdgeFadeMask *mask [[buffer(EdgeFadeInputIndex_Mask)]],
+    texture2d<float> layer [[texture(EdgeFadeInputIndex_Layer)]]) {
+  float2 p = input.position.xy;
+  Bounds_ScaledPixels fade = mask->fade_bounds;
+  Edges_ScaledPixels bands = mask->bands;
+  float r = 1.0;
+  if (bands.top > 0.0) {
+    r = min(r, saturate((p.y - fade.origin.y) / bands.top));
+  }
+  if (bands.right > 0.0) {
+    r = min(r, saturate((fade.origin.x + fade.size.width - p.x) / bands.right));
+  }
+  if (bands.bottom > 0.0) {
+    r = min(r, saturate((fade.origin.y + fade.size.height - p.y) / bands.bottom));
+  }
+  if (bands.left > 0.0) {
+    r = min(r, saturate((p.x - fade.origin.x) / bands.left));
+  }
+  return layer.read(uint2(p)) * (r * r);
+}
+
 struct FrameCopyVertexOutput {
   float4 position [[position]];
 };

@@ -4,8 +4,11 @@
 //! report. These tests fail if the Vulkan tier selects an adapter a GL
 //! adapter outranks, which would select a Vulkan CPU or virtual adapter
 //! over a GL GPU, or rejects one no GL adapter outranks, which would create
-//! the GL instance where it cannot change the selection. They do not
-//! observe which instances a context creates on a real host.
+//! the GL instance where it cannot change the selection. They also fail if
+//! the tier of a display whose GL instance is a last resort rejects a
+//! Vulkan adapter, which would create the GL instance while a Vulkan CPU
+//! adapter can present. They do not observe which instances a context
+//! creates on a real host.
 
 use super::{AdapterRank, BackendTier, parse_pci_id};
 use crate::CompositorGpuHint;
@@ -102,6 +105,10 @@ fn vulkan_tier_selects_exactly_the_adapters_above_every_gl_adapter() {
                     hint.map(|h| (h.vendor_id, h.device_id)),
                 );
                 assert!(BackendTier::VulkanAndGl.selects(vulkan));
+                assert!(
+                    BackendTier::EveryVulkan.selects(vulkan),
+                    "{device_type:?} with filter {filter:?}"
+                );
             }
         }
     }
@@ -130,15 +137,6 @@ fn vulkan_tier_selects_hardware_adapters_and_the_named_device() {
             );
         }
     }
-}
-
-#[test]
-fn only_the_vulkan_and_gl_tier_creates_a_gl_instance() {
-    assert_eq!(BackendTier::Vulkan.backends(), wgpu::Backends::VULKAN);
-    assert_eq!(
-        BackendTier::VulkanAndGl.backends(),
-        wgpu::Backends::VULKAN | wgpu::Backends::GL
-    );
 }
 
 #[test]

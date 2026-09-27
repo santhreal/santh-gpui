@@ -1,22 +1,28 @@
+#[cfg(test)]
+mod layer_mask_tests;
+mod layers;
+mod pipeline_cache;
 mod pipelines;
 
 #[cfg(not(target_family = "wasm"))]
 use crate::wgpu_context::create_surface;
-use crate::{CompositorGpuHint, WgpuAtlas, WgpuContext};
+use crate::{CompositorGpuHint, GpuContext, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, GpuSpecs, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, TransformationMatrix, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EdgeFadeMask, GpuSpecs,
+    LayerMask, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, TransformationMatrix,
+    get_gamma_correction_ratios,
 };
+use layers::{LayerTextures, OpenLayer};
 use log::warn;
-use pipelines::{WgpuPipelines, WgpuShaders};
+pub(crate) use pipeline_cache::PipelineCache;
+use pipeline_cache::{ModuleKey, PipelineKey};
+use pipelines::WgpuPipelines;
 #[cfg(not(target_family = "wasm"))]
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use std::cell::RefCell;
 use std::num::NonZeroU64;
 use std::ops::Range;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
@@ -171,9 +177,6 @@ struct WgpuBindGroupLayouts {
     surfaces: wgpu::BindGroupLayout,
 }
 
-/// Shared GPU context reference, used to coordinate device recovery across multiple windows.
-pub type GpuContext = Rc<RefCell<Option<WgpuContext>>>;
-
 enum InstanceData {
     Storage(wgpu::Buffer),
     // WebGL2 has no storage buffers. A uint texture keeps the records available to both shader
@@ -201,9 +204,11 @@ struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     target: WgpuRenderTarget,
-    pipelines: WgpuPipelines,
-    shaders: WgpuShaders,
-    bind_group_layouts: WgpuBindGroupLayouts,
+    /// The pipelines of the target's key, shared with the renderers of the
+    /// same key on `device`.
+    pipelines: Arc<WgpuPipelines>,
+    /// The cache of `device` that `pipelines` come from.
+    pipeline_cache: Arc<PipelineCache>,
     atlas_sampler: wgpu::Sampler,
     globals_buffer: wgpu::Buffer,
     globals_bind_group: wgpu::BindGroup,
@@ -211,8 +216,8 @@ struct WgpuResources {
     instance_data: InstanceData,
     path_intermediate_texture: Option<wgpu::Texture>,
     path_intermediate_view: Option<wgpu::TextureView>,
-    clip_intermediate_texture: Option<wgpu::Texture>,
-    clip_intermediate_view: Option<wgpu::TextureView>,
+    /// The layers masked subtrees draw into, one per nesting depth.
+    layers: LayerTextures,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
     backdrop_texture: Option<wgpu::Texture>,
@@ -230,8 +235,7 @@ impl WgpuResources {
     fn invalidate_intermediate_textures(&mut self) {
         self.path_intermediate_texture = None;
         self.path_intermediate_view = None;
-        self.clip_intermediate_texture = None;
-        self.clip_intermediate_view = None;
+        self.layers.clear();
         self.path_msaa_texture = None;
         self.path_msaa_view = None;
         self.backdrop_texture = None;
@@ -240,6 +244,13 @@ impl WgpuResources {
         self.retained_view = None;
         self.retained_present_binding = None;
         self.retained_valid = false;
+    }
+
+    /// Takes the pipelines of a target configured as `config`, rasterizing
+    /// paths with `path_sample_count` samples, from the cache.
+    fn select_pipelines(&mut self, config: &wgpu::SurfaceConfiguration, path_sample_count: u32) {
+        let key = PipelineKey::new(self.pipelines.key().modules, config, path_sample_count);
+        self.pipelines = self.pipeline_cache.pipelines(&self.device, key);
     }
 }
 
@@ -356,18 +367,19 @@ impl WgpuRenderer {
         let mut ctx_ref = gpu_context.borrow_mut();
         let (context, surface) = match ctx_ref.as_mut() {
             Some(context) => {
-                let window_handle = window
-                    .window_handle()
-                    .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
                 // The caller keeps the window alive while the renderer exists,
                 // and the renderer drops the surface before the window.
-                let surface = create_surface(&context.instance, window_handle.as_raw())
-                    .context("Failed to create surface")?;
+                let surface = create_surface(&context.instance, window)?;
                 context.check_compatible_with_surface(&surface)?;
                 (context, surface)
             }
             None => {
-                let (context, surface) = WgpuContext::for_window(window, compositor_gpu, false)?;
+                let (context, surface) = WgpuContext::for_window(
+                    gpu_context.instances(window),
+                    window,
+                    compositor_gpu,
+                    false,
+                )?;
                 (ctx_ref.insert(context), surface)
             }
         };
@@ -375,7 +387,7 @@ impl WgpuRenderer {
         let atlas = Arc::new(WgpuAtlas::from_context(context));
 
         Self::new_internal(
-            Some(Rc::clone(&gpu_context)),
+            Some(gpu_context.clone()),
             context,
             WgpuRenderTarget::Surface(surface),
             config,
@@ -416,6 +428,9 @@ impl WgpuRenderer {
     }
 
     /// Creates a new offscreen WgpuRenderer with an owned texture render target.
+    // wgpu objects are neither `Send` nor `Sync` on the web, which runs the
+    // renderer on one thread.
+    #[cfg_attr(target_family = "wasm", allow(clippy::arc_with_non_send_sync))]
     pub fn new_offscreen(context: &WgpuContext, size: Size<DevicePixels>) -> anyhow::Result<Self> {
         let format = context.color_texture_format();
         let width = (size.width.0 as u32).max(1);
@@ -587,17 +602,19 @@ impl WgpuRenderer {
         let uses_webgl_instance_data = context.uses_webgl_instance_data();
         let dual_source_blending =
             context.supports_dual_source_blending() && !uses_webgl_instance_data;
-        let bind_group_layouts = Self::create_bind_group_layouts(&device, uses_webgl_instance_data);
-        let shaders = WgpuShaders::new(&device, dual_source_blending, uses_webgl_instance_data);
-        let pipelines = WgpuPipelines::new(
+        let pipeline_cache = Arc::clone(&context.pipeline_cache);
+        let pipelines = pipeline_cache.pipelines(
             &device,
-            &bind_group_layouts,
-            &shaders,
-            surface_format,
-            alpha_mode,
-            rendering_params.path_sample_count,
-            surface_config.usage.contains(wgpu::TextureUsages::COPY_DST),
+            PipelineKey::new(
+                ModuleKey {
+                    dual_source_blending,
+                    uses_webgl_instance_data,
+                },
+                &surface_config,
+                rendering_params.path_sample_count,
+            ),
         );
+        let bind_group_layouts = pipelines.layouts();
 
         let atlas_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("atlas_sampler"),
@@ -721,8 +738,7 @@ impl WgpuRenderer {
             queue,
             target,
             pipelines,
-            shaders,
-            bind_group_layouts,
+            pipeline_cache,
             atlas_sampler,
             globals_buffer,
             globals_bind_group,
@@ -732,8 +748,7 @@ impl WgpuRenderer {
             // This avoids panics when the device/surface is in an invalid state during initialization.
             path_intermediate_texture: None,
             path_intermediate_view: None,
-            clip_intermediate_texture: None,
-            clip_intermediate_view: None,
+            layers: LayerTextures::default(),
             path_msaa_texture: None,
             path_msaa_view: None,
             backdrop_texture: None,
@@ -1091,11 +1106,6 @@ impl WgpuRenderer {
         resources.path_intermediate_texture = Some(t);
         resources.path_intermediate_view = Some(v);
 
-        let (clip_t, clip_v) =
-            Self::create_path_intermediate(&resources.device, format, width, height);
-        resources.clip_intermediate_texture = Some(clip_t);
-        resources.clip_intermediate_view = Some(clip_v);
-
         let (path_msaa_texture, path_msaa_view) = Self::create_msaa_if_needed(
             &resources.device,
             format,
@@ -1191,15 +1201,7 @@ impl WgpuRenderer {
             if let WgpuRenderTarget::Surface(surface) = &mut resources.target {
                 surface.configure(&resources.device, &surface_config);
             }
-            resources.pipelines = WgpuPipelines::new(
-                &resources.device,
-                &resources.bind_group_layouts,
-                &resources.shaders,
-                surface_config.format,
-                surface_config.alpha_mode,
-                path_sample_count,
-                surface_config.usage.contains(wgpu::TextureUsages::COPY_DST),
-            );
+            resources.select_pipelines(&surface_config, path_sample_count);
             resources.invalidate_intermediate_textures();
         }
     }
@@ -1460,7 +1462,10 @@ impl WgpuRenderer {
                 pass.draw(0..3, 0..1);
             }
 
-            let mut active_path_clip: Option<Path<ScaledPixels>> = None;
+            // The masks open at this point of the frame, innermost last. A
+            // frame without masks leaves it empty and creates no layer.
+            let mut open_layers: Vec<OpenLayer> = Vec::new();
+            let mut deepest_layer = 0;
             for batch in scene.batches() {
                 match batch {
                     PrimitiveBatch::Quads(range) => self.draw_instances(
@@ -1490,7 +1495,7 @@ impl WgpuRenderer {
 
                         pass = Self::begin_frame_pass(
                             &mut encoder,
-                            target_view,
+                            layers::draw_target(&open_layers, target_view),
                             "main_pass_continued",
                             wgpu::LoadOp::Load,
                             scissor,
@@ -1541,46 +1546,32 @@ impl WgpuRenderer {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
-                    PrimitiveBatch::StartPathClip(path) => {
+                    PrimitiveBatch::StartLayerMask(mask) => {
                         drop(pass);
-                        self.draw_paths_to_intermediate(
-                            &mut encoder,
-                            std::slice::from_ref(&path),
-                            &mut instance_offset,
-                        )?;
-                        let resources = self.resources();
-                        let clip_intermediate_view = resources
-                            .clip_intermediate_view
-                            .as_ref()
-                            .expect("clip intermediate view must exist");
-                        pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                            label: Some("clip_subtree_pass"),
-                            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                                view: clip_intermediate_view,
-                                resolve_target: None,
-                                ops: wgpu::Operations {
-                                    load: wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
-                                    store: wgpu::StoreOp::Store,
-                                },
-                                depth_slice: None,
-                            })],
-                            depth_stencil_attachment: None,
-                            ..Default::default()
-                        });
-                        active_path_clip = Some(path);
-                    }
-                    PrimitiveBatch::EndPathClip => {
-                        drop(pass);
+                        let view = self.layer_view(open_layers.len());
                         pass = Self::begin_frame_pass(
                             &mut encoder,
-                            target_view,
-                            "main_pass_after_path_clip",
-                            wgpu::LoadOp::Load,
+                            &view,
+                            "layer_mask_pass",
+                            wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),
                             scissor,
                         );
-                        if let Some(path) = active_path_clip.take() {
-                            self.draw_path_clip_composite(&path, &mut instance_offset, &mut pass)?;
-                        }
+                        open_layers.push(OpenLayer { mask, view });
+                        deepest_layer = deepest_layer.max(open_layers.len());
+                    }
+                    PrimitiveBatch::EndLayerMask => {
+                        // An end without a start has no layer to composite.
+                        let Some(layer) = open_layers.pop() else {
+                            continue;
+                        };
+                        drop(pass);
+                        pass = self.composite_layer(
+                            &mut encoder,
+                            layer,
+                            layers::draw_target(&open_layers, target_view),
+                            scissor,
+                            &mut instance_offset,
+                        )?;
                     }
                     PrimitiveBatch::BackdropBlurs(range) => {
                         let backdrop_blurs = &scene.backdrop_blurs[range.clone()];
@@ -1621,7 +1612,7 @@ impl WgpuRenderer {
 
                             pass = Self::begin_frame_pass(
                                 &mut encoder,
-                                target_view,
+                                layers::draw_target(&open_layers, target_view),
                                 "main_pass_backdrop_blur",
                                 wgpu::LoadOp::Load,
                                 scissor,
@@ -1644,7 +1635,7 @@ impl WgpuRenderer {
                         } else {
                             pass = Self::begin_frame_pass(
                                 &mut encoder,
-                                target_view,
+                                layers::draw_target(&open_layers, target_view),
                                 "main_pass_continued",
                                 wgpu::LoadOp::Load,
                                 scissor,
@@ -1653,6 +1644,19 @@ impl WgpuRenderer {
                     }
                 }
             }
+            // A mask the scene left open closes at the end of the frame.
+            while let Some(layer) = open_layers.pop() {
+                drop(pass);
+                pass = self.composite_layer(
+                    &mut encoder,
+                    layer,
+                    layers::draw_target(&open_layers, target_view),
+                    scissor,
+                    &mut instance_offset,
+                )?;
+            }
+            drop(pass);
+            self.resources_mut().layers.end_frame(deepest_layer);
         }
 
         // Swapchain contents are undefined, so present the complete retained
@@ -1788,7 +1792,7 @@ impl WgpuRenderer {
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
-                layout: &resources.bind_group_layouts.texture,
+                layout: &resources.pipelines.layouts().texture,
                 entries: &[
                     wgpu::BindGroupEntry {
                         binding: 0,
@@ -1978,31 +1982,88 @@ impl WgpuRenderer {
         Ok(true)
     }
 
-    fn draw_path_clip_composite(
+    /// The layer a mask opened at nesting `depth` draws into, sized to the
+    /// frame.
+    fn layer_view(&mut self, depth: usize) -> wgpu::TextureView {
+        let format = self.surface_config.format;
+        let width = self.surface_config.width;
+        let height = self.surface_config.height;
+        let resources = self.resources_mut();
+        resources
+            .layers
+            .view(&resources.device, depth, format, width, height)
+    }
+
+    /// Composites the closed `layer` onto `parent` through its mask, inside
+    /// the mask's bounds and `scissor`, and returns the pass that continues
+    /// drawing onto `parent`.
+    fn composite_layer<'encoder>(
+        &mut self,
+        encoder: &'encoder mut wgpu::CommandEncoder,
+        layer: OpenLayer,
+        parent: &wgpu::TextureView,
+        scissor: Option<Scissor>,
+        instance_offset: &mut u64,
+    ) -> Result<wgpu::RenderPass<'encoder>> {
+        match layer.mask {
+            LayerMask::Path(path) => {
+                // Paths inside the subtree reuse the path intermediate
+                // texture, so the mask path is rasterized when it closes.
+                let rasterized = self.draw_paths_to_intermediate(
+                    encoder,
+                    std::slice::from_ref(&path),
+                    instance_offset,
+                )?;
+                let mut pass = Self::begin_frame_pass(
+                    encoder,
+                    parent,
+                    "path_mask_composite",
+                    wgpu::LoadOp::Load,
+                    scissor,
+                );
+                // A path without vertices covers nothing, so its layer
+                // contributes nothing.
+                if rasterized {
+                    self.draw_path_mask_composite(&path, &layer.view, instance_offset, &mut pass)?;
+                }
+                Ok(pass)
+            }
+            LayerMask::EdgeFade(fade) => {
+                let mut pass = Self::begin_frame_pass(
+                    encoder,
+                    parent,
+                    "edge_fade_composite",
+                    wgpu::LoadOp::Load,
+                    scissor,
+                );
+                self.draw_edge_fade_composite(&fade, &layer.view, instance_offset, &mut pass)?;
+                Ok(pass)
+            }
+        }
+    }
+
+    /// Composites `layer` through the coverage of `path`, which the path
+    /// intermediate texture holds.
+    fn draw_path_mask_composite(
         &mut self,
         path: &Path<ScaledPixels>,
+        layer: &wgpu::TextureView,
         instance_offset: &mut u64,
         pass: &mut wgpu::RenderPass<'_>,
     ) -> Result<()> {
         let sprite = PathSprite {
             bounds: path.transformation.apply_to_bounds(path.clipped_bounds()),
         };
-        let (Some(clip_intermediate_view), Some(path_intermediate_view)) = (
-            self.resources().clip_intermediate_view.clone(),
-            self.resources().path_intermediate_view.clone(),
-        ) else {
+        let Some(path_intermediate_view) = self.resources().path_intermediate_view.clone() else {
             return Ok(());
         };
 
         let instances = self.write_instance_binding(
-            "path_clip_composite_bind_group",
+            "path_mask_composite_bind_group",
             instance_offset,
             &[sprite],
         )?;
-        let clip_texture_bind = self.create_texture_bind_group(
-            "clip_intermediate_texture_bind_group",
-            &clip_intermediate_view,
-        );
+        let layer_bind = self.create_texture_bind_group("path_mask_layer_bind_group", layer);
         let path_mask_bind =
             self.create_texture_bind_group("path_mask_texture_bind_group", &path_intermediate_view);
 
@@ -2010,8 +2071,32 @@ impl WgpuRenderer {
         pass.set_pipeline(&resources.pipelines.path_mask_composite);
         pass.set_bind_group(0, &resources.globals_bind_group, &[]);
         pass.set_bind_group(1, &instances.bind_group, &[]);
-        pass.set_bind_group(2, &clip_texture_bind, &[]);
+        pass.set_bind_group(2, &layer_bind, &[]);
         pass.set_bind_group(3, &path_mask_bind, &[]);
+        pass.draw(0..4, instances.first_instance..instances.first_instance + 1);
+        Ok(())
+    }
+
+    /// Composites `layer` through the edge fade `fade`.
+    fn draw_edge_fade_composite(
+        &mut self,
+        fade: &EdgeFadeMask,
+        layer: &wgpu::TextureView,
+        instance_offset: &mut u64,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) -> Result<()> {
+        let instances = self.write_instance_binding(
+            "edge_fade_composite_bind_group",
+            instance_offset,
+            std::slice::from_ref(fade),
+        )?;
+        let layer_bind = self.create_texture_bind_group("edge_fade_layer_bind_group", layer);
+
+        let resources = self.resources();
+        pass.set_pipeline(&resources.pipelines.edge_fade_composite);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        pass.set_bind_group(1, &instances.bind_group, &[]);
+        pass.set_bind_group(2, &layer_bind, &[]);
         pass.draw(0..4, instances.first_instance..instances.first_instance + 1);
         Ok(())
     }
@@ -2066,7 +2151,7 @@ impl WgpuRenderer {
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some(label),
-                layout: &resources.bind_group_layouts.instances,
+                layout: &resources.pipelines.layouts().instances,
                 entries: &[wgpu::BindGroupEntry {
                     binding: 0,
                     resource: match &resources.instance_data {
@@ -2240,17 +2325,13 @@ impl WgpuRenderer {
     /// different instance will cause a "Device does not exist" panic because
     /// the wgpu device is bound to its originating instance.
     #[cfg(not(target_family = "wasm"))]
-    pub fn replace_surface<W: HasWindowHandle>(
+    pub fn replace_surface<W: HasWindowHandle + HasDisplayHandle>(
         &mut self,
         window: &W,
         config: WgpuSurfaceConfig,
         instance: &wgpu::Instance,
     ) -> anyhow::Result<()> {
-        let window_handle = window
-            .window_handle()
-            .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
-
-        let surface = create_surface(instance, window_handle.as_raw())?;
+        let surface = create_surface(instance, window)?;
 
         let width = (config.size.width.0 as u32).max(1);
         let height = (config.size.height.0 as u32).max(1);
@@ -2335,17 +2416,18 @@ impl WgpuRenderer {
             // may need more time to come back (e.g. after suspend/resume).
             std::thread::sleep(std::time::Duration::from_millis(350));
 
-            let (new_context, surface) =
-                WgpuContext::for_window(window, self.compositor_gpu, true)?;
+            let (new_context, surface) = WgpuContext::for_window(
+                gpu_context.instances(window),
+                window,
+                self.compositor_gpu,
+                true,
+            )?;
             *gpu_context.borrow_mut() = Some(new_context);
             surface
         } else {
-            let window_handle = window
-                .window_handle()
-                .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?;
             let ctx_ref = gpu_context.borrow();
             let instance = &ctx_ref.as_ref().unwrap().instance;
-            create_surface(instance, window_handle.as_raw())?
+            create_surface(instance, window)?
         };
 
         let config = WgpuSurfaceConfig {
@@ -2356,7 +2438,7 @@ impl WgpuRenderer {
             transparent: self.surface_config.alpha_mode != wgpu::CompositeAlphaMode::Opaque,
             preferred_present_mode: Some(self.surface_config.present_mode),
         };
-        let gpu_context = Rc::clone(gpu_context);
+        let gpu_context = gpu_context.clone();
         let ctx_ref = gpu_context.borrow();
         let context = ctx_ref.as_ref().expect("context should exist");
 
@@ -2487,13 +2569,16 @@ impl WgpuRenderer {
     }
 }
 
-/// A headless WGPU renderer implementing `PlatformHeadlessRenderer`.
+/// A headless WGPU renderer implementing `PlatformHeadlessRenderer`. The web
+/// has no surfaceless context, so the renderer exists on native targets only.
+#[cfg(not(target_family = "wasm"))]
 pub struct WgpuHeadlessRenderer {
     #[allow(dead_code)]
     context: WgpuContext,
     renderer: WgpuRenderer,
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl WgpuHeadlessRenderer {
     /// Creates a new headless WGPU renderer for offscreen rasterization.
     pub fn new(size: Size<DevicePixels>) -> anyhow::Result<Self> {
@@ -2509,6 +2594,7 @@ impl WgpuHeadlessRenderer {
     }
 }
 
+#[cfg(not(target_family = "wasm"))]
 impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
     fn render_scene_to_image(
         &mut self,
@@ -2624,6 +2710,7 @@ mod tests {
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
         assert_eq!(std::mem::size_of::<PolychromeSprite>(), 34 * 4);
+        assert_eq!(std::mem::size_of::<EdgeFadeMask>(), 12 * 4);
     }
 
     fn build_test_quad_scene(x: f32, width: f32, height: f32) -> Scene {
@@ -2716,15 +2803,7 @@ mod tests {
             format: config.format,
         };
         if configure_pipeline {
-            resources.pipelines = WgpuPipelines::new(
-                &resources.device,
-                &resources.bind_group_layouts,
-                &resources.shaders,
-                config.format,
-                config.alpha_mode,
-                path_sample_count,
-                usage.contains(wgpu::TextureUsages::COPY_DST),
-            );
+            resources.select_pipelines(&config, path_sample_count);
             resources.invalidate_intermediate_textures();
         }
     }
@@ -4412,7 +4491,7 @@ mod tests {
                 corner_radii: Default::default(),
             };
             let path_scaled = path.scale(scale);
-            scene.push_path_clip(path_scaled);
+            scene.push_layer_mask(gpui::LayerMask::Path(path_scaled));
 
             // Subtree quad: bright green covering (0, 0, 100, 100)
             scene.insert_primitive(Quad {
@@ -4448,7 +4527,7 @@ mod tests {
                 transformation: TransformationMatrix::unit(),
             });
 
-            scene.pop_path_clip();
+            scene.pop_layer_mask();
             scene.finish();
 
             assert!(renderer.draw(&scene));

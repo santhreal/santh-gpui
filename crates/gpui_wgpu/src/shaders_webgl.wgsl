@@ -243,3 +243,12 @@ fn load_backdrop_blur(instance_id: u32) -> BackdropBlur {
         read_transformation(&cursor),
     );
 }
+
+fn load_edge_fade(instance_id: u32) -> EdgeFadeMask {
+    var cursor = instance_cursor(instance_id * 12u);
+    return EdgeFadeMask(
+        read_bounds(&cursor),
+        read_bounds(&cursor),
+        read_edges(&cursor),
+    );
+}

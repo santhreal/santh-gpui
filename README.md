@@ -10,6 +10,7 @@ the framework crates and their dependencies only, with the upstream history.
 | Package | Contents |
 | ------- | -------- |
 | `gpui` | Application and window contexts, entities, elements, layout, input, text, animation. |
+| `motion` | Easing curves, springs, tweens, and motion tokens with no GPUI dependency; `gpui::motion` re-exports it with the frame clock and driver. |
 | `gpui_platform` | `application()` and `headless()`: the platform for the current OS. |
 | `gpui_linux` | X11 and Wayland windows, input, clipboard, and display integration. |
 | `gpui_macos`, `gpui_apple` | AppKit windows and the Metal renderer. |

@@ -1,14 +1,15 @@
-//! Offscreen textures and pipelines for backdrop blurs and path-clipped
-//! layers.
+//! Offscreen textures and pipelines for backdrop blurs and layer masks.
 //!
 //! A backdrop blur batch copies the frame drawn so far into the backdrop
-//! texture and samples that copy through a clamp-to-edge sampler. A path clip
-//! draws its subtree into a layer cleared to transparent black, one layer per
-//! nesting depth, and composites the layer onto its parent scaled by the clip
-//! path's coverage.
+//! texture and samples that copy through a clamp-to-edge sampler. A layer
+//! mask draws its subtree into a layer cleared to transparent black, one
+//! layer per nesting depth, and composites the layer onto its parent scaled
+//! by the mask value `m` documented on [`gpui::StartLayerMask`]: the clip
+//! path's coverage for [`gpui::LayerMask::Path`], the fade computed in the
+//! composite pixel shader for [`gpui::LayerMask::EdgeFade`].
 //!
-//! Frames without blurs or clips create none of these resources. Textures are
-//! released after [`gpui::LAYER_IDLE_RELEASE_FRAMES`] consecutive frames
+//! Frames without blurs or masks create none of these resources. Textures
+//! are released after [`gpui::LAYER_IDLE_RELEASE_FRAMES`] consecutive frames
 //! without a use, and pipelines are compiled on first use.
 
 use super::{
@@ -16,7 +17,7 @@ use super::{
     create_blend_state_for_path_sprite,
 };
 use anyhow::{Context as _, Result};
-use gpui::{BackdropBlur, LayerIdleCounter};
+use gpui::{BackdropBlur, EdgeFadeMask, LayerIdleCounter};
 use std::slice;
 use windows::Win32::Graphics::{Direct3D11::*, Dxgi::Common::*};
 
@@ -26,14 +27,16 @@ pub(super) struct RenderLayers {
     width: u32,
     height: u32,
     backdrop: Option<Target>,
-    clip_layers: Vec<Target>,
+    /// The layer of each open mask, indexed by nesting depth.
+    mask_layers: Vec<Target>,
     blur_idle: LayerIdleCounter,
-    clip_idle: LayerIdleCounter,
+    mask_idle: LayerIdleCounter,
 }
 
 struct LayerPipelines {
     backdrop_blur: PipelineState<BackdropBlur>,
     path_clip_composite: PipelineState<PathSprite>,
+    edge_fade_composite: PipelineState<EdgeFadeMask>,
     clamp_sampler: Option<ID3D11SamplerState>,
 }
 
@@ -88,8 +91,9 @@ impl RenderLayers {
         )
     }
 
-    /// Clears the layer for clip nesting `depth`, creating it when missing.
-    pub fn begin_clip_layer(
+    /// Clears the layer for mask nesting `depth`, creating every missing
+    /// layer up to it.
+    pub fn begin_mask_layer(
         &mut self,
         device: &ID3D11Device,
         device_context: &ID3D11DeviceContext,
@@ -97,70 +101,91 @@ impl RenderLayers {
         depth: usize,
     ) -> Result<()> {
         self.match_size(size)?;
-        while self.clip_layers.len() <= depth {
-            self.clip_layers.push(new_target(device, size, true)?);
+        while self.mask_layers.len() <= depth {
+            self.mask_layers.push(new_target(device, size, true)?);
         }
-        let view = self.clip_layers[depth]
+        let view = self.mask_layers[depth]
             .render_target_view
             .as_ref()
-            .context("path clip layer has no render target view")?;
+            .context("layer mask layer has no render target view")?;
         unsafe { device_context.ClearRenderTargetView(view, &[0.0; 4]) };
         Ok(())
     }
 
-    /// Returns the render target view of the open clip layer at `depth`.
-    pub fn clip_layer_view(&self, depth: usize) -> Result<&Option<ID3D11RenderTargetView>> {
-        self.clip_layers
+    /// Returns the render target view of the open mask layer at `depth`.
+    pub fn mask_layer_view(&self, depth: usize) -> Result<&Option<ID3D11RenderTargetView>> {
+        self.mask_layers
             .get(depth)
             .map(|layer| &layer.render_target_view)
-            .with_context(|| format!("path clip layer {depth} missing"))
+            .with_context(|| format!("layer mask layer {depth} missing"))
     }
 
-    /// Draws the clip layer at `depth` onto the bound render target inside
-    /// `sprite`, scaled by the alpha of `mask`, then unbinds both textures so
-    /// the layer can be a render target again.
+    /// Draws the mask layer at `depth` onto the bound render target inside
+    /// `sprite`, scaled by the alpha of `coverage`, the rasterized clip path.
     pub fn draw_path_clip_composite(
         &mut self,
         device: &ID3D11Device,
         device_context: &ID3D11DeviceContext,
         sprite: PathSprite,
         depth: usize,
-        mask: &Option<ID3D11ShaderResourceView>,
+        coverage: &Option<ID3D11ShaderResourceView>,
     ) -> Result<()> {
         let pipelines = layer_pipelines(&mut self.pipelines, device)?;
-        let layer = self
-            .clip_layers
-            .get(depth)
-            .with_context(|| format!("path clip layer {depth} missing"))?;
         pipelines.path_clip_composite.update_buffer(
             device,
             device_context,
             slice::from_ref(&sprite),
         )?;
-        unsafe { device_context.PSSetShaderResources(2, Some(slice::from_ref(mask))) };
-        let result = pipelines.path_clip_composite.draw_with_texture(
+        unsafe { device_context.PSSetShaderResources(2, Some(slice::from_ref(coverage))) };
+        composite_layer(
+            &pipelines.path_clip_composite,
+            &self.mask_layers,
+            depth,
             device_context,
-            slice::from_ref(&layer.shader_resource_view),
-            slice::from_ref(&pipelines.clamp_sampler),
-            1,
-        );
-        unsafe {
-            device_context.VSSetShaderResources(0, Some(&[None]));
-            device_context.PSSetShaderResources(0, Some(&[None, None, None]));
-        }
-        result
+            &pipelines.clamp_sampler,
+        )
     }
 
-    /// Records whether the finished frame used blurs and clips, and releases
+    /// Draws the mask layer at `depth` onto the bound render target inside
+    /// `mask.bounds`, scaled by the fade of `mask`.
+    pub fn draw_edge_fade_composite(
+        &mut self,
+        device: &ID3D11Device,
+        device_context: &ID3D11DeviceContext,
+        mask: EdgeFadeMask,
+        depth: usize,
+    ) -> Result<()> {
+        let pipelines = layer_pipelines(&mut self.pipelines, device)?;
+        pipelines.edge_fade_composite.update_buffer(
+            device,
+            device_context,
+            slice::from_ref(&mask),
+        )?;
+        composite_layer(
+            &pipelines.edge_fade_composite,
+            &self.mask_layers,
+            depth,
+            device_context,
+            &pipelines.clamp_sampler,
+        )
+    }
+
+    /// Records whether the finished frame used blurs and masks, and releases
     /// the textures of a feature idle for [`gpui::LAYER_IDLE_RELEASE_FRAMES`]
     /// frames.
-    pub fn end_frame(&mut self, used_blur: bool, used_clip: bool) {
+    pub fn end_frame(&mut self, used_blur: bool, used_mask: bool) {
         if self.blur_idle.tick(used_blur) {
             self.backdrop = None;
         }
-        if self.clip_idle.tick(used_clip) {
-            self.clip_layers.clear();
+        if self.mask_idle.tick(used_mask) {
+            self.mask_layers = Vec::new();
         }
+    }
+
+    /// The number of allocated mask layers.
+    #[cfg(test)]
+    pub fn mask_layer_count(&self) -> usize {
+        self.mask_layers.len()
     }
 
     fn match_size(&mut self, size: (u32, u32)) -> Result<()> {
@@ -173,10 +198,36 @@ impl RenderLayers {
         if (self.width, self.height) != size {
             (self.width, self.height) = size;
             self.backdrop = None;
-            self.clip_layers.clear();
+            self.mask_layers.clear();
         }
         Ok(())
     }
+}
+
+/// Draws one instance of `pipeline` onto the bound render target with the
+/// mask layer at `depth` bound as `t_sprite`, then unbinds the layer and the
+/// mask textures so the layer can be a render target again.
+fn composite_layer<T>(
+    pipeline: &PipelineState<T>,
+    layers: &[Target],
+    depth: usize,
+    device_context: &ID3D11DeviceContext,
+    sampler: &Option<ID3D11SamplerState>,
+) -> Result<()> {
+    let layer = layers
+        .get(depth)
+        .with_context(|| format!("layer mask layer {depth} missing"))?;
+    let result = pipeline.draw_with_texture(
+        device_context,
+        slice::from_ref(&layer.shader_resource_view),
+        slice::from_ref(sampler),
+        1,
+    );
+    unsafe {
+        device_context.VSSetShaderResources(0, Some(&[None]));
+        device_context.PSSetShaderResources(0, Some(&[None, None, None]));
+    }
+    result
 }
 
 fn layer_pipelines<'a>(
@@ -203,6 +254,13 @@ impl LayerPipelines {
                 device,
                 "path_clip_composite_pipeline",
                 ShaderModule::PathClipComposite,
+                1,
+                create_blend_state_for_path_sprite(device)?,
+            )?,
+            edge_fade_composite: PipelineState::new(
+                device,
+                "edge_fade_composite_pipeline",
+                ShaderModule::EdgeFadeComposite,
                 1,
                 create_blend_state_for_path_sprite(device)?,
             )?,

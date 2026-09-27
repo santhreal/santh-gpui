@@ -51,7 +51,7 @@ pub(crate) struct DirectXRenderer {
     globals: DirectXGlobalElements,
     pipelines: DirectXRenderPipelines,
     direct_composition: Option<DirectComposition>,
-    /// Offscreen textures and pipelines for backdrop blurs and path clips.
+    /// Offscreen textures and pipelines for backdrop blurs and layer masks.
     layers: RenderLayers,
     font_info: &'static FontInfo,
 
@@ -373,10 +373,10 @@ impl DirectXRenderer {
             .as_ref()
             .and_then(|devices| devices.annotation.clone())
             .filter(|annotation| unsafe { annotation.GetStatus().as_bool() });
-        // Open path clips, innermost last. Batches draw into the layer of the
-        // innermost clip, or into the render target when none is open.
-        let mut clip_stack: Vec<Path<ScaledPixels>> = Vec::new();
-        let mut used_clip = false;
+        // Open layer masks, innermost last. Batches draw into the layer of
+        // the innermost mask, or into the render target when none is open.
+        let mut mask_stack: Vec<LayerMask> = Vec::new();
+        let mut used_mask = false;
         for batch in scene.batches() {
             let _annotation = annotation
                 .as_ref()
@@ -385,7 +385,7 @@ impl DirectXRenderer {
                 PrimitiveBatch::Shadows(range) => self.draw_shadows(range.start, range.len()),
                 PrimitiveBatch::Quads(range) => self.draw_quads(range.start, range.len()),
                 PrimitiveBatch::Paths(range) => {
-                    self.draw_paths(&scene.paths[range], clip_stack.len())
+                    self.draw_paths(&scene.paths[range], mask_stack.len())
                 }
                 PrimitiveBatch::Underlines(range) => self.draw_underlines(range.start, range.len()),
                 PrimitiveBatch::MonochromeSprites { texture_id, range } => {
@@ -401,11 +401,11 @@ impl DirectXRenderer {
                 PrimitiveBatch::BackdropBlurs(range) => {
                     self.draw_backdrop_blurs(range.start, range.len())
                 }
-                PrimitiveBatch::StartPathClip(path) => {
-                    used_clip = true;
-                    self.begin_path_clip(path, &mut clip_stack)
+                PrimitiveBatch::StartLayerMask(mask) => {
+                    used_mask = true;
+                    self.begin_layer_mask(mask, &mut mask_stack)
                 }
-                PrimitiveBatch::EndPathClip => self.end_path_clip(&mut clip_stack),
+                PrimitiveBatch::EndLayerMask => self.end_layer_mask(&mut mask_stack),
             }
             .with_context(|| {
                 format!(
@@ -424,7 +424,7 @@ impl DirectXRenderer {
             })?;
         }
         self.layers
-            .end_frame(!scene.backdrop_blurs.is_empty(), used_clip);
+            .end_frame(!scene.backdrop_blurs.is_empty(), used_mask);
         Ok(())
     }
 
@@ -757,21 +757,21 @@ impl DirectXRenderer {
         )
     }
 
-    /// Draws a batch of paths into the target of clip nesting `clip_depth`.
-    fn draw_paths(&mut self, paths: &[Path<ScaledPixels>], clip_depth: usize) -> Result<()> {
+    /// Draws a batch of paths into the target of mask nesting `mask_depth`.
+    fn draw_paths(&mut self, paths: &[Path<ScaledPixels>], mask_depth: usize) -> Result<()> {
         if self.draw_paths_to_intermediate(paths)? {
-            self.bind_target(clip_depth)?;
+            self.bind_target(mask_depth)?;
             self.draw_paths_from_intermediate(paths)?;
         }
         Ok(())
     }
 
-    /// Binds the render target that batches at clip nesting `clip_depth`
-    /// draw into: the layer of the innermost open clip, or the frame when no
-    /// clip is open.
-    fn bind_target(&self, clip_depth: usize) -> Result<()> {
+    /// Binds the render target that batches at mask nesting `mask_depth`
+    /// draw into: the layer of the innermost open mask, or the frame when no
+    /// mask is open.
+    fn bind_target(&self, mask_depth: usize) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
-        let view = match clip_depth.checked_sub(1) {
+        let view = match mask_depth.checked_sub(1) {
             None => {
                 &self
                     .resources
@@ -779,7 +779,7 @@ impl DirectXRenderer {
                     .context("resources missing")?
                     .render_target_view
             }
-            Some(depth) => self.layers.clip_layer_view(depth)?,
+            Some(depth) => self.layers.mask_layer_view(depth)?,
         };
         unsafe {
             devices
@@ -813,45 +813,56 @@ impl DirectXRenderer {
         )
     }
 
-    /// Opens a path clip: later batches draw into a cleared layer until the
-    /// matching [`end_path_clip`](Self::end_path_clip).
-    fn begin_path_clip(
-        &mut self,
-        path: Path<ScaledPixels>,
-        clip_stack: &mut Vec<Path<ScaledPixels>>,
-    ) -> Result<()> {
+    /// Opens a layer mask: later batches draw into a cleared layer until the
+    /// matching [`end_layer_mask`](Self::end_layer_mask).
+    fn begin_layer_mask(&mut self, mask: LayerMask, mask_stack: &mut Vec<LayerMask>) -> Result<()> {
         let devices = self.devices.as_ref().context("devices missing")?;
-        self.layers.begin_clip_layer(
+        self.layers.begin_mask_layer(
             &devices.device,
             &devices.device_context,
             (self.width, self.height),
-            clip_stack.len(),
+            mask_stack.len(),
         )?;
-        clip_stack.push(path);
-        self.bind_target(clip_stack.len())
+        mask_stack.push(mask);
+        self.bind_target(mask_stack.len())
     }
 
-    /// Closes the innermost path clip: rasterizes its path, then composites
-    /// its layer onto the parent target scaled by the path's coverage.
-    fn end_path_clip(&mut self, clip_stack: &mut Vec<Path<ScaledPixels>>) -> Result<()> {
-        let path = clip_stack
+    /// Closes the innermost layer mask: composites its layer onto the parent
+    /// target through the mask.
+    fn end_layer_mask(&mut self, mask_stack: &mut Vec<LayerMask>) -> Result<()> {
+        let mask = mask_stack
             .pop()
-            .context("path clip end without a matching start")?;
-        // The clip path is rasterized when the clip closes, so paths drawn
-        // inside the subtree cannot overwrite it.
-        self.draw_paths_to_intermediate(slice::from_ref(&path))?;
-        self.bind_target(clip_stack.len())?;
-        let devices = self.devices.as_ref().context("devices missing")?;
-        let resources = self.resources.as_ref().context("resources missing")?;
-        self.layers.draw_path_clip_composite(
-            &devices.device,
-            &devices.device_context,
-            PathSprite {
-                bounds: path.transformation.apply_to_bounds(path.clipped_bounds()),
-            },
-            clip_stack.len(),
-            &resources.path_intermediate_srv,
-        )
+            .context("layer mask end without a matching start")?;
+        let depth = mask_stack.len();
+        match &mask {
+            LayerMask::Path(path) => {
+                // The clip path is rasterized when the mask closes, so paths
+                // drawn inside the subtree cannot overwrite it.
+                self.draw_paths_to_intermediate(slice::from_ref(path))?;
+                self.bind_target(depth)?;
+                let devices = self.devices.as_ref().context("devices missing")?;
+                let resources = self.resources.as_ref().context("resources missing")?;
+                self.layers.draw_path_clip_composite(
+                    &devices.device,
+                    &devices.device_context,
+                    PathSprite {
+                        bounds: mask.bounds(),
+                    },
+                    depth,
+                    &resources.path_intermediate_srv,
+                )
+            }
+            LayerMask::EdgeFade(fade) => {
+                self.bind_target(depth)?;
+                let devices = self.devices.as_ref().context("devices missing")?;
+                self.layers.draw_edge_fade_composite(
+                    &devices.device,
+                    &devices.device_context,
+                    *fade,
+                    depth,
+                )
+            }
+        }
     }
 
     fn draw_underlines(&mut self, start: usize, len: usize) -> Result<()> {
@@ -1849,6 +1860,7 @@ pub(crate) mod shader_resources {
         EmojiRasterization,
         BackdropBlur,
         PathClipComposite,
+        EdgeFadeComposite,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1933,6 +1945,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::PathClipComposite => match target {
                     ShaderTarget::Vertex => PATH_CLIP_COMPOSITE_VERTEX_BYTES,
                     ShaderTarget::Fragment => PATH_CLIP_COMPOSITE_FRAGMENT_BYTES,
+                },
+                ShaderModule::EdgeFadeComposite => match target {
+                    ShaderTarget::Vertex => EDGE_FADE_COMPOSITE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => EDGE_FADE_COMPOSITE_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -2023,6 +2039,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
                 ShaderModule::BackdropBlur => "backdrop_blur",
                 ShaderModule::PathClipComposite => "path_clip_composite",
+                ShaderModule::EdgeFadeComposite => "edge_fade_composite",
             }
         }
     }

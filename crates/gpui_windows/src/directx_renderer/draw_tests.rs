@@ -1,18 +1,19 @@
-//! Draws backdrop blurs and path clips with the DirectX renderer into the
+//! Draws backdrop blurs and layer masks with the DirectX renderer into the
 //! render target of a hidden window, and compares every pixel with the math
-//! documented on [`gpui::BackdropBlur`] and [`gpui::StartPathClip`], computed
-//! on the CPU from a frame drawn without the primitive under test.
+//! documented on [`gpui::BackdropBlur`] and [`gpui::StartLayerMask`],
+//! computed on the CPU from a frame drawn without the primitive under test.
 
 mod reference;
 
 use super::DirectXRenderer;
 use crate::DirectXDevices;
 use gpui::{
-    BackdropBlur, Bounds, ContentMask, Corners, DevicePixels, Hsla, Quad, ScaledPixels, Scene,
-    WindowBackgroundAppearance, black, hsla, point, size, white,
+    BackdropBlur, Bounds, ContentMask, Corners, DevicePixels, Edges, Hsla,
+    LAYER_IDLE_RELEASE_FRAMES, LayerMask, Pixels, Quad, ScaledPixels, Scene,
+    WindowBackgroundAppearance, black, hsla, point, px, size, white,
 };
 use gpui_util::ResultExt;
-use reference::{Image, Outline, Rgba, composite, expected_blur, over, rgba};
+use reference::{Fade, Image, Outline, Rgba, composite, expected_blur, over, rgba};
 use windows::{
     Win32::{
         Foundation::HWND,
@@ -234,10 +235,10 @@ fn path_clip_composites_its_premultiplied_layer_by_path_coverage() {
             rect(0.0, 0.0, 100.0, 100.0),
             hsla(2.0 / 3.0, 1.0, 0.5, 1.0),
         ));
-        scene.push_path_clip(outline.clip_path());
+        scene.push_layer_mask(LayerMask::Path(outline.clip_path()));
         scene.insert_primitive(quad(rect(0.0, 0.0, 100.0, 50.0), green));
         scene.insert_primitive(quad(rect(50.0, 0.0, 50.0, 100.0), red));
-        scene.pop_path_clip();
+        scene.pop_layer_mask();
     });
     assert_pixels("path clip", &drawn, |x, y| {
         let mut layer = [0.0; 4];
@@ -274,14 +275,14 @@ fn nested_path_clips_intersect() {
             rect(0.0, 0.0, 100.0, 100.0),
             hsla(2.0 / 3.0, 1.0, 0.5, 1.0),
         ));
-        scene.push_path_clip(outer.clip_path());
-        scene.push_path_clip(inner.clip_path());
+        scene.push_layer_mask(LayerMask::Path(outer.clip_path()));
+        scene.push_layer_mask(LayerMask::Path(inner.clip_path()));
         scene.insert_primitive(quad(
             rect(0.0, 0.0, 100.0, 100.0),
             hsla(1.0 / 3.0, 1.0, 0.5, 1.0),
         ));
-        scene.pop_path_clip();
-        scene.pop_path_clip();
+        scene.pop_layer_mask();
+        scene.pop_layer_mask();
     });
     assert_pixels("nested path clips", &drawn, |x, y| {
         Some(match (outer.coverage(x, y), inner.coverage(x, y)) {
@@ -317,10 +318,10 @@ fn backdrop_blur_inside_a_path_clip_samples_the_frame_beneath_it() {
     let frame = target.draw(stripes);
     let drawn = target.draw(|scene| {
         stripes(scene);
-        scene.push_path_clip(outline.clip_path());
+        scene.push_layer_mask(LayerMask::Path(outline.clip_path()));
         scene.insert_primitive(quad(rect(30.0, 30.0, 40.0, 40.0), hsla(0.0, 1.0, 0.5, 1.0)));
         scene.insert_primitive(blur);
-        scene.pop_path_clip();
+        scene.pop_layer_mask();
     });
     assert_pixels("blur inside a path clip", &drawn, |x, y| {
         let pixel = match outline.coverage(x, y)? {
@@ -328,5 +329,337 @@ fn backdrop_blur_inside_a_path_clip_samples_the_frame_beneath_it() {
             _ => frame.at(x, y),
         };
         Some((pixel, pixel))
+    });
+}
+
+/// Scale factors, in device pixels per logical pixel, the edge fade tests
+/// draw at.
+const SCALES: [f32; 2] = [1.0, 2.0];
+
+fn logical(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
+    Bounds {
+        origin: point(px(x), px(y)),
+        size: size(px(width), px(height)),
+    }
+}
+
+fn edges(top: f32, right: f32, bottom: f32, left: f32) -> Edges<Pixels> {
+    Edges {
+        top: px(top),
+        right: px(right),
+        bottom: px(bottom),
+        left: px(left),
+    }
+}
+
+fn blue() -> Hsla {
+    hsla(2.0 / 3.0, 1.0, 0.5, 1.0)
+}
+
+fn green() -> Hsla {
+    hsla(1.0 / 3.0, 1.0, 0.5, 1.0)
+}
+
+fn translucent_red() -> Hsla {
+    hsla(0.0, 1.0, 0.5, 0.5)
+}
+
+/// Fills the target with opaque blue.
+fn backdrop(scene: &mut Scene) {
+    scene.insert_primitive(quad(rect(0.0, 0.0, SIZE as f32, SIZE as f32), blue()));
+}
+
+/// Draws opaque green left of logical x 25 and half transparent red right
+/// of logical x 20, over the full height of the target, at `scale`.
+fn layer_content(scene: &mut Scene, scale: f32) {
+    scene.insert_primitive(quad(rect(0.0, 0.0, 25.0 * scale, SIZE as f32), green()));
+    scene.insert_primitive(quad(
+        rect(20.0 * scale, 0.0, SIZE as f32, SIZE as f32),
+        translucent_red(),
+    ));
+}
+
+/// The premultiplied layer [`layer_content`] draws in device pixel column
+/// `x`.
+fn layer_at(x: i32, scale: f32) -> Rgba {
+    let x = (x as f32 + 0.5) / scale;
+    let mut layer = [0.0; 4];
+    if x < 25.0 {
+        layer = over(layer, rgba(green()));
+    }
+    if x >= 20.0 {
+        layer = over(layer, rgba(translucent_red()));
+    }
+    layer
+}
+
+/// The region the edge fade tests composite into, in logical pixels. It
+/// fits the 50 logical pixel window of the 2x target.
+fn fade_clip() -> Bounds<Pixels> {
+    logical(2.0, 3.0, 45.0, 43.0)
+}
+
+/// The faded region of the edge fade tests, in logical pixels, inside
+/// [`fade_clip`] on every side. No side is a whole device pixel at either
+/// scale.
+fn fade_bounds() -> Bounds<Pixels> {
+    logical(5.25, 6.75, 36.5, 33.5)
+}
+
+/// The fade of the nested mask tests: every edge of [`fade_bounds`] faded
+/// across 8.5 logical pixels.
+fn nested_fade(scale: f32) -> Fade {
+    Fade {
+        bounds: fade_bounds(),
+        bands: edges(8.5, 8.5, 8.5, 8.5),
+        clip: fade_clip(),
+        scale,
+    }
+}
+
+/// The clip path of the nested mask tests, crossing every ramp of
+/// [`nested_fade`].
+fn nested_outline(scale: f32) -> Outline {
+    Outline::rounded_square(10.0 * scale, 44.0 * scale, 8.0 * scale)
+}
+
+/// Draws [`layer_content`] through `inner` nested in `outer`, over
+/// [`backdrop`].
+fn draw_nested(target: &mut Target, outer: LayerMask, inner: LayerMask, scale: f32) -> Image {
+    target.draw(|scene| {
+        backdrop(scene);
+        scene.push_layer_mask(outer);
+        scene.push_layer_mask(inner);
+        layer_content(scene, scale);
+        scene.pop_layer_mask();
+        scene.pop_layer_mask();
+    })
+}
+
+/// The documented pixel `(x, y)` of [`layer_content`] composited through
+/// `fade` nested in a path clip of `outline`, as the range the outline's
+/// antialiasing spans.
+fn fade_inside_path(fade: &Fade, outline: &Outline, x: i32, y: i32) -> (Rgba, Rgba) {
+    let faded = composite([0.0; 4], layer_at(x, fade.scale), fade.m(x, y));
+    let at = |coverage| composite(rgba(blue()), faded, coverage);
+    match outline.coverage(x, y) {
+        Some(coverage) => (at(coverage), at(coverage)),
+        None => (at(0.0), at(1.0)),
+    }
+}
+
+/// The documented pixel `(x, y)` of [`layer_content`] composited through a
+/// path clip of `outline` nested in `fade`, as the range the outline's
+/// antialiasing spans.
+fn path_inside_fade(fade: &Fade, outline: &Outline, x: i32, y: i32) -> (Rgba, Rgba) {
+    let at = |coverage| {
+        let clipped = composite([0.0; 4], layer_at(x, fade.scale), coverage);
+        composite(rgba(blue()), clipped, fade.m(x, y))
+    };
+    match outline.coverage(x, y) {
+        Some(coverage) => (at(coverage), at(coverage)),
+        None => (at(0.0), at(1.0)),
+    }
+}
+
+/// Draws [`layer_content`] through `fade` over [`backdrop`] and compares
+/// every pixel with the documented composite.
+fn assert_fade(name: &str, target: &mut Target, fade: &Fade) {
+    let drawn = target.draw(|scene| {
+        backdrop(scene);
+        scene.push_layer_mask(fade.mask());
+        layer_content(scene, fade.scale);
+        scene.pop_layer_mask();
+    });
+    let dst = rgba(blue());
+    assert_pixels(name, &drawn, |x, y| {
+        let expected = composite(dst, layer_at(x, fade.scale), fade.m(x, y));
+        Some((expected, expected))
+    });
+}
+
+/// Catches a ramp measured from the wrong side or in the wrong direction, a
+/// band read from another edge, a dropped edge term, `m = r` in place of
+/// `m = r * r`, an edge with a zero band that still limits the fade, a
+/// straight instead of premultiplied composite, and a composite drawn
+/// outside the clip.
+#[test]
+fn edge_fade_ramps_each_faded_edge_and_leaves_the_others_open() {
+    let mut target = Target::new();
+    for scale in SCALES {
+        for (edge, bands) in [
+            ("top", edges(9.5, 0.0, 0.0, 0.0)),
+            ("right", edges(0.0, 9.5, 0.0, 0.0)),
+            ("bottom", edges(0.0, 0.0, 9.5, 0.0)),
+            ("left", edges(0.0, 0.0, 0.0, 9.5)),
+        ] {
+            let fade = Fade {
+                bounds: fade_bounds(),
+                bands,
+                clip: fade_clip(),
+                scale,
+            };
+            assert_fade(&format!("{edge} edge fade at {scale}x"), &mut target, &fade);
+        }
+    }
+}
+
+/// Catches `max` in place of `min` across edges, bands applied to the wrong
+/// edges, and a composite drawn over the whole faded region where the clip
+/// cuts through a ramp.
+#[test]
+fn edge_fade_takes_the_smallest_ratio_of_all_faded_edges_inside_the_clip() {
+    let mut target = Target::new();
+    for scale in SCALES {
+        let fade = Fade {
+            bounds: fade_bounds(),
+            bands: edges(6.0, 9.0, 12.0, 4.5),
+            // The right side of the clip cuts through the right ramp.
+            clip: logical(2.0, 3.0, 34.0, 43.0),
+            scale,
+        };
+        assert_fade(&format!("all edges fade at {scale}x"), &mut target, &fade);
+    }
+}
+
+/// Catches a ratio that reaches 1 between opposite ramps that overlap, as a
+/// fade that limits each band to half the faded region draws.
+#[test]
+fn edge_fade_bands_wider_than_half_the_bounds_overlap() {
+    let mut target = Target::new();
+    for scale in SCALES {
+        let fade = Fade {
+            bounds: logical(8.0, 6.0, 30.0, 36.0),
+            bands: edges(20.0, 18.0, 0.0, 18.0),
+            clip: fade_clip(),
+            scale,
+        };
+        assert_fade(&format!("wide band fade at {scale}x"), &mut target, &fade);
+    }
+}
+
+/// Catches an edge fade inside a path clip that composites onto the frame
+/// instead of the clip layer, or draws into the clip layer itself, so the
+/// result is not the fade scaled by the path coverage.
+#[test]
+fn edge_fade_inside_a_path_clip_composites_through_both() {
+    let mut target = Target::new();
+    for scale in SCALES {
+        let fade = nested_fade(scale);
+        let outline = nested_outline(scale);
+        let drawn = draw_nested(
+            &mut target,
+            LayerMask::Path(outline.clip_path()),
+            fade.mask(),
+            scale,
+        );
+        assert_pixels(
+            &format!("edge fade inside a path clip at {scale}x"),
+            &drawn,
+            |x, y| Some(fade_inside_path(&fade, &outline, x, y)),
+        );
+    }
+}
+
+/// Catches a path clip inside an edge fade that composites onto the frame
+/// instead of the fade layer, or draws into the fade layer itself, so the
+/// result is not the path coverage scaled by the fade.
+#[test]
+fn path_clip_inside_an_edge_fade_composites_through_both() {
+    let mut target = Target::new();
+    for scale in SCALES {
+        let fade = nested_fade(scale);
+        let outline = nested_outline(scale);
+        let drawn = draw_nested(
+            &mut target,
+            fade.mask(),
+            LayerMask::Path(outline.clip_path()),
+            scale,
+        );
+        assert_pixels(
+            &format!("path clip inside an edge fade at {scale}x"),
+            &drawn,
+            |x, y| Some(path_inside_fade(&fade, &outline, x, y)),
+        );
+    }
+}
+
+/// Catches a blur inside an edge fade that samples the fade layer, where
+/// the red quad drawn before it would tint the result, instead of the frame
+/// beneath every open layer.
+#[test]
+fn backdrop_blur_inside_an_edge_fade_samples_the_frame_beneath_it() {
+    let blur = BackdropBlur {
+        order: 0,
+        pad: 0,
+        bounds: rect(0.0, 0.0, 100.0, 100.0),
+        content_mask: window_mask(),
+        corner_radii: Corners::default(),
+        blur_radius: ScaledPixels(6.0),
+        saturation: 1.0,
+        tint: hsla(0.0, 0.0, 0.0, 0.0),
+        transformation: Default::default(),
+    };
+    let fade = nested_fade(2.0);
+    let mut target = Target::new();
+    let frame = target.draw(stripes);
+    let drawn = target.draw(|scene| {
+        stripes(scene);
+        scene.push_layer_mask(fade.mask());
+        scene.insert_primitive(quad(rect(30.0, 30.0, 40.0, 40.0), hsla(0.0, 1.0, 0.5, 1.0)));
+        scene.insert_primitive(blur);
+        scene.pop_layer_mask();
+    });
+    assert_pixels("blur inside an edge fade", &drawn, |x, y| {
+        let layer = expected_blur(&frame, &blur, x, y);
+        let expected = composite(frame.at(x, y), layer, fade.m(x, y));
+        Some((expected, expected))
+    });
+}
+
+/// Catches mask layers that stay allocated after
+/// [`LAYER_IDLE_RELEASE_FRAMES`] frames without a mask, are released
+/// sooner, keep counting idle frames across a masked frame, are allocated
+/// by a frame without masks, or are not recreated for the next masked
+/// frame.
+#[test]
+fn mask_layers_are_released_after_idle_frames_and_recreated_on_use() {
+    let fade = nested_fade(1.0);
+    let outline = nested_outline(1.0);
+    let masked = |target: &mut Target| {
+        draw_nested(
+            target,
+            LayerMask::Path(outline.clip_path()),
+            fade.mask(),
+            1.0,
+        )
+    };
+    let layers = |target: &Target| target.renderer.layers.mask_layer_count();
+    let mut target = Target::new();
+    target.draw(backdrop);
+    assert_eq!(layers(&target), 0, "a frame without masks allocated layers");
+    // The masked frame of the second round restarts the idle count.
+    for _ in 0..2 {
+        masked(&mut target);
+        assert_eq!(layers(&target), 2, "two nested masks use two layers");
+        for idle in 1..LAYER_IDLE_RELEASE_FRAMES {
+            target.draw(backdrop);
+            assert_eq!(
+                layers(&target),
+                2,
+                "layers released after {idle} idle frames"
+            );
+        }
+    }
+    target.draw(backdrop);
+    assert_eq!(
+        layers(&target),
+        0,
+        "layers kept after {LAYER_IDLE_RELEASE_FRAMES} idle frames"
+    );
+    let drawn = masked(&mut target);
+    assert_eq!(layers(&target), 2, "layers not recreated after release");
+    assert_pixels("nested masks after release", &drawn, |x, y| {
+        Some(fade_inside_path(&fade, &outline, x, y))
     });
 }

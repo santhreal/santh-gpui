@@ -13,7 +13,8 @@ use super::shader_resources::{ShaderModule, ShaderTarget, build_shader_blob};
 use super::{BatchParams, GlobalParams, PathRasterizationSprite, PathSprite};
 use crate::direct_write::GlyphLayerTextureParams;
 use gpui::{
-    BackdropBlur, MonochromeSprite, PolychromeSprite, Quad, Shadow, SubpixelSprite, Underline,
+    BackdropBlur, EdgeFadeMask, MonochromeSprite, PolychromeSprite, Quad, Shadow, SubpixelSprite,
+    Underline,
 };
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -218,6 +219,18 @@ fn rust_layout(module: ShaderModule, name: &str) -> Option<Layout> {
                 "transformation": transformation,
             }),
         ),
+        ShaderModule::EdgeFadeComposite => (
+            "edge_fade_masks",
+            layout!(EdgeFadeMask {
+                "bounds": bounds,
+                "fade_bounds": fade_bounds,
+                "bands": bands,
+                "bands.top": bands.top,
+                "bands.right": bands.right,
+                "bands.bottom": bands.bottom,
+                "bands.left": bands.left,
+            }),
+        ),
     };
     (buffer == name).then_some(layout)
 }
@@ -236,6 +249,7 @@ fn module_named(name: &str) -> Option<ShaderModule> {
         "emoji_rasterization" => ShaderModule::EmojiRasterization,
         "backdrop_blur" => ShaderModule::BackdropBlur,
         "path_clip_composite" => ShaderModule::PathClipComposite,
+        "edge_fade_composite" => ShaderModule::EdgeFadeComposite,
         _ => return None,
     })
 }

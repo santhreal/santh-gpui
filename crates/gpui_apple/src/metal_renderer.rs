@@ -1,3 +1,5 @@
+#[cfg(test)]
+mod draw_tests;
 mod layers;
 
 use crate::metal_atlas::MetalAtlas;
@@ -9,12 +11,12 @@ use cocoa::{
     quartzcore::AutoresizingMask,
 };
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, LayerMask, PaintSurface, Path,
+    Point, PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
-use layers::RenderLayers;
+use layers::{CompositeMask, RenderLayers};
 
 use core_foundation::base::TCFType;
 use core_video::{
@@ -137,7 +139,7 @@ pub struct MetalRenderer {
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
-    /// Offscreen targets and pipelines for backdrop blurs and path clips.
+    /// Offscreen targets and pipelines for backdrop blurs and layer masks.
     layers: RenderLayers,
     /// Offscreen render target reused across `render_scene` calls when
     /// rendering headlessly without reading pixels back.
@@ -677,10 +679,10 @@ impl MetalRenderer {
             Some(targets) => &targets.frame,
             None => texture,
         };
-        // Open path clips, innermost last, each with the layer its subtree
+        // Open layer masks, innermost last, each with the layer its subtree
         // draws into.
-        let mut clip_stack: Vec<(Path<ScaledPixels>, metal::Texture)> = Vec::new();
-        let mut used_clip = false;
+        let mut mask_stack: Vec<(LayerMask, metal::Texture)> = Vec::new();
+        let mut used_mask = false;
 
         let mut command_encoder = new_command_encoder_for_texture(
             command_buffer,
@@ -710,7 +712,7 @@ impl MetalRenderer {
 
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
-                        current_target(frame, &clip_stack),
+                        current_target(frame, &mask_stack),
                         viewport_size,
                         None,
                     );
@@ -762,7 +764,7 @@ impl MetalRenderer {
                     RenderLayers::snapshot_frame(command_buffer, targets);
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
-                        current_target(frame, &clip_stack),
+                        current_target(frame, &mask_stack),
                         viewport_size,
                         None,
                     );
@@ -779,44 +781,45 @@ impl MetalRenderer {
                         return Err(error);
                     }
                 }
-                PrimitiveBatch::StartPathClip(path) => {
+                PrimitiveBatch::StartLayerMask(mask) => {
                     command_encoder.end_encoding();
                     let layer =
                         self.layers
-                            .clip_layer(&self.device, viewport_size, clip_stack.len())?;
+                            .mask_layer(&self.device, viewport_size, mask_stack.len())?;
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
                         &layer,
                         viewport_size,
                         Some(metal::MTLClearColor::new(0., 0., 0., 0.)),
                     );
-                    clip_stack.push((path, layer));
-                    used_clip = true;
+                    mask_stack.push((mask, layer));
+                    used_mask = true;
                 }
-                PrimitiveBatch::EndPathClip => {
+                PrimitiveBatch::EndLayerMask => {
                     command_encoder.end_encoding();
-                    let clip = clip_stack.pop();
-                    // The clip path is rasterized when the clip closes, so
+                    let open = mask_stack.pop();
+                    // A clip path is rasterized when its mask closes, so
                     // paths drawn inside the subtree cannot overwrite it.
-                    let did_draw = match &clip {
-                        Some((path, _)) => self.draw_paths_to_intermediate(
+                    let composite = match &open {
+                        Some((LayerMask::Path(path), _)) => self.draw_paths_to_intermediate(
                             slice::from_ref(path),
                             writer,
                             viewport_size,
                             command_buffer,
                         )?,
+                        Some((LayerMask::EdgeFade(_), _)) => true,
                         None => false,
                     };
                     command_encoder = new_command_encoder_for_texture(
                         command_buffer,
-                        current_target(frame, &clip_stack),
+                        current_target(frame, &mask_stack),
                         viewport_size,
                         None,
                     );
-                    if did_draw
-                        && let Some((path, layer)) = &clip
-                        && let Err(error) = self.draw_path_clip_composite(
-                            path,
+                    if composite
+                        && let Some((mask, layer)) = &open
+                        && let Err(error) = self.draw_layer_composite(
+                            mask,
                             layer,
                             writer,
                             viewport_size,
@@ -841,27 +844,33 @@ impl MetalRenderer {
                 viewport_size,
             )?;
         }
-        self.layers.end_frame(backdrop_targets.is_some(), used_clip);
+        self.layers.end_frame(backdrop_targets.is_some(), used_mask);
 
         Ok(command_buffer.to_owned())
     }
 
-    fn draw_path_clip_composite(
+    /// Composites `layer` onto the encoder's target through `mask`. A path
+    /// mask reads the path rasterized into the path intermediate texture.
+    fn draw_layer_composite(
         &mut self,
-        path: &Path<ScaledPixels>,
+        mask: &LayerMask,
         layer: &metal::TextureRef,
         writer: &mut InstanceBufferWriter,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> Result<()> {
-        let mask = self
-            .path_intermediate_texture
-            .as_ref()
-            .context("missing path intermediate texture")?;
         let sprite = writer.write(&[PathSprite {
-            bounds: path.transformation.apply_to_bounds(path.clipped_bounds()),
+            bounds: mask.bounds(),
         }])?;
-        self.layers.draw_path_clip_composite(
+        let mask = match mask {
+            LayerMask::Path(_) => CompositeMask::Path(
+                self.path_intermediate_texture
+                    .as_ref()
+                    .context("missing path intermediate texture")?,
+            ),
+            LayerMask::EdgeFade(fade) => CompositeMask::EdgeFade(fade),
+        };
+        self.layers.draw_layer_composite(
             &self.device,
             &sprite,
             &self.unit_vertices,
@@ -1336,13 +1345,13 @@ impl MetalRenderer {
     }
 }
 
-/// Returns the texture batches draw into: the innermost open clip layer, or
-/// `frame` when no path clip is open.
+/// Returns the texture batches draw into: the innermost open mask layer, or
+/// `frame` when no layer mask is open.
 fn current_target<'a>(
     frame: &'a metal::TextureRef,
-    clip_stack: &'a [(Path<ScaledPixels>, metal::Texture)],
+    mask_stack: &'a [(LayerMask, metal::Texture)],
 ) -> &'a metal::TextureRef {
-    match clip_stack.last() {
+    match mask_stack.last() {
         Some((_, layer)) => layer,
         None => frame,
     }
@@ -1737,6 +1746,12 @@ enum BackdropBlurInputIndex {
 
 #[repr(C)]
 enum PathClipInputIndex {
+    Layer = 0,
+    Mask = 1,
+}
+
+#[repr(C)]
+enum EdgeFadeInputIndex {
     Layer = 0,
     Mask = 1,
 }

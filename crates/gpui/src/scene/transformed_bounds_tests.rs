@@ -186,7 +186,7 @@ fn a_primitive_transformed_over_an_earlier_one_draws_above_it() {
             bounds: rect(500.0, 500.0, 100.0, 100.0),
             content_mask: mask(),
             #[cfg(target_os = "macos")]
-            image_buffer: Default::default(),
+            image_buffer: test_image_buffer(),
         });
         scene.insert_primitive(primitive);
         scene.finish();

@@ -8,21 +8,21 @@ use crate::{
     Action, AnyDrag, AnyElement, AnyImageCache, AnyTooltip, AnyView, App, AppContext, Arena, Asset,
     AsyncWindowContext, AtlasTile, AvailableSpace, BackdropBlur, Background, BorderStyle, Bounds,
     BoxShadow, Capslock, Context, Corners, CursorHideMode, CursorStyle, Decorations, DevicePixels,
-    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, Edges, Effect, Entity,
-    EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId, GpuSpecs,
-    Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent, Keystroke,
-    KeystrokeEvent, LayoutId, LineLayoutIndex, Modifiers, ModifiersChangedEvent, MonochromeSprite,
-    MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent, Path, Pixels, PlatformAtlas,
-    PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PolychromeSprite,
-    Priority, PromptButton, PromptLevel, Quad, Render, RenderGlyphParams, RenderImage,
-    RenderImageParams, RenderSvgParams, Replay, ResizeEdge, SMOOTH_SVG_SCALE_FACTOR,
-    SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow, SharedString, Size,
-    StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription, SystemWindowTab,
-    SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task, TextInputConfiguration,
-    TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState, TransformationMatrix,
-    Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem, point,
-    prelude::*, px, rems, size, transparent_black,
+    DispatchActionListener, DispatchNodeId, DispatchTree, DisplayId, EdgeFadeMask, Edges, Effect,
+    Entity, EntityId, EventEmitter, FileDropEvent, FontId, Global, GlobalElementId, GlyphId,
+    GpuSpecs, Hsla, InputHandler, IsZero, KeyBinding, KeyContext, KeyDownEvent, KeyEvent,
+    Keystroke, KeystrokeEvent, LayerMask, LayoutId, LineLayoutIndex, Modifiers,
+    ModifiersChangedEvent, MonochromeSprite, MouseButton, MouseEvent, MouseMoveEvent, MouseUpEvent,
+    Path, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformWindow, Point, PolychromeSprite, Priority, PromptButton, PromptLevel, Quad, Render,
+    RenderGlyphParams, RenderImage, RenderImageParams, RenderSvgParams, Replay, ResizeEdge,
+    SMOOTH_SVG_SCALE_FACTOR, SUBPIXEL_VARIANTS_X, SUBPIXEL_VARIANTS_Y, ScaledPixels, Scene, Shadow,
+    SharedString, Size, StrikethroughStyle, Style, SubpixelSprite, SubscriberSet, Subscription,
+    SystemWindowTab, SystemWindowTabController, TabStopMap, TaffyLayoutEngine, Task,
+    TextInputConfiguration, TextRenderingMode, TextStyle, TextStyleRefinement, ThermalState,
+    TransformationMatrix, Underline, UnderlineStyle, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControls, WindowDecorations, WindowOptions, WindowParams, WindowTextSystem,
+    point, prelude::*, px, rems, size, transparent_black,
 };
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
@@ -2189,6 +2189,32 @@ impl ContentMask<ScaledPixels> {
     }
 }
 
+/// A region whose subtree fades to transparent across a band inside each edge.
+///
+/// At a pixel `p`, the fade ratio `r` is the minimum, over each edge with a
+/// nonzero band, of `clamp(d / band, 0, 1)`, where `d` is the distance from
+/// `p` to that edge measured toward the inside of `bounds`. A pixel painted
+/// by the subtree is composited with its premultiplied color multiplied by
+/// `r * r`. `r` is 0 beyond an edge with a nonzero band. An edge with a zero
+/// band does not limit `r`, so content beyond it is unaffected.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EdgeFade {
+    /// The faded region, in window coordinates.
+    pub bounds: Bounds<Pixels>,
+    /// The width of the ramp inside each edge; zero leaves that edge unfaded.
+    pub bands: Edges<Pixels>,
+}
+
+impl EdgeFade {
+    /// Whether any edge has a band wider than zero. A fade without one
+    /// leaves its subtree unchanged. A NaN band is not wider than zero.
+    pub fn fades(&self) -> bool {
+        // `Pixels` orders by `f32::total_cmp`, which places NaN above every
+        // number, so the comparison reads the `f32`.
+        self.bands.any(|band| band.0 > 0.0)
+    }
+}
+
 impl Window {
     fn mark_view_dirty(&mut self, view_id: EntityId) {
         // Mark ancestor views as dirty. If already in the `dirty_views` set, then all its ancestors
@@ -3914,7 +3940,8 @@ impl Window {
 
     /// Invoke the given function with an arbitrary path clip. Subtree primitives
     /// are drawn into an intermediate target and composited onto the frame
-    /// multiplied by the path coverage.
+    /// multiplied by the path coverage. A path that covers nothing inside the
+    /// current content mask hides the subtree.
     pub fn with_clip_path<R>(
         &mut self,
         mut path: Path<Pixels>,
@@ -3929,14 +3956,44 @@ impl Window {
         path.transformation = self.transformation;
 
         let scaled_path = path.scale(scale_factor);
-        let clipped_bounds = scaled_path.clipped_bounds();
-        if clipped_bounds.is_empty() {
-            return f(self);
+        if scaled_path.clipped_bounds().is_empty() {
+            return self.with_content_mask(Some(ContentMask::default()), f);
         }
+        self.with_layer_mask(LayerMask::Path(scaled_path), f)
+    }
 
-        self.next_frame.scene.push_path_clip(scaled_path);
+    /// Invoke the given function with an edge fade. Subtree primitives are
+    /// drawn into an intermediate target and composited onto the frame
+    /// multiplied by the fade documented on [`EdgeFade`]. `None`, or a fade
+    /// with no band wider than zero, invokes `f` directly and records
+    /// nothing in the scene. A fade whose faded edges exclude the whole
+    /// current content mask hides the subtree.
+    pub fn with_edge_fade<R>(
+        &mut self,
+        fade: Option<EdgeFade>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> R {
+        self.invalidator.debug_assert_paint();
+
+        let Some(fade) = fade.filter(EdgeFade::fades) else {
+            return f(self);
+        };
+        let scale_factor = self.scale_factor();
+        let mask = EdgeFadeMask::new(
+            fade.bounds.scale(scale_factor),
+            fade.bands.scale(scale_factor),
+            self.snapped_content_mask().bounds,
+        );
+        if mask.bounds.is_empty() {
+            return self.with_content_mask(Some(ContentMask::default()), f);
+        }
+        self.with_layer_mask(LayerMask::EdgeFade(mask), f)
+    }
+
+    fn with_layer_mask<R>(&mut self, mask: LayerMask, f: impl FnOnce(&mut Self) -> R) -> R {
+        self.next_frame.scene.push_layer_mask(mask);
         let result = f(self);
-        self.next_frame.scene.pop_path_clip();
+        self.next_frame.scene.pop_layer_mask();
         result
     }
 
@@ -8540,6 +8597,190 @@ mod tests {
                 Some(bounds(100.0, 0.0, 58.0, 20.0)),
                 "the old position is not carried past the frame that cleared it"
             );
+        }
+    }
+
+    /// WHY: `with_edge_fade` and `with_clip_path` are the only producers of
+    /// layer masks. A fade with no band must record nothing, so an unused
+    /// fade costs nothing; a fade must be recorded in device pixels around
+    /// the subtree it wraps; and a fade or clip path that leaves nothing
+    /// visible must hide its subtree instead of drawing it unmasked. Does not
+    /// catch a renderer that composites a recorded mask wrongly.
+    mod layer_masks {
+        use super::*;
+        use crate::{
+            EdgeFade, LayerMask, Path, PrimitiveBatch, canvas, div, fill, point, px, red, size,
+        };
+
+        type Paint = Rc<dyn Fn(&mut Window)>;
+
+        struct Paints(Paint);
+
+        impl Render for Paints {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let paint = self.0.clone();
+                div()
+                    .size_full()
+                    .child(canvas(|_, _, _| {}, move |_, _, window, _| paint(window)))
+            }
+        }
+
+        fn bounds(x: f32, y: f32, width: f32, height: f32) -> Bounds<Pixels> {
+            Bounds::new(point(px(x), px(y)), size(px(width), px(height)))
+        }
+
+        fn scaled(x: f32, y: f32, width: f32, height: f32) -> Bounds<ScaledPixels> {
+            Bounds::new(
+                point(ScaledPixels(x), ScaledPixels(y)),
+                size(ScaledPixels(width), ScaledPixels(height)),
+            )
+        }
+
+        /// Draws an 800x600 window at scale factor 2 that runs `paint`, and
+        /// returns the masks its frame recorded and its batches in draw
+        /// order: `S` for a mask start, `E` for a mask end, `Q` per quad.
+        fn frame(
+            cx: &mut TestAppContext,
+            paint: impl Fn(&mut Window) + 'static,
+        ) -> (Vec<LayerMask>, String) {
+            let paint: Paint = Rc::new(paint);
+            let window = cx.open_window(size(px(800.0), px(600.0)), move |_, _| Paints(paint));
+            cx.run_until_parked();
+            window
+                .update(cx, |_, window, _| {
+                    assert_eq!(window.scale_factor(), 2.0);
+                    let scene = &window.rendered_frame.scene;
+                    let masks = scene
+                        .start_layer_masks
+                        .iter()
+                        .map(|start| start.mask.clone())
+                        .collect();
+                    let drawn = scene
+                        .batches()
+                        .map(|batch| match batch {
+                            PrimitiveBatch::StartLayerMask(_) => "S".to_string(),
+                            PrimitiveBatch::EndLayerMask => "E".to_string(),
+                            PrimitiveBatch::Quads(range) => "Q".repeat(range.len()),
+                            other => panic!("unexpected batch {other:?}"),
+                        })
+                        .collect();
+                    (masks, drawn)
+                })
+                .unwrap()
+        }
+
+        fn paint_red(window: &mut Window) {
+            window.paint_quad(fill(bounds(50.0, 50.0, 100.0, 100.0), red()));
+        }
+
+        #[gpui::test]
+        fn a_fade_without_a_band_records_nothing(cx: &mut TestAppContext) {
+            let region = bounds(10.0, 10.0, 300.0, 300.0);
+            let unfaded = [
+                None,
+                Some(Edges::all(px(0.0))),
+                Some(Edges::all(px(-4.0))),
+                Some(Edges::all(px(f32::NAN))),
+            ];
+            for bands in unfaded {
+                let fade = bands.map(|bands| EdgeFade {
+                    bounds: region,
+                    bands,
+                });
+                let (masks, drawn) = frame(cx, move |window| {
+                    window.with_edge_fade(fade, paint_red);
+                });
+                assert!(masks.is_empty(), "{fade:?} recorded {masks:?}");
+                assert_eq!(drawn, "Q", "{fade:?}");
+            }
+        }
+
+        /// The fade region, the bands, and the composited region all scale
+        /// to device pixels; the region stays at the viewport on the unfaded
+        /// right edge.
+        #[gpui::test]
+        fn a_fade_is_recorded_in_device_pixels_around_its_subtree(cx: &mut TestAppContext) {
+            let fade = EdgeFade {
+                bounds: bounds(10.0, 20.0, 300.0, 200.0),
+                bands: Edges {
+                    top: px(8.0),
+                    right: px(0.0),
+                    bottom: px(16.0),
+                    left: px(4.0),
+                },
+            };
+            let (masks, drawn) = frame(cx, move |window| {
+                window.with_edge_fade(Some(fade), paint_red);
+            });
+            assert_eq!(drawn, "SQE");
+            let [LayerMask::EdgeFade(mask)] = masks.as_slice() else {
+                panic!("expected one edge fade, got {masks:?}");
+            };
+            assert_eq!(mask.fade_bounds, scaled(20.0, 40.0, 600.0, 400.0));
+            assert_eq!(
+                mask.bands,
+                Edges {
+                    top: ScaledPixels(16.0),
+                    right: ScaledPixels(0.0),
+                    bottom: ScaledPixels(32.0),
+                    left: ScaledPixels(8.0),
+                }
+            );
+            assert_eq!(mask.bounds, scaled(20.0, 40.0, 1580.0, 400.0));
+        }
+
+        /// The content mask is the top 100 pixels and the fade's faded top
+        /// edge is at 200, so no pixel of the subtree is visible.
+        #[gpui::test]
+        fn a_fade_beyond_the_content_mask_hides_its_subtree(cx: &mut TestAppContext) {
+            let fade = EdgeFade {
+                bounds: bounds(0.0, 200.0, 800.0, 400.0),
+                bands: Edges {
+                    top: px(8.0),
+                    ..Edges::default()
+                },
+            };
+            let (masks, drawn) = frame(cx, move |window| {
+                window.with_content_mask(
+                    Some(ContentMask::from_bounds(bounds(0.0, 0.0, 800.0, 100.0))),
+                    |window| window.with_edge_fade(Some(fade), paint_red),
+                );
+            });
+            assert!(masks.is_empty(), "{masks:?}");
+            assert_eq!(drawn, "");
+        }
+
+        /// A clip path inside the content mask masks its subtree; a clip path
+        /// outside it, or with no area, hides the subtree.
+        #[gpui::test]
+        fn a_clip_path_that_covers_nothing_hides_its_subtree(cx: &mut TestAppContext) {
+            let square = |x: f32, y: f32, side: f32| {
+                let mut path = Path::new(point(px(x), px(y)));
+                path.line_to(point(px(x + side), px(y)));
+                path.line_to(point(px(x + side), px(y + side)));
+                path.line_to(point(px(x), px(y + side)));
+                path
+            };
+            let cases = [
+                (
+                    "inside the content mask",
+                    square(40.0, 40.0, 60.0),
+                    "SQE",
+                    1,
+                ),
+                ("outside the content mask", square(40.0, 300.0, 60.0), "", 0),
+                ("without area", square(40.0, 40.0, 0.0), "", 0),
+            ];
+            for (name, path, expected, mask_count) in cases {
+                let (masks, drawn) = frame(cx, move |window| {
+                    window.with_content_mask(
+                        Some(ContentMask::from_bounds(bounds(0.0, 0.0, 800.0, 200.0))),
+                        |window| window.with_clip_path(path.clone(), paint_red),
+                    );
+                });
+                assert_eq!(drawn, expected, "{name}");
+                assert_eq!(masks.len(), mask_count, "{name}: {masks:?}");
+            }
         }
     }
 }

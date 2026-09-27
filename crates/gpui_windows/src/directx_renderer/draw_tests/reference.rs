@@ -1,10 +1,11 @@
-//! CPU reference math for the draw tests: the documented backdrop blur and
-//! path clip composite, the rounded rectangle signed distance, and polygon
-//! coverage of path outlines.
+//! CPU reference math for the draw tests: the documented backdrop blur,
+//! layer mask composite, and edge fade, the rounded rectangle signed
+//! distance, and polygon coverage of path outlines.
 
 use super::{EDGE, SIZE};
 use gpui::{
-    BackdropBlur, Bounds, Corners, Hsla, Path, Pixels, ScaledPixels, point, px, size, white,
+    BackdropBlur, Bounds, Corners, EdgeFadeMask, Edges, Hsla, LayerMask, Path, Pixels,
+    ScaledPixels, point, px, size, white,
 };
 
 pub(super) type Rgba = [f32; 4];
@@ -194,9 +195,61 @@ impl Outline {
     }
 }
 
-/// The documented `EndPathClip` composite of `layer` onto `dst` at path
-/// coverage `m`.
+/// The documented `EndLayerMask` composite of `layer` onto `dst` at mask
+/// value `m`.
 pub(super) fn composite(dst: Rgba, layer: Rgba, m: f32) -> Rgba {
     let [r, g, b] = [0, 1, 2].map(|c| layer[c] * m + dst[c] * (1.0 - layer[3] * m));
     [r, g, b, (layer[3] * m + dst[3]).min(1.0)]
+}
+
+/// An edge fade in logical pixels, drawn at `scale` device pixels per
+/// logical pixel.
+pub(super) struct Fade {
+    /// The faded region.
+    pub(super) bounds: Bounds<Pixels>,
+    /// The width of the ramp inside each edge of `bounds`.
+    pub(super) bands: Edges<Pixels>,
+    /// The region the layer is composited into.
+    pub(super) clip: Bounds<Pixels>,
+    pub(super) scale: f32,
+}
+
+impl Fade {
+    /// The layer mask `Window::with_edge_fade` records for this fade.
+    pub(super) fn mask(&self) -> LayerMask {
+        LayerMask::EdgeFade(EdgeFadeMask::new(
+            self.bounds.scale(self.scale),
+            self.bands.scale(self.scale),
+            self.clip.scale(self.scale),
+        ))
+    }
+
+    /// The documented mask value `m = r * r` at the center of device pixel
+    /// `(x, y)`, zero outside `clip`. Computed in logical pixels, where the
+    /// ratio of a distance to a band is the same as in device pixels.
+    pub(super) fn m(&self, x: i32, y: i32) -> f32 {
+        let p = ((x as f32 + 0.5) / self.scale, (y as f32 + 0.5) / self.scale);
+        let [left, top, right, bottom] = sides(&self.clip);
+        if p.0 < left || p.0 >= right || p.1 < top || p.1 >= bottom {
+            return 0.0;
+        }
+        let [left, top, right, bottom] = sides(&self.bounds);
+        let r = [
+            (p.1 - top, self.bands.top),
+            (right - p.0, self.bands.right),
+            (bottom - p.1, self.bands.bottom),
+            (p.0 - left, self.bands.left),
+        ]
+        .map(|(d, band)| (d, f32::from(band)))
+        .into_iter()
+        .filter(|(_, band)| *band > 0.0)
+        .map(|(d, band)| (d / band).clamp(0.0, 1.0))
+        .fold(1.0, f32::min);
+        r * r
+    }
+}
+
+/// The left, top, right, and bottom sides of `bounds`.
+fn sides(bounds: &Bounds<Pixels>) -> [f32; 4] {
+    [bounds.left(), bounds.top(), bounds.right(), bounds.bottom()].map(f32::from)
 }

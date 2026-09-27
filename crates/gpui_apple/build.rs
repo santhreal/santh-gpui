@@ -65,6 +65,8 @@ mod macos_build {
             "BackdropBlur".into(),
             "BackdropBlurInputIndex".into(),
             "PathClipInputIndex".into(),
+            "EdgeFadeMask".into(),
+            "EdgeFadeInputIndex".into(),
             "FrameCopyInputIndex".into(),
         ]);
         config.no_includes = true;

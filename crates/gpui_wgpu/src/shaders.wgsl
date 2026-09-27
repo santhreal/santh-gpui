@@ -1191,6 +1191,57 @@ fn fs_path_mask_composite(input: PathVarying) -> @location(0) vec4<f32> {
     return color * mask.a;
 }
 
+// --- edge fade composite --- //
+
+// `gpui::EdgeFadeMask`: an edge fade in device pixels.
+struct EdgeFadeMask {
+    bounds: Bounds,
+    fade_bounds: Bounds,
+    bands: Edges,
+}
+
+struct EdgeFadeVarying {
+    @builtin(position) position: vec4<f32>,
+    // The left, top, right, and bottom edges of the faded region.
+    @location(0) @interpolate(flat) fade_edges: vec4<f32>,
+    // The top, right, bottom, and left bands.
+    @location(1) @interpolate(flat) bands: vec4<f32>,
+}
+
+// The fade ratio at `p`: the minimum, over each edge with a nonzero band, of
+// the distance from `p` to that edge toward the inside of the faded region
+// divided by the band, clamped to [0, 1]. 1 when every band is zero.
+fn edge_fade_ratio(p: vec2<f32>, edges: vec4<f32>, bands: vec4<f32>) -> f32 {
+    // Distances to the top, right, bottom, and left edges, in band order.
+    let distances = vec4<f32>(p.y - edges.y, edges.z - p.x, edges.w - p.y, p.x - edges.x);
+    let faded = bands > vec4<f32>(0.0);
+    let ratios = select(
+        vec4<f32>(1.0),
+        saturate(distances / select(vec4<f32>(1.0), bands, faded)),
+        faded,
+    );
+    return min(min(ratios.x, ratios.y), min(ratios.z, ratios.w));
+}
+
+@vertex
+fn vs_edge_fade(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index) instance_id: u32) -> EdgeFadeVarying {
+    let unit_vertex = vec2<f32>(f32(vertex_id & 1u), 0.5 * f32(vertex_id & 2u));
+    let fade = load_edge_fade(instance_id);
+    var out = EdgeFadeVarying();
+    out.position = to_device_position(unit_vertex, fade.bounds);
+    out.fade_edges = vec4<f32>(fade.fade_bounds.origin, fade.fade_bounds.origin + fade.fade_bounds.size);
+    out.bands = vec4<f32>(fade.bands.top, fade.bands.right, fade.bands.bottom, fade.bands.left);
+    return out;
+}
+
+// Composites the premultiplied layer in `t_sprite` through `m = r * r`.
+@fragment
+fn fs_edge_fade(input: EdgeFadeVarying) -> @location(0) vec4<f32> {
+    let layer = textureLoad(t_sprite, vec2<i32>(input.position.xy), 0);
+    let r = edge_fade_ratio(input.position.xy, input.fade_edges, input.bands);
+    return layer * (r * r);
+}
+
 // --- underlines --- //
 
 struct Underline {

@@ -2782,6 +2782,7 @@ dependencies = [
  "gpui",
  "gpui_util",
  "itertools 0.14.0",
+ "libc",
  "log",
  "naga",
  "parking_lot",

@@ -46,6 +46,17 @@ wgpu = { workspace = true, features = ["webgl"] }
 criterion.workspace = true
 naga = { version = "29.0.4", features = ["wgsl-in"] }
 
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dev-dependencies]
+libc.workspace = true
+
 [[bench]]
 name = "layout_line"
+harness = false
+
+[[bench]]
+name = "layer_mask_frame"
+harness = false
+
+[[bench]]
+name = "renderer_creation"
 harness = false

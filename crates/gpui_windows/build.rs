@@ -40,6 +40,7 @@ mod shader_compilation {
             "polychrome_sprite",
             "backdrop_blur",
             "path_clip_composite",
+            "edge_fade_composite",
         ];
 
         let rust_binding_path = format!("{}/shaders_bytes.rs", out_dir);

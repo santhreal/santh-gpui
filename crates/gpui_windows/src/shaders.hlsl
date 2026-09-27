@@ -1426,3 +1426,51 @@ float4 path_clip_composite_fragment(PathSpriteVertexOutput input): SV_Target {
     float coverage = t_clip_mask.Sample(s_sprite, input.texture_coords).a;
     return layer * coverage;
 }
+
+/*
+**
+**              Edge fade composite
+**
+*/
+
+// Implements the fade documented on `EdgeFadeMask` in gpui's scene.rs.
+struct EdgeFadeMask {
+    Bounds bounds;
+    Bounds fade_bounds;
+    Edges bands;
+};
+
+struct EdgeFadeVertexOutput {
+    float4 position: SV_Position;
+    nointerpolation uint mask_id: TEXCOORD0;
+};
+
+StructuredBuffer<EdgeFadeMask> edge_fade_masks: register(t1);
+
+EdgeFadeVertexOutput edge_fade_composite_vertex(uint vertex_id: SV_VertexID, uint mask_id: SV_InstanceID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+    EdgeFadeVertexOutput output;
+    output.position = to_device_position(unit_vertex, edge_fade_masks[mask_id].bounds);
+    output.mask_id = mask_id;
+    return output;
+}
+
+// `clamp(d / band, 0, 1)` for a pixel center `d` pixels inside an edge, or 1
+// for an edge with no band.
+float edge_fade_ramp(float d, float band) {
+    return band > 0.0 ? saturate(d / band) : 1.0;
+}
+
+// `t_sprite` holds the masked subtree with premultiplied color. The result
+// is blended with ONE, INV_SRC_ALPHA.
+float4 edge_fade_composite_fragment(EdgeFadeVertexOutput input): SV_Target {
+    EdgeFadeMask mask = edge_fade_masks[input.mask_id];
+    float2 p = input.position.xy;
+    float2 lo = mask.fade_bounds.origin;
+    float2 hi = lo + mask.fade_bounds.size;
+    float r = min(
+        min(edge_fade_ramp(p.y - lo.y, mask.bands.top), edge_fade_ramp(hi.x - p.x, mask.bands.right)),
+        min(edge_fade_ramp(hi.y - p.y, mask.bands.bottom), edge_fade_ramp(p.x - lo.x, mask.bands.left)));
+    float4 layer = t_sprite.Load(int3(int2(p), 0));
+    return layer * (r * r);
+}

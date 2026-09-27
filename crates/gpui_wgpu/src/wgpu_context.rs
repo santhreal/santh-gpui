@@ -1,7 +1,6 @@
+use crate::wgpu_renderer::PipelineCache;
 #[cfg(not(target_family = "wasm"))]
 use anyhow::Context as _;
-#[cfg(not(target_family = "wasm"))]
-use gpui_util::ResultExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use wgpu::TextureFormat;
@@ -9,10 +8,17 @@ use wgpu::TextureFormat;
 #[cfg(not(target_family = "wasm"))]
 mod adapter_selection;
 #[cfg(not(target_family = "wasm"))]
-use adapter_selection::{BackendTier, parse_pci_id};
+use adapter_selection::BackendTier;
 
 mod instance;
+#[cfg(not(target_family = "wasm"))]
+pub use instance::DisplayInstances;
 pub(crate) use instance::create_instance;
+
+#[cfg(test)]
+mod keepalive;
+#[cfg(all(test, not(target_family = "wasm")))]
+mod tests;
 
 pub struct WgpuContext {
     pub instance: wgpu::Instance,
@@ -23,6 +29,9 @@ pub struct WgpuContext {
     dual_source_blending: bool,
     color_texture_format: wgpu::TextureFormat,
     device_lost: Arc<AtomicBool>,
+    /// The shader modules, bind group layouts, and render pipelines of the
+    /// renderers on `device`, dropped with the context.
+    pub(crate) pipeline_cache: Arc<PipelineCache>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -71,83 +80,59 @@ pub struct CompositorGpuHint {
 }
 
 impl WgpuContext {
-    /// Creates the context of `window`'s display and the surface of
-    /// `window`, selecting an adapter whose device configures the surface.
-    /// `reject_software` excludes CPU adapters. The context comes from the
-    /// first backend tier that selects an adapter.
+    /// Creates the context of `window`'s display from `instances` and the
+    /// surface of `window`, selecting an adapter whose device configures
+    /// the surface. `reject_software` excludes CPU adapters. The context
+    /// comes from the first backend tier that selects an adapter.
     #[cfg(not(target_family = "wasm"))]
     pub fn for_window<W>(
+        instances: &DisplayInstances,
         window: &W,
         compositor_gpu: Option<CompositorGpuHint>,
         reject_software: bool,
     ) -> anyhow::Result<(Self, wgpu::Surface<'static>)>
     where
-        W: raw_window_handle::HasWindowHandle + wgpu::wgt::WgpuHasDisplayHandle + Clone,
+        W: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle,
     {
-        let window_handle = window
-            .window_handle()
-            .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?
-            .as_raw();
-        Self::by_backend_tier(window, |instance, tier| {
-            let surface =
-                create_surface(&instance, window_handle).context("Failed to create surface")?;
-            let context = Self::new_with_options(
-                instance,
-                tier,
-                Some(&surface),
-                compositor_gpu,
-                reject_software,
-            )?;
-            Ok((context, surface))
-        })
-    }
-
-    /// Creates the context of the windows on `display`, selecting the
-    /// adapter without a surface. The context comes from the first backend
-    /// tier that selects an adapter.
-    #[cfg(not(target_family = "wasm"))]
-    pub fn for_display<D>(
-        display: &D,
-        compositor_gpu: Option<CompositorGpuHint>,
-    ) -> anyhow::Result<Self>
-    where
-        D: wgpu::wgt::WgpuHasDisplayHandle + Clone,
-    {
-        Self::by_backend_tier(display, |instance, tier| {
-            Self::new_with_options(instance, tier, None, compositor_gpu, false)
-        })
-    }
-
-    /// The result of `create` on an instance of the Vulkan tier, or, if that
-    /// fails, on an instance of the Vulkan and GL tier. Both instances
-    /// display on `display`.
-    #[cfg(not(target_family = "wasm"))]
-    fn by_backend_tier<D, T>(
-        display: &D,
-        mut create: impl FnMut(wgpu::Instance, BackendTier) -> anyhow::Result<T>,
-    ) -> anyhow::Result<T>
-    where
-        D: wgpu::wgt::WgpuHasDisplayHandle + Clone,
-    {
-        let instance = |tier: BackendTier| {
-            create_instance(wgpu::InstanceDescriptor {
-                backends: tier.backends(),
-                flags: wgpu::InstanceFlags::default(),
-                backend_options: wgpu::BackendOptions::default(),
-                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-                display: Some(Box::new(display.clone())),
-            })
-        };
-        match create(instance(BackendTier::Vulkan), BackendTier::Vulkan) {
-            Ok(created) => Ok(created),
-            Err(error) => {
-                log::info!(
-                    "No Vulkan adapter selected ({error:#}); selecting from the Vulkan and GL \
-                     adapters"
-                );
-                create(instance(BackendTier::VulkanAndGl), BackendTier::VulkanAndGl)
+        Self::by_backend_tier(instances, |tier, candidates| {
+            let mut surfaces = Vec::with_capacity(candidates.len());
+            let mut errors = Vec::new();
+            for &instance in candidates {
+                match create_surface(instance, window) {
+                    Ok(surface) => surfaces.push((instance, surface)),
+                    Err(error) => errors.push(format!("{error:#}")),
+                }
             }
-        }
+            anyhow::ensure!(
+                !surfaces.is_empty(),
+                "Failed to create surface: {}",
+                errors.join("; ")
+            );
+            let sources: Vec<_> = surfaces
+                .iter()
+                .map(|(instance, surface)| (*instance, Some(surface)))
+                .collect();
+            let (context, source) =
+                Self::new_with_options(&sources, tier, compositor_gpu, reject_software)?;
+            Ok((context, surfaces.swap_remove(source).1))
+        })
+    }
+
+    /// Creates the context of the windows of the display of `instances`,
+    /// selecting the adapter without a surface. The context comes from the
+    /// first backend tier that selects an adapter.
+    #[cfg(not(target_family = "wasm"))]
+    pub fn for_display(
+        instances: &DisplayInstances,
+        compositor_gpu: Option<CompositorGpuHint>,
+    ) -> anyhow::Result<Self> {
+        Self::by_backend_tier(instances, |tier, candidates| {
+            let sources: Vec<_> = candidates
+                .iter()
+                .map(|&instance| (instance, None))
+                .collect();
+            Ok(Self::new_with_options(&sources, tier, compositor_gpu, false)?.0)
+        })
     }
 
     /// Creates a surfaceless WgpuContext with no OS display surface.
@@ -159,13 +144,8 @@ impl WgpuContext {
         instance: wgpu::Instance,
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_options(
-            instance,
-            BackendTier::VulkanAndGl,
-            None,
-            compositor_gpu,
-            false,
-        )
+        let sources = [(&instance, None)];
+        Ok(Self::new_with_options(&sources, BackendTier::VulkanAndGl, compositor_gpu, false)?.0)
     }
 
     /// Creates a surfaceless WgpuContext rejecting software adapters.
@@ -174,75 +154,8 @@ impl WgpuContext {
         instance: wgpu::Instance,
         compositor_gpu: Option<CompositorGpuHint>,
     ) -> anyhow::Result<Self> {
-        Self::new_with_options(
-            instance,
-            BackendTier::VulkanAndGl,
-            None,
-            compositor_gpu,
-            true,
-        )
-    }
-
-    #[cfg(not(target_family = "wasm"))]
-    fn new_with_options(
-        instance: wgpu::Instance,
-        tier: BackendTier,
-        surface: Option<&wgpu::Surface<'_>>,
-        compositor_gpu: Option<CompositorGpuHint>,
-        reject_software: bool,
-    ) -> anyhow::Result<Self> {
-        let device_id_filter = match std::env::var("ZED_DEVICE_ID") {
-            Ok(val) => parse_pci_id(&val)
-                .context("Failed to parse device ID from `ZED_DEVICE_ID` environment variable")
-                .log_err(),
-            Err(std::env::VarError::NotPresent) => None,
-            err => {
-                err.context("Failed to read value of `ZED_DEVICE_ID` environment variable")
-                    .log_err();
-                None
-            }
-        };
-
-        // Select an adapter by actually testing surface configuration with the real device.
-        // This is the only reliable way to determine compatibility on hybrid GPU systems.
-        let (adapter, device, queue, dual_source_blending, color_texture_format) =
-            gpui::block_on(Self::select_adapter_and_device(
-                &instance,
-                tier,
-                device_id_filter,
-                surface,
-                compositor_gpu.as_ref(),
-                reject_software,
-            ))?;
-
-        let device_lost = Arc::new(AtomicBool::new(false));
-        device.set_device_lost_callback({
-            let device_lost = Arc::clone(&device_lost);
-            move |reason, message| {
-                log::error!("wgpu device lost: reason={reason:?}, message={message}");
-                if reason != wgpu::DeviceLostReason::Destroyed {
-                    device_lost.store(true, Ordering::Relaxed);
-                }
-            }
-        });
-
-        log::info!(
-            "Selected GPU adapter: {:?} ({:?})",
-            adapter.get_info().name,
-            adapter.get_info().backend
-        );
-
-        let backend = WgpuBackend::Native(adapter.get_info().backend);
-        Ok(Self {
-            instance,
-            adapter,
-            device: Arc::new(device),
-            queue: Arc::new(queue),
-            backend,
-            dual_source_blending,
-            color_texture_format,
-            device_lost,
-        })
+        let sources = [(&instance, None)];
+        Ok(Self::new_with_options(&sources, BackendTier::VulkanAndGl, compositor_gpu, true)?.0)
     }
 
     #[cfg(target_family = "wasm")]
@@ -333,10 +246,12 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             device_lost,
+            pipeline_cache: Arc::default(),
         };
         Ok(PreparedWebGraphics { context, surface })
     }
 
+    #[allow(clippy::disallowed_methods)]
     async fn create_device(
         adapter: &wgpu::Adapter,
     ) -> anyhow::Result<(wgpu::Device, wgpu::Queue, bool, TextureFormat)> {
@@ -390,29 +305,46 @@ impl WgpuContext {
         ))
     }
 
-    /// Creates a surfaceless wgpu::Instance with no display handle.
-    /// Allows overriding backend via ZED_BACKEND or WGPU_BACKEND environment variables.
+    /// Creates a wgpu::Instance with no display handle.
+    ///
+    /// `ZED_BACKEND`, or `WGPU_BACKEND` if it is unset, selects the backends
+    /// of the instance: `vulkan`, `gl` or `opengl`, `metal`, `dx12`, or
+    /// `all`. Otherwise the instance is Vulkan alone if one of its adapters
+    /// ranks above every GL adapter, and Vulkan and GL if none does.
+    /// Creating a GL instance loads every installed EGL vendor library, and
+    /// the NVIDIA driver (580) deadlocks when one thread destroys an EGL
+    /// context while another destroys a Vulkan device.
     #[cfg(not(target_family = "wasm"))]
     pub fn surfaceless_instance() -> wgpu::Instance {
-        let backends = match std::env::var("ZED_BACKEND").or_else(|_| std::env::var("WGPU_BACKEND"))
-        {
-            Ok(b) => match b.to_lowercase().as_str() {
-                "vulkan" => wgpu::Backends::VULKAN,
-                "gl" | "opengl" => wgpu::Backends::GL,
-                "metal" => wgpu::Backends::METAL,
-                "dx12" => wgpu::Backends::DX12,
-                "all" => wgpu::Backends::all(),
-                _ => wgpu::Backends::VULKAN | wgpu::Backends::GL,
-            },
-            Err(_) => wgpu::Backends::VULKAN | wgpu::Backends::GL,
+        let selected = std::env::var("ZED_BACKEND")
+            .or_else(|_| std::env::var("WGPU_BACKEND"))
+            .ok()
+            .and_then(|backend| match backend.to_lowercase().as_str() {
+                "vulkan" => Some(wgpu::Backends::VULKAN),
+                "gl" | "opengl" => Some(wgpu::Backends::GL),
+                "metal" => Some(wgpu::Backends::METAL),
+                "dx12" => Some(wgpu::Backends::DX12),
+                "all" => Some(wgpu::Backends::all()),
+                _ => None,
+            });
+        let surfaceless = |backends| {
+            create_instance(wgpu::InstanceDescriptor {
+                backends,
+                flags: wgpu::InstanceFlags::default(),
+                backend_options: wgpu::BackendOptions::default(),
+                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                display: None,
+            })
         };
-        create_instance(wgpu::InstanceDescriptor {
-            backends,
-            flags: wgpu::InstanceFlags::default(),
-            backend_options: wgpu::BackendOptions::default(),
-            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-            display: None,
-        })
+        if let Some(backends) = selected {
+            return surfaceless(backends);
+        }
+        let vulkan = surfaceless(wgpu::Backends::VULKAN);
+        if BackendTier::Vulkan.selects_from(&vulkan) {
+            return vulkan;
+        }
+        drop(vulkan);
+        surfaceless(wgpu::Backends::VULKAN | wgpu::Backends::GL)
     }
 
     pub fn check_compatible_with_surface(&self, surface: &wgpu::Surface<'_>) -> anyhow::Result<()> {
@@ -496,23 +428,33 @@ impl WgpuContext {
     }
 }
 
-/// Creates the surface of the window `raw_window_handle` on the display of
-/// `instance`.
+/// Creates the surface of `window` on `instance`.
 ///
 /// The caller keeps the window alive while the surface exists.
 #[cfg(not(target_family = "wasm"))]
-pub(crate) fn create_surface(
+pub(crate) fn create_surface<W>(
     instance: &wgpu::Instance,
-    raw_window_handle: raw_window_handle::RawWindowHandle,
-) -> anyhow::Result<wgpu::Surface<'static>> {
+    window: &W,
+) -> anyhow::Result<wgpu::Surface<'static>>
+where
+    W: raw_window_handle::HasWindowHandle + raw_window_handle::HasDisplayHandle,
+{
+    let raw_window_handle = window
+        .window_handle()
+        .map_err(|e| anyhow::anyhow!("Failed to get window handle: {e}"))?
+        .as_raw();
+    // A Vulkan instance of `DisplayInstances` has no display of its own, so
+    // the surface names the window's.
+    let raw_display_handle = window
+        .display_handle()
+        .map_err(|e| anyhow::anyhow!("Failed to get display handle: {e}"))?
+        .as_raw();
     // Safety: the caller keeps the window alive while the surface exists.
     unsafe {
-        instance
-            .create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
-                // The display handle is the one the instance was created with.
-                raw_display_handle: None,
-                raw_window_handle,
-            })
-            .map_err(|e| anyhow::anyhow!("{e}"))
+        instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+            raw_display_handle: Some(raw_display_handle),
+            raw_window_handle,
+        })
     }
+    .context("Failed to create surface")
 }

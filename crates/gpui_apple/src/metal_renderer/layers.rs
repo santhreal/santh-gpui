@@ -1,22 +1,23 @@
-//! Offscreen targets and pipelines for backdrop blurs and path-clipped layers.
+//! Offscreen targets and pipelines for backdrop blurs and layer masks.
 //!
 //! A frame with backdrop blurs draws into an offscreen frame texture, because
 //! a blur samples the frame drawn so far and a framebuffer-only drawable is
 //! not readable. Each blur batch copies that texture into the backdrop
-//! texture, and the finished frame is copied into the drawable. A path clip
+//! texture, and the finished frame is copied into the drawable. A layer mask
 //! draws its subtree into a cleared layer texture, one per nesting depth, and
-//! composites the layer onto its parent scaled by the clip path's coverage.
+//! composites the layer onto its parent scaled by the mask value: the clip
+//! path's coverage or the square of the edge fade ratio.
 //!
-//! Frames without blurs or clips create none of these resources. Textures are
+//! Frames without blurs or masks create none of these resources. Textures are
 //! released after [`gpui::LAYER_IDLE_RELEASE_FRAMES`] consecutive frames
 //! without a use, and pipelines are compiled on first use.
 
 use super::{
-    BackdropBlurInputIndex, FrameCopyInputIndex, InstanceBinding, PathClipInputIndex,
-    SpriteInputIndex,
+    BackdropBlurInputIndex, EdgeFadeInputIndex, FrameCopyInputIndex, InstanceBinding,
+    PathClipInputIndex, SpriteInputIndex,
 };
 use anyhow::{Context as _, Result};
-use gpui::{DevicePixels, LayerIdleCounter, Size};
+use gpui::{DevicePixels, EdgeFadeMask, LayerIdleCounter, Size};
 use metal::{MTLPixelFormat, MTLStorageMode, MTLTextureUsage};
 use std::{mem, ops::Range};
 
@@ -26,14 +27,15 @@ pub(super) struct RenderLayers {
     size: Size<DevicePixels>,
     frame: Option<metal::Texture>,
     backdrop: Option<metal::Texture>,
-    clip_layers: Vec<metal::Texture>,
+    mask_layers: Vec<metal::Texture>,
     blur_idle: LayerIdleCounter,
-    clip_idle: LayerIdleCounter,
+    mask_idle: LayerIdleCounter,
 }
 
 struct LayerPipelines {
     backdrop_blur: metal::RenderPipelineState,
     path_clip_composite: metal::RenderPipelineState,
+    edge_fade_composite: metal::RenderPipelineState,
     frame_copy: metal::RenderPipelineState,
 }
 
@@ -45,6 +47,15 @@ pub(super) struct BackdropTargets {
     pub backdrop: metal::Texture,
 }
 
+/// The mask value a layer is composited through, as the composite pipelines
+/// read it.
+pub(super) enum CompositeMask<'a> {
+    /// The clip path rasterized into this texture; its alpha is the mask.
+    Path(&'a metal::TextureRef),
+    /// The edge fade; the mask is the square of its fade ratio.
+    EdgeFade(&'a EdgeFadeMask),
+}
+
 impl RenderLayers {
     pub fn new(library: metal::Library) -> Self {
         Self {
@@ -53,9 +64,9 @@ impl RenderLayers {
             size: Size::default(),
             frame: None,
             backdrop: None,
-            clip_layers: Vec::new(),
+            mask_layers: Vec::new(),
             blur_idle: LayerIdleCounter::default(),
-            clip_idle: LayerIdleCounter::default(),
+            mask_idle: LayerIdleCounter::default(),
         }
     }
 
@@ -78,30 +89,37 @@ impl RenderLayers {
         Ok(BackdropTargets { frame, backdrop })
     }
 
-    /// Returns the cleared-on-use layer texture for clip nesting `depth`.
-    pub fn clip_layer(
+    /// Returns the cleared-on-use layer texture for mask nesting `depth`,
+    /// creating the textures of every shallower depth that is missing.
+    pub fn mask_layer(
         &mut self,
         device: &metal::DeviceRef,
         size: Size<DevicePixels>,
         depth: usize,
     ) -> Result<metal::Texture> {
         self.match_size(size)?;
-        while self.clip_layers.len() <= depth {
-            self.clip_layers.push(new_target(device, size));
+        while self.mask_layers.len() <= depth {
+            self.mask_layers.push(new_target(device, size));
         }
-        Ok(self.clip_layers[depth].clone())
+        Ok(self.mask_layers[depth].clone())
     }
 
-    /// Records whether the finished frame used blurs and clips, and releases
+    /// The layer textures held for mask nesting depths, shallowest first.
+    #[cfg(test)]
+    pub fn mask_layers(&self) -> &[metal::Texture] {
+        &self.mask_layers
+    }
+
+    /// Records whether the finished frame used blurs and masks, and releases
     /// the textures of a feature idle for
     /// [`gpui::LAYER_IDLE_RELEASE_FRAMES`] frames.
-    pub fn end_frame(&mut self, used_blur: bool, used_clip: bool) {
+    pub fn end_frame(&mut self, used_blur: bool, used_mask: bool) {
         if self.blur_idle.tick(used_blur) {
             self.frame = None;
             self.backdrop = None;
         }
-        if self.clip_idle.tick(used_clip) {
-            self.clip_layers.clear();
+        if self.mask_idle.tick(used_mask) {
+            self.mask_layers.clear();
         }
     }
 
@@ -114,7 +132,7 @@ impl RenderLayers {
             self.size = size;
             self.frame = None;
             self.backdrop = None;
-            self.clip_layers.clear();
+            self.mask_layers.clear();
         }
         Ok(())
     }
@@ -202,20 +220,36 @@ impl RenderLayers {
         Ok(())
     }
 
-    /// Draws `layer` onto the encoder's target, scaled by the alpha of `mask`
-    /// inside `sprite` (the clip path's bounds).
-    pub fn draw_path_clip_composite(
+    /// Draws `layer` onto the encoder's target inside `sprite` (the mask's
+    /// bounds), scaled by the value of `mask`.
+    pub fn draw_layer_composite(
         &mut self,
         device: &metal::DeviceRef,
         sprite: &InstanceBinding,
         unit_vertices: &metal::BufferRef,
         layer: &metal::TextureRef,
-        mask: &metal::TextureRef,
+        mask: CompositeMask<'_>,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
     ) -> Result<()> {
         let pipelines = self.pipelines(device)?;
-        command_encoder.set_render_pipeline_state(&pipelines.path_clip_composite);
+        match mask {
+            CompositeMask::Path(coverage) => {
+                command_encoder.set_render_pipeline_state(&pipelines.path_clip_composite);
+                command_encoder.set_fragment_texture(PathClipInputIndex::Layer as u64, Some(layer));
+                command_encoder
+                    .set_fragment_texture(PathClipInputIndex::Mask as u64, Some(coverage));
+            }
+            CompositeMask::EdgeFade(fade) => {
+                command_encoder.set_render_pipeline_state(&pipelines.edge_fade_composite);
+                command_encoder.set_fragment_texture(EdgeFadeInputIndex::Layer as u64, Some(layer));
+                command_encoder.set_fragment_bytes(
+                    EdgeFadeInputIndex::Mask as u64,
+                    mem::size_of_val(fade) as u64,
+                    fade as *const EdgeFadeMask as *const _,
+                );
+            }
+        }
         command_encoder.set_vertex_buffer(
             SpriteInputIndex::Vertices as u64,
             Some(unit_vertices),
@@ -231,8 +265,6 @@ impl RenderLayers {
             mem::size_of_val(&viewport_size) as u64,
             &viewport_size as *const Size<DevicePixels> as *const _,
         );
-        command_encoder.set_fragment_texture(PathClipInputIndex::Layer as u64, Some(layer));
-        command_encoder.set_fragment_texture(PathClipInputIndex::Mask as u64, Some(mask));
         command_encoder.draw_primitives_instanced(metal::MTLPrimitiveType::Triangle, 0, 6, 1);
         Ok(())
     }
@@ -288,6 +320,14 @@ impl LayerPipelines {
                 "path_clip_composite",
                 "path_sprite_vertex",
                 "path_clip_composite_fragment",
+                MTLPixelFormat::BGRA8Unorm,
+            ),
+            edge_fade_composite: super::build_path_sprite_pipeline_state(
+                device,
+                library,
+                "edge_fade_composite",
+                "path_sprite_vertex",
+                "edge_fade_composite_fragment",
                 MTLPixelFormat::BGRA8Unorm,
             ),
             frame_copy: build_copy_pipeline_state(device, library)?,

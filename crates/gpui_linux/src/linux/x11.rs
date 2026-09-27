@@ -1,5 +1,6 @@
 mod client;
 mod clipboard;
+mod compositor;
 mod display;
 mod event;
 mod frame_loop;

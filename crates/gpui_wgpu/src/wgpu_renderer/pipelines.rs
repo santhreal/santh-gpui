@@ -1,4 +1,5 @@
-//! The shader modules and render pipelines of a renderer.
+//! The bind group layouts, shader modules, and render pipelines of a
+//! pipeline key.
 //!
 //! Each module and each pipeline is created on a thread of its own.
 //! Creating a module parses, validates, and translates its WGSL; creating
@@ -9,11 +10,41 @@
 //! A validation error of a creation reaches the device's uncaptured error
 //! handler, as it does on the caller's thread.
 
-use super::{STORAGE_BUFFER_SHADERS, SUBPIXEL_SHADERS, WEBGL_SHADERS, WgpuBindGroupLayouts};
+use super::pipeline_cache::{ModuleKey, PipelineKey};
+use super::{
+    STORAGE_BUFFER_SHADERS, SUBPIXEL_SHADERS, WEBGL_SHADERS, WgpuBindGroupLayouts, WgpuRenderer,
+};
+use std::sync::Arc;
 use std::thread::{Scope, ScopedJoinHandle};
 
+/// The bind group layouts and shader modules the pipelines of a
+/// [`ModuleKey`] are created from.
+pub(super) struct WgpuModules {
+    key: ModuleKey,
+    layouts: WgpuBindGroupLayouts,
+    shaders: WgpuShaders,
+}
+
+impl WgpuModules {
+    pub(super) fn new(device: &wgpu::Device, key: ModuleKey) -> Self {
+        Self {
+            key,
+            layouts: WgpuRenderer::create_bind_group_layouts(device, key.uses_webgl_instance_data),
+            shaders: WgpuShaders::new(
+                device,
+                key.dual_source_blending,
+                key.uses_webgl_instance_data,
+            ),
+        }
+    }
+
+    pub(super) fn key(&self) -> ModuleKey {
+        self.key
+    }
+}
+
 /// The shader modules pipelines are created from.
-pub(super) struct WgpuShaders {
+struct WgpuShaders {
     main: wgpu::ShaderModule,
     /// The dual-source blending shaders of subpixel text, if the device
     /// blends with two sources.
@@ -21,7 +52,7 @@ pub(super) struct WgpuShaders {
 }
 
 impl WgpuShaders {
-    pub(super) fn new(
+    fn new(
         device: &wgpu::Device,
         dual_source_blending: bool,
         uses_webgl_instance_data: bool,
@@ -74,8 +105,11 @@ impl WgpuShaders {
     }
 }
 
-/// The render pipelines of a renderer.
+/// The render pipelines of a [`PipelineKey`], and the bind group layouts
+/// they reference.
 pub(super) struct WgpuPipelines {
+    key: PipelineKey,
+    modules: Arc<WgpuModules>,
     pub(super) quads: wgpu::RenderPipeline,
     pub(super) shadows: wgpu::RenderPipeline,
     pub(super) path_rasterization: wgpu::RenderPipeline,
@@ -87,7 +121,10 @@ pub(super) struct WgpuPipelines {
     #[allow(dead_code)]
     pub(super) surfaces: wgpu::RenderPipeline,
     pub(super) backdrop_blur: wgpu::RenderPipeline,
+    /// Composites a layer through a path mask.
     pub(super) path_mask_composite: wgpu::RenderPipeline,
+    /// Composites a layer through an edge fade mask.
+    pub(super) edge_fade_composite: wgpu::RenderPipeline,
     /// Writes transparent black inside the scissor rect. A render pass load
     /// op clears the whole attachment, so a partial frame clears its damaged
     /// region with this instead.
@@ -96,18 +133,22 @@ pub(super) struct WgpuPipelines {
 }
 
 impl WgpuPipelines {
-    /// Creates the pipelines that draw to a `format` target composited with
-    /// `alpha_mode`. A target that is not `copyable` is presented by the
+    /// Creates the pipelines of `key` from `modules`, the modules of
+    /// `key.modules`. A target that is not `copyable` is presented by the
     /// `present_retained` pipeline.
-    pub(super) fn new(
-        device: &wgpu::Device,
-        layouts: &WgpuBindGroupLayouts,
-        shaders: &WgpuShaders,
-        format: wgpu::TextureFormat,
-        alpha_mode: wgpu::CompositeAlphaMode,
-        path_sample_count: u32,
-        copyable: bool,
-    ) -> Self {
+    pub(super) fn new(device: &wgpu::Device, modules: &Arc<WgpuModules>, key: PipelineKey) -> Self {
+        debug_assert_eq!(modules.key, key.modules);
+        let WgpuModules {
+            layouts, shaders, ..
+        } = &**modules;
+        // Destructured without `..`: creation reads every field of the key.
+        let PipelineKey {
+            modules: _,
+            format,
+            premultiplied_alpha,
+            path_sample_count,
+            copyable,
+        } = key;
         let layout = |label: &'static str,
                       bind_group_layouts: &[Option<&wgpu::BindGroupLayout>]| {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -140,11 +181,10 @@ impl WgpuPipelines {
             write_mask,
         };
         let blended = target(
-            Some(match alpha_mode {
-                wgpu::CompositeAlphaMode::PreMultiplied => {
-                    wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
-                }
-                _ => wgpu::BlendState::ALPHA_BLENDING,
+            Some(if premultiplied_alpha {
+                wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
+            } else {
+                wgpu::BlendState::ALPHA_BLENDING
             }),
             wgpu::ColorWrites::ALL,
         );
@@ -269,6 +309,12 @@ impl WgpuPipelines {
             ["vs_path", "fs_path_mask_composite"],
             &paths_blend,
         );
+        let edge_fade_composite = strip(
+            "edge_fade_composite",
+            &textured_layout,
+            ["vs_edge_fade", "fs_edge_fade"],
+            &paths_blend,
+        );
         let clear = fullscreen("clear", Some(&clear_layout), (main, "fs_clear"));
         let present_retained = present_shader
             .as_ref()
@@ -286,6 +332,7 @@ impl WgpuPipelines {
                 surfaces,
                 backdrop_blur,
                 path_mask_composite,
+                edge_fade_composite,
                 clear,
             ]
             .map(|spec| spec.spawn(scope, device));
@@ -302,9 +349,12 @@ impl WgpuPipelines {
                 surfaces,
                 backdrop_blur,
                 path_mask_composite,
+                edge_fade_composite,
                 clear,
             ] = required.map(Job::join);
             Self {
+                key,
+                modules: Arc::clone(modules),
                 quads,
                 shadows,
                 path_rasterization,
@@ -316,10 +366,20 @@ impl WgpuPipelines {
                 surfaces,
                 backdrop_blur,
                 path_mask_composite,
+                edge_fade_composite,
                 clear,
                 present_retained: present_retained.map(Job::join),
             }
         })
+    }
+
+    pub(super) fn key(&self) -> PipelineKey {
+        self.key
+    }
+
+    /// The bind group layouts the pipelines reference.
+    pub(super) fn layouts(&self) -> &WgpuBindGroupLayouts {
+        &self.modules.layouts
     }
 }
 
@@ -388,6 +448,8 @@ impl<'scope> PipelineSpec<'scope> {
 /// A value a thread of a scope computes, or the value itself when no
 /// thread could be started for it.
 enum Job<'scope, T> {
+    // The web has no threads: every job there is `Done`.
+    #[cfg_attr(target_family = "wasm", allow(dead_code))]
     Thread(ScopedJoinHandle<'scope, T>),
     Done(T),
 }

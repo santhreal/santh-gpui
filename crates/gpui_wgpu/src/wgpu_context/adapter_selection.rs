@@ -1,41 +1,53 @@
-//! The order adapters are tried in, and the backends of the instances they
-//! are enumerated from.
+//! The order adapters are tried in, and the instances they are enumerated
+//! from.
 
-use super::{CompositorGpuHint, WgpuContext};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use super::{CompositorGpuHint, DisplayInstances, WgpuBackend, WgpuContext};
 use anyhow::Context as _;
+use gpui_util::ResultExt;
 use wgpu::TextureFormat;
 
-/// The backends of an instance a native context is selected from. A
-/// context is selected from the Vulkan tier, and from the Vulkan and GL
-/// tier only when the Vulkan tier selects no adapter.
+/// An instance adapters are enumerated from, and the surface of the window
+/// a context is created for, created on that instance.
+pub(super) type Source<'a> = (&'a wgpu::Instance, Option<&'a wgpu::Surface<'static>>);
+
+/// The instances a native context is selected from. A context is selected
+/// from a Vulkan tier, and from the Vulkan and GL tier only when the Vulkan
+/// tier selects no adapter.
 ///
-/// Creating an instance with the GL backend loads every installed EGL
-/// vendor library and initializes an EGL display on each, which takes tens
-/// of milliseconds; creating the Vulkan tier's instance does not.
+/// Creating the GL instance loads every installed EGL vendor library and
+/// initializes an EGL display on each, which takes tens of milliseconds;
+/// the Vulkan tiers do not create it.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum BackendTier {
     /// Vulkan alone. It selects an adapter only if the adapter ranks above
     /// every adapter the GL backend reports, which the Vulkan and GL tier
     /// would then select as well.
     Vulkan,
+    /// Vulkan alone, selecting any adapter: the first tier of a display
+    /// whose GL instance is a last resort (see [`DisplayInstances`]).
+    EveryVulkan,
     /// Vulkan and GL, selecting among the adapters of both.
     VulkanAndGl,
 }
 
 impl BackendTier {
-    pub(super) fn backends(self) -> wgpu::Backends {
-        match self {
-            Self::Vulkan => wgpu::Backends::VULKAN,
-            Self::VulkanAndGl => wgpu::Backends::VULKAN | wgpu::Backends::GL,
-        }
-    }
-
     /// Whether the tier may select an adapter of `rank`.
     fn selects(self, rank: AdapterRank) -> bool {
         match self {
             Self::Vulkan => rank < AdapterRank::BEST_GL,
-            Self::VulkanAndGl => true,
+            Self::EveryVulkan | Self::VulkanAndGl => true,
         }
+    }
+
+    /// Whether the tier may select an adapter `instance` enumerates, at the
+    /// rank the adapter has without `ZED_DEVICE_ID` and a compositor hint.
+    pub(super) fn selects_from(self, instance: &wgpu::Instance) -> bool {
+        gpui::block_on(instance.enumerate_adapters(wgpu::Backends::all()))
+            .iter()
+            .any(|adapter| self.selects(AdapterRank::new(&adapter.get_info(), None, None)))
     }
 }
 
@@ -113,28 +125,124 @@ const fn backend_rank(backend: wgpu::Backend) -> u8 {
     }
 }
 
+/// The adapter a context is created on, and its device.
+struct Selected {
+    /// The index of the source the adapter was enumerated from.
+    source: usize,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    dual_source_blending: bool,
+    color_texture_format: TextureFormat,
+}
+
 impl WgpuContext {
-    /// Selects an adapter of `instance` that `tier` may select and creates
-    /// its device, testing that the device configures `surface`. That test
-    /// is the only reliable one on hybrid GPU systems, where an adapter can
-    /// report a surface as compatible and fail to configure it (NVIDIA
-    /// reports Vulkan Wayland support and fails where the compositor runs
-    /// on the Intel GPU).
-    pub(super) async fn select_adapter_and_device(
-        instance: &wgpu::Instance,
+    /// The result of `create` on the Vulkan tier's instance of `instances`,
+    /// or, if that fails, on the Vulkan and GL tier's instances.
+    pub(super) fn by_backend_tier<T>(
+        instances: &DisplayInstances,
+        mut create: impl FnMut(BackendTier, &[&wgpu::Instance]) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let vulkan_tier = if instances.gl_last_resort() {
+            BackendTier::EveryVulkan
+        } else {
+            BackendTier::Vulkan
+        };
+        match instances.vulkan() {
+            Ok(vulkan) => match create(vulkan_tier, &[vulkan]) {
+                Ok(created) => return Ok(created),
+                Err(error) => log::info!(
+                    "No Vulkan adapter selected ({error:#}); selecting from the Vulkan and GL \
+                     adapters"
+                ),
+            },
+            Err(error) => {
+                log::info!("No Vulkan instance ({error:#}); selecting from the GL adapters")
+            }
+        }
+        let candidates: Vec<&wgpu::Instance> = instances
+            .vulkan()
+            .ok()
+            .into_iter()
+            .chain([instances.gl()])
+            .collect();
+        create(BackendTier::VulkanAndGl, &candidates)
+    }
+
+    /// Creates the context on the adapter of `sources` that `tier` selects,
+    /// and returns it with the index of the adapter's source.
+    pub(super) fn new_with_options(
+        sources: &[Source<'_>],
+        tier: BackendTier,
+        compositor_gpu: Option<CompositorGpuHint>,
+        reject_software: bool,
+    ) -> anyhow::Result<(Self, usize)> {
+        let device_id_filter = match std::env::var("ZED_DEVICE_ID") {
+            Ok(val) => parse_pci_id(&val)
+                .context("Failed to parse device ID from `ZED_DEVICE_ID` environment variable")
+                .log_err(),
+            Err(std::env::VarError::NotPresent) => None,
+            err => {
+                err.context("Failed to read value of `ZED_DEVICE_ID` environment variable")
+                    .log_err();
+                None
+            }
+        };
+
+        let selected = gpui::block_on(Self::select_adapter_and_device(
+            sources,
+            tier,
+            device_id_filter,
+            compositor_gpu.as_ref(),
+            reject_software,
+        ))?;
+
+        let device_lost = Arc::new(AtomicBool::new(false));
+        selected.device.set_device_lost_callback({
+            let device_lost = Arc::clone(&device_lost);
+            move |reason, message| {
+                log::error!("wgpu device lost: reason={reason:?}, message={message}");
+                if reason != wgpu::DeviceLostReason::Destroyed {
+                    device_lost.store(true, Ordering::Relaxed);
+                }
+            }
+        });
+
+        let info = selected.adapter.get_info();
+        log::info!("Selected GPU adapter: {:?} ({:?})", info.name, info.backend);
+
+        let context = Self {
+            instance: sources[selected.source].0.clone(),
+            adapter: selected.adapter,
+            device: Arc::new(selected.device),
+            queue: Arc::new(selected.queue),
+            backend: WgpuBackend::Native(info.backend),
+            dual_source_blending: selected.dual_source_blending,
+            color_texture_format: selected.color_texture_format,
+            device_lost,
+            pipeline_cache: Arc::default(),
+        };
+        Ok((context, selected.source))
+    }
+
+    /// Selects an adapter of `sources` that `tier` may select and creates
+    /// its device, testing that the device configures the source's surface.
+    /// That test is the only reliable one on hybrid GPU systems, where an
+    /// adapter can report a surface as compatible and fail to configure it
+    /// (NVIDIA reports Vulkan Wayland support and fails where the compositor
+    /// runs on the Intel GPU).
+    async fn select_adapter_and_device(
+        sources: &[Source<'_>],
         tier: BackendTier,
         device_id_filter: Option<u32>,
-        surface: Option<&wgpu::Surface<'_>>,
         compositor_gpu: Option<&CompositorGpuHint>,
         reject_software: bool,
-    ) -> anyhow::Result<(
-        wgpu::Adapter,
-        wgpu::Device,
-        wgpu::Queue,
-        bool,
-        TextureFormat,
-    )> {
-        let mut adapters: Vec<_> = instance.enumerate_adapters(wgpu::Backends::all()).await;
+    ) -> anyhow::Result<Selected> {
+        let mut adapters = Vec::new();
+        for (source, (instance, _)) in sources.iter().enumerate() {
+            let enumerated = instance.enumerate_adapters(wgpu::Backends::all()).await;
+            adapters.extend(enumerated.into_iter().map(|adapter| (source, adapter)));
+        }
 
         if adapters.is_empty() {
             anyhow::bail!("No GPU adapters found");
@@ -146,7 +254,7 @@ impl WgpuContext {
 
         // The backend, vendor, device, and name order adapters of one rank
         // deterministically.
-        adapters.sort_by_key(|adapter| {
+        adapters.sort_by_key(|(_, adapter)| {
             let info = adapter.get_info();
             (
                 AdapterRank::new(&info, device_id_filter, compositor_gpu),
@@ -158,7 +266,7 @@ impl WgpuContext {
         });
 
         log::info!("Found {} GPU adapter(s):", adapters.len());
-        for adapter in &adapters {
+        for (_, adapter) in &adapters {
             let info = adapter.get_info();
             log::info!(
                 "  - {} (vendor={:#06x}, device={:#06x}, backend={:?}, type={:?})",
@@ -170,7 +278,7 @@ impl WgpuContext {
             );
         }
 
-        for adapter in adapters {
+        for (source, adapter) in adapters {
             let info = adapter.get_info();
 
             if reject_software && info.device_type == wgpu::DeviceType::Cpu {
@@ -194,26 +302,27 @@ impl WgpuContext {
 
             log::info!("Testing adapter: {} ({:?})...", info.name, info.backend);
 
-            let result = if let Some(surface) = surface {
+            let result = if let Some(surface) = sources[source].1 {
                 Self::try_adapter_with_surface(&adapter, surface).await
             } else {
                 Self::create_device(&adapter).await
             };
 
             match result {
-                Ok((device, queue, dual_source_blending, color_atlas_texture_format)) => {
+                Ok((device, queue, dual_source_blending, color_texture_format)) => {
                     log::info!(
                         "Selected GPU (passed configuration test): {} ({:?})",
                         info.name,
                         info.backend
                     );
-                    return Ok((
+                    return Ok(Selected {
+                        source,
                         adapter,
                         device,
                         queue,
                         dual_source_blending,
-                        color_atlas_texture_format,
-                    ));
+                        color_texture_format,
+                    });
                 }
                 Err(e) => {
                     log::info!(

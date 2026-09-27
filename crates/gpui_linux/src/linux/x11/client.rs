@@ -46,10 +46,10 @@ use super::{
     X11WindowStatePtr, XcbAtoms, XimCallbackEvent, XimHandler, button_or_scroll_from_event_detail,
     check_reply,
     clipboard::{self, Clipboard},
+    compositor::compositor_present,
     get_reply, get_valuator_axis_index,
     gpu_context::{self, WindowGpu},
-    modifiers_from_state,
-    pressed_button_from_mask, xcb_flush, xi_root_position,
+    modifiers_from_state, pressed_button_from_mask, xcb_flush, xi_root_position,
 };
 
 use crate::linux::{
@@ -406,8 +406,8 @@ impl X11Client {
             .reply()
             .context("Failed to get XCB atoms")?;
 
-        let root = xcb_connection.setup().roots[0].root;
-        let compositor_present = check_compositor_present(&xcb_connection, root);
+        let root = xcb_connection.setup().roots[x_root_index].root;
+        let compositor_present = compositor_present(&xcb_connection, x_root_index, root);
         let gtk_frame_extents_supported =
             check_gtk_frame_extents_supported(&xcb_connection, &atoms, root);
         let client_side_decorations_supported = compositor_present && gtk_frame_extents_supported;
@@ -545,7 +545,7 @@ impl X11Client {
             last_location: Point::new(px(0.0), px(0.0)),
             current_count: 0,
             pinch_scale: 1.0,
-            gpu_context: Rc::new(RefCell::new(None)),
+            gpu_context: GpuContext::new(),
             compositor_gpu,
             pending_gpu_context: Some(pending_gpu_context),
             scale_factor,
@@ -2174,75 +2174,6 @@ fn detect_compositor_gpu(
     let metadata = std::fs::metadata(&path).ok()?;
 
     crate::linux::compositor_gpu_hint_from_dev_t(metadata.rdev())
-}
-
-fn check_compositor_present(xcb_connection: &XCBConnection, root: xproto::Window) -> bool {
-    // Method 1: Check for _NET_WM_CM_S{root}
-    let atom_name = format!("_NET_WM_CM_S{}", root);
-    let atom1 = get_reply(
-        || format!("Failed to intern {atom_name}"),
-        xcb_connection.intern_atom(false, atom_name.as_bytes()),
-    );
-    let method1 = match atom1.log_with_level(Level::Debug) {
-        Some(reply) if reply.atom != x11rb::NONE => {
-            let atom = reply.atom;
-            get_reply(
-                || format!("Failed to get {atom_name} owner"),
-                xcb_connection.get_selection_owner(atom),
-            )
-            .map(|reply| reply.owner != 0)
-            .log_with_level(Level::Debug)
-            .unwrap_or(false)
-        }
-        _ => false,
-    };
-
-    // Method 2: Check for _NET_WM_CM_OWNER
-    let atom_name = "_NET_WM_CM_OWNER";
-    let atom2 = get_reply(
-        || format!("Failed to intern {atom_name}"),
-        xcb_connection.intern_atom(false, atom_name.as_bytes()),
-    );
-    let method2 = match atom2.log_with_level(Level::Debug) {
-        Some(reply) if reply.atom != x11rb::NONE => {
-            let atom = reply.atom;
-            get_reply(
-                || format!("Failed to get {atom_name}"),
-                xcb_connection.get_property(false, root, atom, xproto::AtomEnum::WINDOW, 0, 1),
-            )
-            .map(|reply| reply.value_len > 0)
-            .unwrap_or(false)
-        }
-        _ => return false,
-    };
-
-    // Method 3: Check for _NET_SUPPORTING_WM_CHECK
-    let atom_name = "_NET_SUPPORTING_WM_CHECK";
-    let atom3 = get_reply(
-        || format!("Failed to intern {atom_name}"),
-        xcb_connection.intern_atom(false, atom_name.as_bytes()),
-    );
-    let method3 = match atom3.log_with_level(Level::Debug) {
-        Some(reply) if reply.atom != x11rb::NONE => {
-            let atom = reply.atom;
-            get_reply(
-                || format!("Failed to get {atom_name}"),
-                xcb_connection.get_property(false, root, atom, xproto::AtomEnum::WINDOW, 0, 1),
-            )
-            .map(|reply| reply.value_len > 0)
-            .unwrap_or(false)
-        }
-        _ => return false,
-    };
-
-    log::debug!(
-        "Compositor detection: _NET_WM_CM_S?={}, _NET_WM_CM_OWNER={}, _NET_SUPPORTING_WM_CHECK={}",
-        method1,
-        method2,
-        method3
-    );
-
-    method1 || method2 || method3
 }
 
 /// Whether an EWMH window manager runs on the screen of `root`: the

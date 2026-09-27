@@ -3,6 +3,7 @@ mod clipboard;
 mod configure;
 mod cursor;
 mod display;
+mod display_handle;
 mod popup;
 mod serial;
 mod window;

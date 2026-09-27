@@ -11,20 +11,20 @@
 //! connection set up beside the driver's fails with "Unknown connection
 //! error".
 //!
-//! The thread selects the adapter without a surface. The first window
+//! The thread creates the instances the client's contexts are created
+//! from, and selects the adapter without a surface. The first window
 //! keeps that context only if the renderer of its surface is created on it
 //! with no error, the surface configuration included; otherwise the window
-//! creates a context whose adapter is tested against its surface. On a
-//! host with more than one GPU, an adapter can report a surface as
-//! compatible and fail to configure it.
+//! creates a context whose adapter is tested against its surface, on the
+//! same instances. On a host with more than one GPU, an adapter can report
+//! a surface as compatible and fail to configure it.
 
-use std::{
-    cell::RefCell, ffi::c_void, fmt::Debug, ptr::NonNull, rc::Rc, sync::Arc, thread::JoinHandle,
-};
+use std::{ffi::c_void, fmt::Debug, ptr::NonNull, rc::Rc, sync::Arc, thread::JoinHandle};
 
 use anyhow::{Context as _, anyhow};
 use gpui_wgpu::{
-    CompositorGpuHint, GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig, wgpu,
+    CompositorGpuHint, DisplayInstances, GpuContext, WgpuContext, WgpuRenderer, WgpuSurfaceConfig,
+    wgpu,
 };
 use raw_window_handle as rwh;
 use x11rb::xcb_ffi::XCBConnection;
@@ -76,9 +76,11 @@ impl<T: Send + 'static, K> Drop for Pending<T, K> {
     }
 }
 
-/// The client's GPU context, created on the `gpu-context` thread. It holds
-/// the client's X connection open while the thread reads it.
-pub(crate) type PendingContext = Pending<anyhow::Result<WgpuContext>, Rc<XCBConnection>>;
+/// The instances of the client's display and the client's GPU context,
+/// created on the `gpu-context` thread. It holds the client's X connection
+/// open while the thread reads it.
+pub(crate) type PendingContext =
+    Pending<(DisplayInstances, anyhow::Result<WgpuContext>), Rc<XCBConnection>>;
 
 /// Starts the thread that creates the GPU context of the client connected
 /// through `connection`, whose X screen is `screen`.
@@ -93,7 +95,9 @@ pub(crate) fn spawn(
         screen: i32::try_from(screen).context("X screen number out of range")?,
     };
     Pending::spawn("gpu-context", Rc::clone(connection), move || {
-        WgpuContext::for_display(&display, compositor_gpu)
+        let instances = DisplayInstances::new(display);
+        let context = WgpuContext::for_display(&instances, compositor_gpu);
+        (instances, context)
     })
 }
 
@@ -122,8 +126,8 @@ pub(crate) struct WindowGpu {
     /// The context the client's windows share.
     pub context: GpuContext,
     pub compositor_gpu: Option<CompositorGpuHint>,
-    /// The context from the GPU context thread, for the client's first
-    /// window.
+    /// The instances and the context from the GPU context thread, for the
+    /// client's first window.
     pub pending: Option<PendingContext>,
 }
 
@@ -143,7 +147,9 @@ impl WindowGpu {
             pending,
         } = self;
         if let Some(pending) = pending {
-            match pending.join() {
+            let (instances, prewarmed) = pending.join();
+            context.set_instances(instances)?;
+            match prewarmed {
                 Ok(prewarmed) => {
                     match renderer_on(&context, prewarmed, window, &config, compositor_gpu) {
                         Ok(renderer) => return Ok(renderer),
@@ -177,17 +183,17 @@ where
     W: rwh::HasWindowHandle + rwh::HasDisplayHandle + Debug + Send + Sync + Clone + 'static,
 {
     let device = Arc::clone(&prewarmed.device);
-    RefCell::replace(context, Some(prewarmed));
+    *context.borrow_mut() = Some(prewarmed);
     let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let config = WgpuSurfaceConfig {
         size: config.size,
         transparent: config.transparent,
         preferred_present_mode: config.preferred_present_mode,
     };
-    let renderer = WgpuRenderer::new(Rc::clone(context), window, config, compositor_gpu);
+    let renderer = WgpuRenderer::new(context.clone(), window, config, compositor_gpu);
     let result = adopted(renderer, gpui::block_on(scope.pop()));
     if result.is_err() {
-        RefCell::replace(context, None);
+        *context.borrow_mut() = None;
     }
     result
 }

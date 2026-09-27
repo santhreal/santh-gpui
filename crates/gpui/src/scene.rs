@@ -78,8 +78,8 @@ pub struct Scene {
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
     pub backdrop_blurs: Vec<BackdropBlur>,
-    pub start_path_clips: Vec<StartPathClip>,
-    pub end_path_clips: Vec<EndPathClip>,
+    pub start_layer_masks: Vec<StartLayerMask>,
+    pub end_layer_masks: Vec<EndLayerMask>,
     pub damage: Option<Bounds<ScaledPixels>>,
 }
 
@@ -102,8 +102,8 @@ impl Scene {
         self.polychrome_sprites.clear();
         self.surfaces.clear();
         self.backdrop_blurs.clear();
-        self.start_path_clips.clear();
-        self.end_path_clips.clear();
+        self.start_layer_masks.clear();
+        self.end_layer_masks.clear();
         self.damage = None;
     }
 
@@ -192,36 +192,36 @@ impl Scene {
         self.paint_operations.push(PaintOperation::PopZIndex);
     }
 
-    /// Start a path-clipped subtree.
-    pub fn push_path_clip(&mut self, path: Path<ScaledPixels>) {
-        let bounds = path.transformation.apply_to_bounds(path.clipped_bounds());
-        self.open_scope(bounds);
+    /// Start a subtree that draws into a layer composited through `mask`.
+    /// See [`StartLayerMask`].
+    pub fn push_layer_mask(&mut self, mask: LayerMask) {
+        self.open_scope(mask.bounds());
         let key = self.scope_edge_key(i32::MIN, DrawOrder::MIN);
-        let index = self.start_path_clips.len() as u32;
+        let index = self.start_layer_masks.len() as u32;
         self.ranks.push(Rank {
             key,
-            kind: PrimitiveKind::StartPathClip,
+            kind: PrimitiveKind::StartLayerMask,
             index,
         });
-        self.start_path_clips.push(StartPathClip {
+        self.start_layer_masks.push(StartLayerMask {
             order: 0,
-            path: path.clone(),
+            mask: mask.clone(),
         });
         self.paint_operations
-            .push(PaintOperation::StartPathClip(path));
+            .push(PaintOperation::StartLayerMask(mask));
     }
 
-    /// End the innermost path-clipped subtree.
-    pub fn pop_path_clip(&mut self) {
+    /// End the innermost masked subtree.
+    pub fn pop_layer_mask(&mut self) {
         let key = self.scope_edge_key(i32::MAX, DrawOrder::MAX);
-        let index = self.end_path_clips.len() as u32;
+        let index = self.end_layer_masks.len() as u32;
         self.ranks.push(Rank {
             key,
-            kind: PrimitiveKind::EndPathClip,
+            kind: PrimitiveKind::EndLayerMask,
             index,
         });
-        self.end_path_clips.push(EndPathClip { order: 0 });
-        self.paint_operations.push(PaintOperation::EndPathClip);
+        self.end_layer_masks.push(EndLayerMask { order: 0 });
+        self.paint_operations.push(PaintOperation::EndLayerMask);
         self.close_scope();
     }
 
@@ -324,8 +324,8 @@ impl Scene {
                 PaintOperation::EndLayer => self.pop_layer(),
                 PaintOperation::PushZIndex(z) => self.push_z_index(*z),
                 PaintOperation::PopZIndex => self.pop_z_index(),
-                PaintOperation::StartPathClip(path) => self.push_path_clip(path.clone()),
-                PaintOperation::EndPathClip => self.pop_path_clip(),
+                PaintOperation::StartLayerMask(mask) => self.push_layer_mask(mask.clone()),
+                PaintOperation::EndLayerMask => self.pop_layer_mask(),
             }
         }
     }
@@ -350,8 +350,8 @@ impl Scene {
                 PrimitiveKind::PolychromeSprite => self.polychrome_sprites[index].order = order,
                 PrimitiveKind::Surface => self.surfaces[index].order = order,
                 PrimitiveKind::BackdropBlur => self.backdrop_blurs[index].order = order,
-                PrimitiveKind::StartPathClip => self.start_path_clips[index].order = order,
-                PrimitiveKind::EndPathClip => self.end_path_clips[index].order = order,
+                PrimitiveKind::StartLayerMask => self.start_layer_masks[index].order = order,
+                PrimitiveKind::EndLayerMask => self.end_layer_masks[index].order = order,
             }
         }
 
@@ -367,8 +367,8 @@ impl Scene {
             .sort_by_key(|sprite| (sprite.order, sprite.tile.tile_id));
         self.surfaces.sort_by_key(|surface| surface.order);
         self.backdrop_blurs.sort_by_key(|blur| blur.order);
-        self.start_path_clips.sort_by_key(|clip| clip.order);
-        self.end_path_clips.sort_by_key(|clip| clip.order);
+        self.start_layer_masks.sort_by_key(|mask| mask.order);
+        self.end_layer_masks.sort_by_key(|mask| mask.order);
     }
 
     #[cfg_attr(
@@ -398,8 +398,8 @@ impl Scene {
             surfaces_iter: self.surfaces.iter().peekable(),
             backdrop_blurs_start: 0,
             backdrop_blurs_iter: self.backdrop_blurs.iter().peekable(),
-            start_path_clips_iter: self.start_path_clips.iter().peekable(),
-            end_path_clips_iter: self.end_path_clips.iter().peekable(),
+            start_layer_masks_iter: self.start_layer_masks.iter().peekable(),
+            end_layer_masks_iter: self.end_layer_masks.iter().peekable(),
         }
     }
 }
@@ -413,7 +413,7 @@ impl Scene {
     allow(dead_code)
 )]
 pub(crate) enum PrimitiveKind {
-    StartPathClip,
+    StartLayerMask,
     Shadow,
     #[default]
     Quad,
@@ -424,7 +424,7 @@ pub(crate) enum PrimitiveKind {
     PolychromeSprite,
     Surface,
     BackdropBlur,
-    EndPathClip,
+    EndLayerMask,
 }
 
 pub(crate) enum PaintOperation {
@@ -433,8 +433,8 @@ pub(crate) enum PaintOperation {
     EndLayer,
     PushZIndex(i32),
     PopZIndex,
-    StartPathClip(Path<ScaledPixels>),
-    EndPathClip,
+    StartLayerMask(LayerMask),
+    EndLayerMask,
 }
 
 #[derive(Clone)]
@@ -523,8 +523,8 @@ struct BatchIterator<'a> {
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
     backdrop_blurs_start: usize,
     backdrop_blurs_iter: Peekable<slice::Iter<'a, BackdropBlur>>,
-    start_path_clips_iter: Peekable<slice::Iter<'a, StartPathClip>>,
-    end_path_clips_iter: Peekable<slice::Iter<'a, EndPathClip>>,
+    start_layer_masks_iter: Peekable<slice::Iter<'a, StartLayerMask>>,
+    end_layer_masks_iter: Peekable<slice::Iter<'a, EndLayerMask>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -563,12 +563,12 @@ impl<'a> Iterator for BatchIterator<'a> {
                 PrimitiveKind::BackdropBlur,
             ),
             (
-                self.start_path_clips_iter.peek().map(|c| c.order),
-                PrimitiveKind::StartPathClip,
+                self.start_layer_masks_iter.peek().map(|m| m.order),
+                PrimitiveKind::StartLayerMask,
             ),
             (
-                self.end_path_clips_iter.peek().map(|c| c.order),
-                PrimitiveKind::EndPathClip,
+                self.end_layer_masks_iter.peek().map(|m| m.order),
+                PrimitiveKind::EndLayerMask,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -731,13 +731,13 @@ impl<'a> Iterator for BatchIterator<'a> {
                     backdrop_blurs_start..backdrop_blurs_end,
                 ))
             }
-            PrimitiveKind::StartPathClip => {
-                let clip = self.start_path_clips_iter.next().unwrap();
-                Some(PrimitiveBatch::StartPathClip(clip.path.clone()))
+            PrimitiveKind::StartLayerMask => {
+                let start = self.start_layer_masks_iter.next().unwrap();
+                Some(PrimitiveBatch::StartLayerMask(start.mask.clone()))
             }
-            PrimitiveKind::EndPathClip => {
-                self.end_path_clips_iter.next().unwrap();
-                Some(PrimitiveBatch::EndPathClip)
+            PrimitiveKind::EndLayerMask => {
+                self.end_layer_masks_iter.next().unwrap();
+                Some(PrimitiveBatch::EndLayerMask)
             }
         }
     }
@@ -772,8 +772,8 @@ pub enum PrimitiveBatch {
     },
     Surfaces(Range<usize>),
     BackdropBlurs(Range<usize>),
-    StartPathClip(Path<ScaledPixels>),
-    EndPathClip,
+    StartLayerMask(LayerMask),
+    EndLayerMask,
 }
 
 impl PrimitiveBatch {
@@ -807,39 +807,120 @@ impl PrimitiveBatch {
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
             Self::BackdropBlurs(range) => format!("backdrop blurs ({})", range.len()),
-            Self::StartPathClip(_) => "start path clip".to_string(),
-            Self::EndPathClip => "end path clip".to_string(),
+            Self::StartLayerMask(LayerMask::Path(_)) => "start path clip".to_string(),
+            Self::StartLayerMask(LayerMask::EdgeFade(_)) => "start edge fade".to_string(),
+            Self::EndLayerMask => "end layer mask".to_string(),
         }
     }
 }
 
-/// Marker primitive opening a path-clipped subtree.
+/// Marker primitive opening a masked subtree.
 ///
-/// Primitives between a `StartPathClip` and its [`EndPathClip`] draw into a
-/// layer cleared to transparent black. At the `EndPathClip` the layer, which
-/// holds premultiplied color, is composited onto the target beneath it:
-/// `dst.rgb = layer.rgb * m + dst.rgb * (1 - layer.a * m)`, where `m` is the
-/// alpha of `path` rasterized with path antialiasing; destination alpha
-/// combines as it does for path sprites. The path is rasterized when the
-/// clip closes, so paths drawn inside the subtree do not change `m`. Clips
-/// nest: each open clip draws into its own layer. A [`BackdropBlur`] inside a
-/// clip samples the frame beneath every open clip layer.
+/// Primitives between a `StartLayerMask` and its [`EndLayerMask`] draw into a
+/// layer cleared to transparent black. At the `EndLayerMask` the layer, which
+/// holds premultiplied color, is composited onto the target beneath it inside
+/// [`LayerMask::bounds`]: `dst.rgb = layer.rgb * m + dst.rgb * (1 - layer.a * m)`,
+/// where `m` is the value of `mask` at the pixel; destination alpha combines
+/// as it does for path sprites. Masks nest: each open mask draws into its own
+/// layer. A [`BackdropBlur`] inside a mask samples the frame beneath every
+/// open layer.
 #[derive(Clone, Debug)]
-pub struct StartPathClip {
+pub struct StartLayerMask {
     /// The draw order
     pub order: DrawOrder,
-    /// The clipping path
-    pub path: Path<ScaledPixels>,
+    /// The mask the layer is composited through
+    pub mask: LayerMask,
 }
 
-/// Marker primitive closing a path-clipped subtree. See [`StartPathClip`].
+/// Marker primitive closing a masked subtree. See [`StartLayerMask`].
 #[derive(Clone, Copy, Debug)]
-pub struct EndPathClip {
+pub struct EndLayerMask {
     /// The draw order
     pub order: DrawOrder,
 }
 
-/// Consecutive frames without a backdrop blur (or without a path clip) after
+/// The mask value `m` a layer is composited through. See [`StartLayerMask`].
+#[derive(Clone, Debug)]
+pub enum LayerMask {
+    /// `m` is the alpha of the path rasterized with path antialiasing. The
+    /// path is rasterized when the mask closes, so paths drawn inside the
+    /// subtree do not change `m`.
+    Path(Path<ScaledPixels>),
+    /// `m = r * r`, with `r` the fade ratio documented on [`EdgeFadeMask`].
+    EdgeFade(EdgeFadeMask),
+}
+
+impl LayerMask {
+    /// The region of the target the layer is composited into. `m` is zero
+    /// outside it.
+    pub fn bounds(&self) -> Bounds<ScaledPixels> {
+        match self {
+            Self::Path(path) => path.transformation.apply_to_bounds(path.clipped_bounds()),
+            Self::EdgeFade(fade) => fade.bounds,
+        }
+    }
+}
+
+/// An edge fade in device pixels, in the layout the GPU reads it.
+///
+/// At a pixel center `p`, the fade ratio `r` is the minimum, over each edge
+/// of `fade_bounds` with a nonzero band, of `clamp(d / band, 0, 1)`, where
+/// `d` is the distance from `p` to that edge measured toward the inside of
+/// `fade_bounds`. `r` is 1 when every band is zero, and 0 beyond an edge with
+/// a nonzero band.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[repr(C)]
+pub struct EdgeFadeMask {
+    /// The region the layer is composited into: the `clip` passed to
+    /// [`EdgeFadeMask::new`], limited at each edge of `fade_bounds` with a
+    /// nonzero band.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The faded region.
+    pub fade_bounds: Bounds<ScaledPixels>,
+    /// The width of the ramp inside each edge of `fade_bounds`; zero leaves
+    /// that edge unfaded.
+    pub bands: Edges<ScaledPixels>,
+}
+
+impl EdgeFadeMask {
+    /// Fades `fade_bounds` across `bands`, composited inside `clip`. A
+    /// negative or NaN band is zero.
+    pub fn new(
+        fade_bounds: Bounds<ScaledPixels>,
+        bands: Edges<ScaledPixels>,
+        clip: Bounds<ScaledPixels>,
+    ) -> Self {
+        let bands = bands.map(|band| ScaledPixels(band.0.max(0.0)));
+        // A faded edge limits the clip; an unfaded edge leaves it open.
+        let (fade, clip) = (fade_bounds, clip);
+        let faded = |band: ScaledPixels, limited: f32, open: f32| {
+            if band.0 > 0.0 { limited } else { open }
+        };
+        let left = faded(bands.left, fade.left().0.max(clip.left().0), clip.left().0);
+        let top = faded(bands.top, fade.top().0.max(clip.top().0), clip.top().0);
+        let right = faded(
+            bands.right,
+            fade.right().0.min(clip.right().0),
+            clip.right().0,
+        );
+        let bottom = faded(
+            bands.bottom,
+            fade.bottom().0.min(clip.bottom().0),
+            clip.bottom().0,
+        );
+        let (right, bottom) = (right.max(left), bottom.max(top));
+        Self {
+            bounds: Bounds::from_corners(
+                point(ScaledPixels(left), ScaledPixels(top)),
+                point(ScaledPixels(right), ScaledPixels(bottom)),
+            ),
+            fade_bounds,
+            bands,
+        }
+    }
+}
+
+/// Consecutive frames without a backdrop blur (or without a layer mask) after
 /// which a renderer releases the offscreen textures that feature uses.
 pub const LAYER_IDLE_RELEASE_FRAMES: u32 = 30;
 
@@ -1483,11 +1564,21 @@ impl PathVertex<Pixels> {
     }
 }
 
+/// A 1x1 BGRA pixel buffer for tests that insert a [`PaintSurface`].
+/// `CVPixelBuffer` has no `Default`.
+#[cfg(all(test, target_os = "macos"))]
+fn test_image_buffer() -> core_video::pixel_buffer::CVPixelBuffer {
+    use core_video::pixel_buffer::{CVPixelBuffer, kCVPixelFormatType_32BGRA};
+
+    CVPixelBuffer::new(kCVPixelFormatType_32BGRA, 1, 1, None)
+        .expect("CoreVideo creates a 1x1 BGRA pixel buffer")
+}
+
 #[cfg(test)]
 mod transformed_bounds_tests;
 
 #[cfg(test)]
-mod path_clip_tests;
+mod layer_mask_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1528,7 +1619,7 @@ mod tests {
             bounds,
             content_mask: mask(),
             #[cfg(target_os = "macos")]
-            image_buffer: Default::default(),
+            image_buffer: test_image_buffer(),
         }
     }
 
@@ -1552,8 +1643,8 @@ mod tests {
                 }
                 PrimitiveBatch::Surfaces(r) => (PrimitiveKind::Surface, r.len()),
                 PrimitiveBatch::BackdropBlurs(r) => (PrimitiveKind::BackdropBlur, r.len()),
-                PrimitiveBatch::StartPathClip(_) => (PrimitiveKind::StartPathClip, 1),
-                PrimitiveBatch::EndPathClip => (PrimitiveKind::EndPathClip, 1),
+                PrimitiveBatch::StartLayerMask(_) => (PrimitiveKind::StartLayerMask, 1),
+                PrimitiveBatch::EndLayerMask => (PrimitiveKind::EndLayerMask, 1),
             })
             .collect()
     }
@@ -1746,21 +1837,21 @@ mod tests {
     }
 
     #[test]
-    fn path_clip_batches_produce_start_and_end_path_clip_markers() {
+    fn path_clip_batches_produce_start_and_end_layer_mask_markers() {
         let mut scene = Scene::default();
         let path = Path::new(Point::default()).scale(1.0);
-        scene.push_path_clip(path);
+        scene.push_layer_mask(LayerMask::Path(path));
         scene.insert_primitive(quad(rect(10.0, 10.0, 50.0, 50.0)));
-        scene.pop_path_clip();
+        scene.pop_layer_mask();
         scene.finish();
 
         let batches = scene.batches().collect::<Vec<_>>();
         assert_eq!(batches.len(), 3, "batches: {:?}", batches);
         match (&batches[0], &batches[1], &batches[2]) {
             (
-                PrimitiveBatch::StartPathClip(_),
+                PrimitiveBatch::StartLayerMask(LayerMask::Path(_)),
                 PrimitiveBatch::Quads(range),
-                PrimitiveBatch::EndPathClip,
+                PrimitiveBatch::EndLayerMask,
             ) => {
                 assert_eq!(range.len(), 1);
             }

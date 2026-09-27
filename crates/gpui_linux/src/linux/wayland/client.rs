@@ -90,6 +90,7 @@ use crate::linux::{
     wayland::{
         clipboard::{Clipboard, DataOffer, TEXT_MIME_TYPES},
         cursor::Cursor,
+        display_handle::ConnectionDisplay,
         serial::{Serial, SerialKind, SerialTracker},
         to_shape,
         window::WaylandWindow,
@@ -104,7 +105,7 @@ use gpui::{
     PlatformKeyboardLayout, PlatformWindow, Point, ScrollDelta, ScrollWheelEvent, SharedString,
     Size, TouchPhase, WindowButtonLayout, WindowKind, WindowParams, point, profiler, px, size,
 };
-use gpui_wgpu::{CompositorGpuHint, GpuContext};
+use gpui_wgpu::{CompositorGpuHint, DisplayInstances, GpuContext};
 use wayland_protocols::wp::linux_dmabuf::zv1::client::{
     zwp_linux_dmabuf_feedback_v1, zwp_linux_dmabuf_v1,
 };
@@ -786,6 +787,12 @@ impl WaylandClient {
             }
         });
 
+        // LinuxCommon::new starts the dispatcher's threads, and the Vulkan
+        // instance is created without DISPLAY in the environment only while
+        // the process has one thread.
+        let gpu_context =
+            GpuContext::with_instances(DisplayInstances::new(ConnectionDisplay(conn.clone())));
+
         let event_loop = EventLoop::<WaylandClientStatePtr>::try_new().unwrap();
 
         let (common, main_receiver, wake_receiver) = LinuxCommon::new(event_loop.get_signal());
@@ -820,7 +827,6 @@ impl WaylandClient {
             .unwrap();
 
         let compositor_gpu = detect_compositor_gpu();
-        let gpu_context = Rc::new(RefCell::new(None));
 
         let (frame_ping, frame_ping_source) =
             calloop::ping::make_ping().expect("Failed to create the frame ping");

@@ -401,42 +401,13 @@ fn swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Vec<u8> {
 #[cfg(all(test, not(target_family = "wasm")))]
 mod tests {
     use super::*;
-    use gpui::block_on;
     use gpui::{ImageId, RenderImageParams};
     use std::sync::Arc;
 
     fn test_device_and_queue() -> anyhow::Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
-        block_on(async {
-            let instance = crate::wgpu_context::create_instance(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
-                flags: wgpu::InstanceFlags::default(),
-                backend_options: wgpu::BackendOptions::default(),
-                memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
-                display: None,
-            });
-            let adapter = instance
-                .request_adapter(&wgpu::RequestAdapterOptions {
-                    power_preference: wgpu::PowerPreference::LowPower,
-                    compatible_surface: None,
-                    force_fallback_adapter: false,
-                })
-                .await
-                .map_err(|error| anyhow::anyhow!("failed to request adapter: {error}"))?;
-            let (device, queue) = adapter
-                .request_device(&wgpu::DeviceDescriptor {
-                    label: Some("wgpu_atlas_test_device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_defaults()
-                        .using_resolution(adapter.limits())
-                        .using_alignment(adapter.limits()),
-                    memory_hints: wgpu::MemoryHints::MemoryUsage,
-                    trace: wgpu::Trace::Off,
-                    experimental_features: wgpu::ExperimentalFeatures::disabled(),
-                })
-                .await
-                .map_err(|error| anyhow::anyhow!("failed to request device: {error}"))?;
-            Ok((Arc::new(device), Arc::new(queue)))
-        })
+        let context =
+            crate::WgpuContext::new_surfaceless(crate::WgpuContext::surfaceless_instance(), None)?;
+        Ok((Arc::clone(&context.device), Arc::clone(&context.queue)))
     }
 
     #[test]

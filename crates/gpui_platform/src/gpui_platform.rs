@@ -97,7 +97,7 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
     // Without this arm the surfaceless renderer exists and nothing can build
     // one, so a headless render on Linux returns no renderer and the frame is
     // empty rather than failing.
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(not(any(target_os = "macos", target_family = "wasm")))]
     {
         use gpui::{DevicePixels, Size};
 
@@ -114,6 +114,12 @@ pub fn current_headless_renderer() -> Option<Box<dyn gpui::PlatformHeadlessRende
                 None
             }
         }
+    }
+
+    // The web has no surfaceless wgpu context to draw offscreen with.
+    #[cfg(target_family = "wasm")]
+    {
+        None
     }
 }
 
