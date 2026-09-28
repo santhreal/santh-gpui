@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod layer_mask_tests;
 mod layers;
+#[cfg(test)]
+mod path_mask_tests;
 mod pipeline_cache;
 mod pipelines;
 
@@ -133,8 +135,12 @@ struct PathRasterizationVertex {
     xy_position: Point<ScaledPixels>,
     st_position: Point<f32>,
     color: Background,
+    /// The content mask of the path, whose rounded corners clip it.
     content_mask: ContentMask<ScaledPixels>,
     transformation: TransformationMatrix,
+    /// The bounds of the path after its transformation, clipped to its
+    /// content mask. A gradient spans them.
+    bounds: Bounds<ScaledPixels>,
 }
 
 pub struct WgpuSurfaceConfig {
@@ -1913,19 +1919,17 @@ impl WgpuRenderer {
     ) -> Result<bool> {
         let mut vertices = Vec::new();
         for path in paths {
-            let content_mask = ContentMask {
-                bounds: path
-                    .transformation
-                    .apply_to_bounds(path.bounds)
-                    .intersect(&path.content_mask.bounds),
-                corner_radii: path.content_mask.corner_radii,
-            };
+            let bounds = path
+                .transformation
+                .apply_to_bounds(path.bounds)
+                .intersect(&path.content_mask.bounds);
             vertices.extend(path.vertices.iter().map(|v| PathRasterizationVertex {
                 xy_position: v.xy_position,
                 st_position: v.st_position,
                 color: path.color,
-                content_mask,
+                content_mask: path.content_mask,
                 transformation: path.transformation,
+                bounds,
             }));
         }
 
@@ -2704,13 +2708,161 @@ mod tests {
     fn webgl_record_sizes_match_shader_word_strides() {
         assert_eq!(std::mem::size_of::<Quad>(), 50 * 4);
         assert_eq!(std::mem::size_of::<Shadow>(), 38 * 4);
-        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 36 * 4);
+        assert_eq!(std::mem::size_of::<PathRasterizationVertex>(), 40 * 4);
         assert_eq!(std::mem::size_of::<PathSprite>(), 4 * 4);
         assert_eq!(std::mem::size_of::<Underline>(), 26 * 4);
         assert_eq!(std::mem::size_of::<MonochromeSprite>(), 32 * 4);
         assert_eq!(std::mem::size_of::<SubpixelSprite>(), 32 * 4);
         assert_eq!(std::mem::size_of::<PolychromeSprite>(), 34 * 4);
         assert_eq!(std::mem::size_of::<EdgeFadeMask>(), 12 * 4);
+    }
+
+    /// Every record a storage buffer holds has the layout of its Rust type
+    /// in the shaders: the same members in the same order at the same byte
+    /// offsets, and a span equal to the size of the Rust type. Catches a
+    /// field added, removed, or moved on one side only, which makes the
+    /// shader read a member from bytes of another. A storage buffer of a
+    /// record type not listed here fails the test until it is listed.
+    #[test]
+    fn storage_records_have_the_layout_of_their_rust_types() {
+        use gpui::BackdropBlur;
+        use std::collections::BTreeSet;
+        use std::mem::{offset_of, size_of};
+
+        let module = naga::front::wgsl::parse_str(SUBPIXEL_SHADERS).expect("shader should parse");
+        let struct_name = |ty: naga::Handle<naga::Type>| module.types[ty].name.clone();
+        let stored: BTreeSet<String> = module
+            .global_variables
+            .iter()
+            .filter(|(_, var)| matches!(var.space, naga::AddressSpace::Storage { .. }))
+            .filter_map(|(_, var)| match module.types[var.ty].inner {
+                naga::TypeInner::Array { base, .. } => struct_name(base),
+                _ => None,
+            })
+            .collect();
+        let layout = |name: &str| -> (Vec<(String, u32)>, u32) {
+            module
+                .types
+                .iter()
+                .find_map(|(_, ty)| match &ty.inner {
+                    naga::TypeInner::Struct { members, span }
+                        if ty.name.as_deref() == Some(name) =>
+                    {
+                        let members = members
+                            .iter()
+                            .map(|member| (member.name.clone().unwrap_or_default(), member.offset))
+                            .collect();
+                        Some((members, *span))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("the shaders declare no struct {name}"))
+        };
+
+        let mut checked = BTreeSet::new();
+        macro_rules! assert_layout {
+            ($ty:ident { $($field:ident),* $(,)? }) => {{
+                let name = stringify!($ty);
+                let rust: Vec<(String, u32)> =
+                    vec![$((stringify!($field).to_string(), offset_of!($ty, $field) as u32)),*];
+                let (shader, span) = layout(name);
+                assert_eq!(shader, rust, "members and byte offsets of {name}");
+                assert_eq!(span as usize, size_of::<$ty>(), "size of {name}");
+                checked.insert(name.to_string());
+            }};
+        }
+        assert_layout!(Quad {
+            order,
+            border_style,
+            bounds,
+            content_mask,
+            background,
+            border_color,
+            corner_radii,
+            border_widths,
+            transformation,
+        });
+        assert_layout!(Shadow {
+            order,
+            blur_radius,
+            bounds,
+            corner_radii,
+            content_mask,
+            color,
+            element_bounds,
+            element_corner_radii,
+            inset,
+            pad,
+            transformation,
+        });
+        assert_layout!(PathRasterizationVertex {
+            xy_position,
+            st_position,
+            color,
+            content_mask,
+            transformation,
+            bounds,
+        });
+        assert_layout!(PathSprite { bounds });
+        assert_layout!(Underline {
+            order,
+            pad,
+            bounds,
+            content_mask,
+            color,
+            thickness,
+            wavy,
+            transformation,
+        });
+        assert_layout!(MonochromeSprite {
+            order,
+            pad,
+            bounds,
+            content_mask,
+            color,
+            tile,
+            transformation,
+        });
+        assert_layout!(SubpixelSprite {
+            order,
+            pad,
+            bounds,
+            content_mask,
+            color,
+            tile,
+            transformation,
+        });
+        assert_layout!(PolychromeSprite {
+            order,
+            pad,
+            grayscale,
+            opacity,
+            bounds,
+            content_mask,
+            corner_radii,
+            tile,
+            transformation,
+        });
+        assert_layout!(BackdropBlur {
+            order,
+            pad,
+            bounds,
+            content_mask,
+            corner_radii,
+            blur_radius,
+            saturation,
+            tint,
+            transformation,
+        });
+        assert_layout!(EdgeFadeMask {
+            bounds,
+            fade_bounds,
+            bands,
+        });
+        assert_eq!(
+            checked, stored,
+            "the records the storage buffers hold and the records checked here"
+        );
     }
 
     fn build_test_quad_scene(x: f32, width: f32, height: f32) -> Scene {

@@ -172,13 +172,14 @@ fn load_shadow(instance_id: u32) -> Shadow {
 }
 
 fn load_path_vertex(vertex_id: u32) -> PathRasterizationVertex {
-    var cursor = instance_cursor(vertex_id * 36u);
+    var cursor = instance_cursor(vertex_id * 40u);
     return PathRasterizationVertex(
         read_vec2_f32(&cursor),
         read_vec2_f32(&cursor),
         read_background(&cursor),
         read_content_mask(&cursor),
         read_transformation(&cursor),
+        read_bounds(&cursor),
     );
 }
 

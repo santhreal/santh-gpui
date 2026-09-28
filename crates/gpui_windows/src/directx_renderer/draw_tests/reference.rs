@@ -2,10 +2,10 @@
 //! layer mask composite, and edge fade, the rounded rectangle signed
 //! distance, and polygon coverage of path outlines.
 
-use super::{EDGE, SIZE};
+use super::{EDGE, SIZE, window_mask};
 use gpui::{
-    BackdropBlur, Bounds, Corners, EdgeFadeMask, Edges, Hsla, LayerMask, Path, Pixels,
-    ScaledPixels, point, px, size, white,
+    BackdropBlur, Bounds, ContentMask, Corners, EdgeFadeMask, Edges, Hsla, LayerMask, Path, Pixels,
+    ScaledPixels, point, px, white,
 };
 
 pub(super) type Rgba = [f32; 4];
@@ -161,14 +161,21 @@ impl Outline {
     }
 
     pub(super) fn clip_path(&self) -> Path<ScaledPixels> {
+        self.path(white(), window_mask())
+    }
+
+    /// The outline as a path filled with `color` and clipped by
+    /// `content_mask`.
+    pub(super) fn path(
+        &self,
+        color: Hsla,
+        content_mask: ContentMask<ScaledPixels>,
+    ) -> Path<ScaledPixels> {
         let mut path = self.path.clone();
-        path.color = white().into();
-        path.content_mask = Bounds::new(
-            point(px(0.0), px(0.0)),
-            size(px(SIZE as f32), px(SIZE as f32)),
-        )
-        .into();
-        path.scale(1.0)
+        path.color = color.into();
+        let mut path = path.scale(1.0);
+        path.content_mask = content_mask;
+        path
     }
 
     /// Coverage of pixel `(x, y)`: `Some(1.0)` or `Some(0.0)` when its center

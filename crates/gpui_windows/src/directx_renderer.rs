@@ -683,6 +683,7 @@ impl DirectXRenderer {
                 color: path.color,
                 bounds,
                 transformation: path.transformation,
+                content_mask: path.content_mask,
             }));
         }
 
@@ -1412,8 +1413,12 @@ struct PathRasterizationSprite {
     xy_position: Point<ScaledPixels>,
     st_position: Point<f32>,
     color: Background,
+    /// The bounds of the path after its transformation, clipped to its
+    /// content mask. A gradient spans them.
     bounds: Bounds<ScaledPixels>,
     transformation: TransformationMatrix,
+    /// The content mask of the path, whose rounded corners clip it.
+    content_mask: ContentMask<ScaledPixels>,
 }
 
 #[derive(Clone, Copy)]

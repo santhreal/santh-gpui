@@ -1080,8 +1080,12 @@ struct PathRasterizationVertex {
     xy_position: vec2<f32>,
     st_position: vec2<f32>,
     color: Background,
+    // The content mask of the path, whose rounded corners clip it.
     content_mask: ContentMask,
     transformation: TransformationMatrix,
+    // The bounds of the path after its transformation, clipped to its
+    // content mask. A gradient spans them.
+    bounds: Bounds,
 }
 
 
@@ -1127,7 +1131,7 @@ fn fs_path_rasterization(input: PathRasterizationVarying) -> @location(0) vec4<f
     let clip_alpha = saturate(0.5 - mask_sdf);
 
     let background = v.color;
-    let bounds = v.content_mask.bounds;
+    let bounds = v.bounds;
     var alpha: f32;
     if (length(vec2<f32>(dx.x, dy.x)) < 0.001) {
         // If the gradient is too small, return a solid color.

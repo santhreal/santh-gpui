@@ -143,6 +143,9 @@ fn rust_layout(module: ShaderModule, name: &str) -> Option<Layout> {
                 "color": color,
                 "bounds": bounds,
                 "transformation": transformation,
+                "content_mask": content_mask,
+                "content_mask.bounds": content_mask.bounds,
+                "content_mask.corner_radii": content_mask.corner_radii,
             }),
         ),
         ShaderModule::PathSprite | ShaderModule::PathClipComposite => {

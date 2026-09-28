@@ -984,8 +984,12 @@ struct PathRasterizationSprite {
     float2 xy_position;
     float2 st_position;
     Background color;
+    // The bounds of the path after its transformation, clipped to its
+    // content mask. A gradient spans them.
     Bounds bounds;
     TransformationMatrix transformation;
+    // The content mask of the path, whose rounded corners clip it.
+    ContentMask content_mask;
 };
 
 StructuredBuffer<PathRasterizationSprite> path_rasterization_sprites: register(t1);
@@ -1044,7 +1048,8 @@ float4 path_rasterization_fragment(PathFragmentInput input): SV_Target {
 
     float4 color = gradient_color(background, input.local_position, bounds,
         gradient.solid, gradient.color0, gradient.color1);
-    return float4(color.rgb * color.a * alpha, alpha * color.a);
+    float coverage = alpha * content_mask_coverage(input.position.xy, sprite.content_mask);
+    return float4(color.rgb * color.a * coverage, coverage * color.a);
 }
 
 /*

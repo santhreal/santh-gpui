@@ -1,7 +1,9 @@
-//! Draws backdrop blurs and layer masks with the DirectX renderer into the
-//! render target of a hidden window, and compares every pixel with the math
-//! documented on [`gpui::BackdropBlur`] and [`gpui::StartLayerMask`],
-//! computed on the CPU from a frame drawn without the primitive under test.
+//! Draws backdrop blurs, layer masks, and paths in rounded content masks
+//! with the DirectX renderer into the render target of a hidden window, and
+//! compares every pixel with the math documented on [`gpui::BackdropBlur`]
+//! and [`gpui::StartLayerMask`], computed on the CPU from a frame drawn
+//! without the primitive under test, or with the rounded rectangle of the
+//! content mask.
 
 mod reference;
 
@@ -13,7 +15,7 @@ use gpui::{
     WindowBackgroundAppearance, black, hsla, point, px, size, white,
 };
 use gpui_util::ResultExt;
-use reference::{Fade, Image, Outline, Rgba, composite, expected_blur, over, rgba};
+use reference::{Fade, Image, Outline, Rgba, composite, expected_blur, over, quad_sdf, rgba};
 use windows::{
     Win32::{
         Foundation::HWND,
@@ -662,4 +664,45 @@ fn mask_layers_are_released_after_idle_frames_and_recreated_on_use() {
     assert_pixels("nested masks after release", &drawn, |x, y| {
         Some(fade_inside_path(&fade, &outline, x, y))
     });
+}
+
+/// Catches a path clipped by the rectangle of its content mask without its
+/// rounded corners, which paints the corners the mask cuts away, and a
+/// path clipped by the corner radii of the mask applied to the bounds of
+/// the path, which rounds the corners of a path smaller than its mask.
+/// Does not check the antialiased band along the edge of the mask.
+#[test]
+fn paths_are_clipped_by_the_rounded_rectangle_of_their_content_mask() {
+    let mask = ContentMask {
+        bounds: rect(10.0, 10.0, 80.0, 80.0),
+        corner_radii: Corners::all(ScaledPixels(20.0)),
+    };
+    let square = |lo: (f32, f32), hi: (f32, f32)| {
+        Outline::new(lo)
+            .line_to((hi.0, lo.1))
+            .line_to(hi)
+            .line_to((lo.0, hi.1))
+    };
+    let red = hsla(0.0, 1.0, 0.5, 1.0);
+    let mut target = Target::new();
+    for (name, outline) in [
+        ("path inside", square((40.0, 40.0), (60.0, 60.0))),
+        ("path across a corner", square((0.0, 0.0), (40.0, 40.0))),
+        ("path over the frame", square((0.0, 0.0), (100.0, 100.0))),
+    ] {
+        let drawn = target.draw(|scene| {
+            scene.insert_primitive(quad(rect(0.0, 0.0, 100.0, 100.0), black()));
+            scene.insert_primitive(outline.path(red, mask));
+        });
+        assert_pixels(name, &drawn, |x, y| {
+            let center = (x as f32 + 0.5, y as f32 + 0.5);
+            let distance = quad_sdf(center, &mask.bounds, &mask.corner_radii);
+            if distance.abs() < EDGE {
+                return None;
+            }
+            let painted = distance < 0.0 && outline.coverage(x, y)? > 0.0;
+            let color = rgba(if painted { red } else { black() });
+            Some((color, color))
+        });
+    }
 }
