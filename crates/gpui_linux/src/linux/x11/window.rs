@@ -287,7 +287,9 @@ pub struct X11WindowState {
     hovered: bool,
     pub(crate) force_render_after_recovery: bool,
     fullscreen: bool,
-    client_side_decorations_supported: bool,
+    /// Whether a compositing manager ran when the window opened. A window
+    /// that draws its own frame needs one to blend its transparent corners.
+    compositor_present: bool,
     decorations: WindowDecorations,
     edge_constraints: Option<EdgeConstraints>,
     pub handle: AnyWindowHandle,
@@ -461,7 +463,6 @@ impl X11WindowState {
         gpu: WindowGpu,
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
-        client_side_decorations_supported: bool,
         compositor_present: bool,
         x_main_screen_index: usize,
         x_window: xproto::Window,
@@ -844,7 +845,7 @@ impl X11WindowState {
                 handle,
                 background_appearance: params.window_background,
                 destroyed: false,
-                client_side_decorations_supported,
+                compositor_present,
                 decorations: WindowDecorations::Server,
                 last_insets: [0, 0, 0, 0],
                 edge_constraints: None,
@@ -938,7 +939,6 @@ impl X11Window {
         gpu: WindowGpu,
         params: WindowParams,
         xcb: &Rc<XCBConnection>,
-        client_side_decorations_supported: bool,
         compositor_present: bool,
         x_main_screen_index: usize,
         x_window: xproto::Window,
@@ -958,7 +958,6 @@ impl X11Window {
                 gpu,
                 params,
                 xcb,
-                client_side_decorations_supported,
                 compositor_present,
                 x_main_screen_index,
                 x_window,
@@ -1871,8 +1870,9 @@ impl PlatformWindow for X11Window {
     fn window_decorations(&self) -> gpui::Decorations {
         let state = self.0.state.borrow();
 
-        // Client window decorations require compositor support
-        if !state.client_side_decorations_supported {
+        // A frame the window draws itself needs a compositor to blend its
+        // transparent corners.
+        if !state.compositor_present {
             return Decorations::Server;
         }
 
@@ -1947,9 +1947,12 @@ impl PlatformWindow for X11Window {
     fn request_decorations(&self, mut decorations: gpui::WindowDecorations) {
         let mut state = self.0.state.borrow_mut();
 
-        if matches!(decorations, gpui::WindowDecorations::Client)
-            && !state.client_side_decorations_supported
-        {
+        // A window that draws its own frame gets none from the window
+        // manager whenever a compositor blends its transparent corners,
+        // whether or not the window manager handles _GTK_FRAME_EXTENTS,
+        // which decides only whether a client inset stays out of the
+        // geometry of the window.
+        if matches!(decorations, gpui::WindowDecorations::Client) && !state.compositor_present {
             log::info!(
                 "x11: no compositor present, falling back to server-side window decorations"
             );

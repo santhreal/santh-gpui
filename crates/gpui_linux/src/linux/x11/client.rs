@@ -197,7 +197,7 @@ pub struct X11ClientState {
     xkb_context: xkbc::Context,
     pub(crate) xcb_connection: Rc<XCBConnection>,
     xkb_device_id: i32,
-    client_side_decorations_supported: bool,
+    /// Whether a compositing manager ran when the last window opened.
     compositor_present: bool,
     /// Whether an EWMH window manager ran when the client connected.
     window_manager_present: bool,
@@ -408,14 +408,10 @@ impl X11Client {
 
         let root = xcb_connection.setup().roots[x_root_index].root;
         let compositor_present = compositor_present(&xcb_connection, x_root_index, root);
-        let gtk_frame_extents_supported =
-            check_gtk_frame_extents_supported(&xcb_connection, &atoms, root);
-        let client_side_decorations_supported = compositor_present && gtk_frame_extents_supported;
         let window_manager_present = check_window_manager_present(&xcb_connection, &atoms, root);
         log::info!(
-            "x11: compositor present: {}, gtk_frame_extents_supported: {}, window manager present: {}",
+            "x11: compositor present: {}, window manager present: {}",
             compositor_present,
-            gtk_frame_extents_supported,
             window_manager_present
         );
 
@@ -553,7 +549,6 @@ impl X11Client {
             xkb_context,
             xcb_connection,
             xkb_device_id,
-            client_side_decorations_supported,
             compositor_present,
             window_manager_present,
             x_root_index,
@@ -1662,8 +1657,15 @@ impl LinuxClient for X11Client {
             .context("X11: Failed to generate window ID")?;
 
         let xcb_connection = state.xcb_connection.clone();
-        let client_side_decorations_supported = state.client_side_decorations_supported;
-        let compositor_present = state.compositor_present;
+        // A compositing manager can start after the client connects, as one
+        // started beside an application at login does, so every window
+        // looks for one as it opens.
+        let root = xcb_connection.setup().roots[state.x_root_index].root;
+        let compositor_present = compositor_present(&xcb_connection, state.x_root_index, root);
+        if compositor_present != state.compositor_present {
+            log::info!("x11: compositor present: {compositor_present}");
+            state.compositor_present = compositor_present;
+        }
         let x_root_index = state.x_root_index;
         let atoms = state.atoms;
         let scale_factor = state.scale_factor;
@@ -1685,7 +1687,6 @@ impl LinuxClient for X11Client {
             gpu,
             params,
             &xcb_connection,
-            client_side_decorations_supported,
             compositor_present,
             x_root_index,
             x_window,
@@ -2201,35 +2202,6 @@ fn check_window_manager_present(
         .and_then(|reply| reply.value32()?.next())
     };
     check_window(root).is_some_and(|wm| check_window(wm) == Some(wm))
-}
-
-fn check_gtk_frame_extents_supported(
-    xcb_connection: &XCBConnection,
-    atoms: &XcbAtoms,
-    root: xproto::Window,
-) -> bool {
-    let Some(supported_atoms) = get_reply(
-        || "Failed to get _NET_SUPPORTED",
-        xcb_connection.get_property(
-            false,
-            root,
-            atoms._NET_SUPPORTED,
-            xproto::AtomEnum::ATOM,
-            0,
-            1024,
-        ),
-    )
-    .log_with_level(Level::Debug) else {
-        return false;
-    };
-
-    let supported_atom_ids: Vec<u32> = supported_atoms
-        .value
-        .chunks_exact(4)
-        .filter_map(|chunk| chunk.try_into().ok().map(u32::from_ne_bytes))
-        .collect();
-
-    supported_atom_ids.contains(&atoms._GTK_FRAME_EXTENTS)
 }
 
 fn xdnd_is_atom_supported(atom: u32, atoms: &XcbAtoms) -> bool {
