@@ -20,6 +20,11 @@
 //! Not covered: a configure that fails in the driver, which the test
 //! server's adapter does not do, and the platform calling
 //! `needs_recovery` before it draws.
+//!
+//! The X server must run with -noreset. The other tests of this crate load
+//! GPU drivers that connect to `DISPLAY` and disconnect, and a server that
+//! resets when its last client disconnects fails a test's connection that
+//! is still in setup.
 
 use crate::wgpu_renderer::{WgpuRenderer, WgpuSurfaceConfig};
 use crate::{DisplayInstances, GpuContext, WgpuContext};
