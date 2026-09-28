@@ -2332,49 +2332,58 @@ fn current_pointer_device_states(
         xcb_connection.xinput_xi_query_device(XINPUT_ALL_DEVICES),
     )
     .log_err()?;
+    Some(pointer_device_states(
+        &devices_query_result.infos,
+        scroll_values_to_preserve,
+    ))
+}
 
-    let mut pointer_device_states = BTreeMap::new();
-    pointer_device_states.extend(
-        devices_query_result
-            .infos
-            .iter()
-            .filter(|info| is_pointer_device(info.type_))
-            .filter_map(|info| {
-                let scroll_data = info
-                    .classes
-                    .iter()
-                    .filter_map(|class| class.data.as_scroll())
-                    .copied()
-                    .rev()
-                    .collect::<Vec<_>>();
-                let old_state = scroll_values_to_preserve.get(&info.deviceid);
-                let old_horizontal = old_state.map(|state| &state.horizontal);
-                let old_vertical = old_state.map(|state| &state.vertical);
-                let horizontal = scroll_data
-                    .iter()
-                    .find(|data| data.scroll_type == xinput::ScrollType::HORIZONTAL)
-                    .map(|data| scroll_data_to_axis_state(data, old_horizontal));
-                let vertical = scroll_data
-                    .iter()
-                    .find(|data| data.scroll_type == xinput::ScrollType::VERTICAL)
-                    .map(|data| scroll_data_to_axis_state(data, old_vertical));
-                if horizontal.is_none() && vertical.is_none() {
-                    None
-                } else {
-                    Some((
-                        info.deviceid,
-                        PointerDeviceState {
-                            horizontal: horizontal.unwrap_or_else(Default::default),
-                            vertical: vertical.unwrap_or_else(Default::default),
-                        },
-                    ))
-                }
-            }),
-    );
-    if pointer_device_states.is_empty() {
-        log::error!("Found no xinput mouse pointers.");
+/// The scroll state of each pointer device in `infos` that reports scroll
+/// valuators. A server whose pointers report none, Xvfb's for one, delivers
+/// the wheel as button presses 4 to 7, which scroll without this state.
+fn pointer_device_states(
+    infos: &[xinput::XIDeviceInfo],
+    scroll_values_to_preserve: &BTreeMap<xinput::DeviceId, PointerDeviceState>,
+) -> BTreeMap<xinput::DeviceId, PointerDeviceState> {
+    let states: BTreeMap<_, _> = infos
+        .iter()
+        .filter(|info| is_pointer_device(info.type_))
+        .filter_map(|info| {
+            let scroll_data = info
+                .classes
+                .iter()
+                .filter_map(|class| class.data.as_scroll())
+                .copied()
+                .rev()
+                .collect::<Vec<_>>();
+            let old_state = scroll_values_to_preserve.get(&info.deviceid);
+            let old_horizontal = old_state.map(|state| &state.horizontal);
+            let old_vertical = old_state.map(|state| &state.vertical);
+            let horizontal = scroll_data
+                .iter()
+                .find(|data| data.scroll_type == xinput::ScrollType::HORIZONTAL)
+                .map(|data| scroll_data_to_axis_state(data, old_horizontal));
+            let vertical = scroll_data
+                .iter()
+                .find(|data| data.scroll_type == xinput::ScrollType::VERTICAL)
+                .map(|data| scroll_data_to_axis_state(data, old_vertical));
+            if horizontal.is_none() && vertical.is_none() {
+                None
+            } else {
+                Some((
+                    info.deviceid,
+                    PointerDeviceState {
+                        horizontal: horizontal.unwrap_or_else(Default::default),
+                        vertical: vertical.unwrap_or_else(Default::default),
+                    },
+                ))
+            }
+        })
+        .collect();
+    if states.is_empty() {
+        log::debug!("no XInput pointer reports scroll valuators; the wheel scrolls by button");
     }
-    Some(pointer_device_states)
+    states
 }
 
 /// Returns true if the device is a pointer device. Does not include pointer device groups.
@@ -3115,5 +3124,90 @@ mod tests {
                 other => panic!("{name} must fail the source, got {other:?}"),
             }
         }
+    }
+
+    thread_local! {
+        static RECORDS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Records every warning and error logged on the thread that logs it.
+    struct Recorder;
+
+    impl log::Log for Recorder {
+        fn enabled(&self, metadata: &log::Metadata) -> bool {
+            metadata.level() <= log::Level::Warn
+        }
+
+        fn log(&self, record: &log::Record) {
+            if self.enabled(record.metadata()) {
+                let line = format!("{} {}", record.level(), record.args());
+                RECORDS.with_borrow_mut(|records| records.push(line));
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn pointer(
+        deviceid: xinput::DeviceId,
+        scroll: &[(u16, xinput::ScrollType)],
+    ) -> xinput::XIDeviceInfo {
+        xinput::XIDeviceInfo {
+            deviceid,
+            type_: xinput::DeviceType::SLAVE_POINTER,
+            attachment: 2,
+            enabled: true,
+            name: b"pointer".to_vec(),
+            classes: scroll
+                .iter()
+                .map(|&(number, scroll_type)| xinput::DeviceClass {
+                    len: 6,
+                    sourceid: deviceid,
+                    data: xinput::DeviceClassData::Scroll(xinput::DeviceClassDataScroll {
+                        number,
+                        scroll_type,
+                        flags: xinput::ScrollFlags::NO_EMULATION,
+                        increment: xinput::Fp3232 {
+                            integral: 1,
+                            frac: 0,
+                        },
+                    }),
+                })
+                .collect(),
+        }
+    }
+
+    // WHY: every start on a server whose pointers report no scroll
+    // valuators (Xvfb, and so each X11 test and CI run) logged "Found no
+    // xinput mouse pointers" as an error, though the wheel scrolls there by
+    // button press. This checks that such a server logs no warning or error
+    // and that a pointer reporting scroll valuators still gets its state.
+    // Not covered: the XInput query itself, which needs an X server.
+    #[test]
+    fn pointers_without_scroll_valuators_log_no_error() {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&Recorder).expect("gpui_linux's tests install no other logger");
+            log::set_max_level(log::LevelFilter::Warn);
+        });
+        RECORDS.with_borrow_mut(Vec::clear);
+
+        let wheel_by_button = pointer(6, &[]);
+        let states =
+            pointer_device_states(std::slice::from_ref(&wheel_by_button), &BTreeMap::new());
+        assert!(states.is_empty());
+        assert_eq!(RECORDS.take(), Vec::<String>::new());
+
+        let smooth = pointer(
+            7,
+            &[
+                (2, xinput::ScrollType::HORIZONTAL),
+                (3, xinput::ScrollType::VERTICAL),
+            ],
+        );
+        let states = pointer_device_states(&[wheel_by_button, smooth], &BTreeMap::new());
+        assert_eq!(states.keys().copied().collect::<Vec<_>>(), [7]);
+        assert_eq!(states[&7].horizontal.valuator_number, Some(2));
+        assert_eq!(states[&7].vertical.valuator_number, Some(3));
     }
 }
