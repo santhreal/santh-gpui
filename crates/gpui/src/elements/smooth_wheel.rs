@@ -11,8 +11,9 @@ use crate::{
 mod tests;
 
 /// The spring the offset of a scroll state with smooth wheel scrolling follows
-/// its wheel target on: critically damped with a 120 ms response, a natural
-/// frequency of 2π / 0.12 s (stiffness 2741.6, damping 104.7, unit mass).
+/// its wheel target on, and a list with smooth tail following follows its end
+/// on: critically damped with a 120 ms response, a natural frequency of
+/// 2π / 0.12 s (stiffness 2741.6, damping 104.7, unit mass).
 pub const WHEEL_SPRING: SpringConfig = SpringConfig::new(2741.557, 104.719_76, 1.0);
 
 /// Whether a wheel event with `delta` eases: a line delta, as from a mouse

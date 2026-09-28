@@ -18,7 +18,10 @@ use refineable::Refineable as _;
 use std::{cell::RefCell, ops::Range, rc::Rc};
 use sum_tree::{Bias, Dimensions, SumTree};
 
-use super::smooth_wheel::{self, WheelEase};
+use super::{
+    smooth_follow::FollowEase,
+    smooth_wheel::{self, WheelEase},
+};
 
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
 
@@ -76,6 +79,7 @@ struct StateInner {
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
     wheel: Option<WheelEase<Option<ListOffset>>>,
+    follow: Option<FollowEase>,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -329,6 +333,7 @@ impl ListState {
             pending_scroll: None,
             follow_state: FollowState::default(),
             wheel: None,
+            follow: None,
         })));
         this.splice(0..0, item_count);
         this
@@ -364,6 +369,7 @@ impl ListState {
             state.logical_scroll_top = None;
             state.pending_scroll = None;
             state.scrollbar_drag_start_height = None;
+            state.end_follow_motion();
             state.items.summary().count
         };
 
@@ -403,6 +409,7 @@ impl ListState {
     /// but the number and identity of items remains the same.
     pub fn remeasure(&self) {
         let count = self.item_count();
+        self.0.borrow_mut().end_follow_motion();
         self.remeasure_items_with_scroll_anchor(0..count, ScrollAnchor::Proportional);
     }
 
@@ -550,6 +557,9 @@ impl ListState {
                 *item_ix = *item_ix - (old_range.end - old_range.start) + spliced_count;
             }
         }
+        if let Some(follow) = state.follow.as_mut() {
+            follow.splice(&old_range, spliced_count);
+        }
     }
 
     /// Set a handler that will be called when the list is scrolled.
@@ -573,6 +583,7 @@ impl ListState {
 
         let current_offset = self.logical_scroll_top();
         let state = &mut *self.0.borrow_mut();
+        state.end_follow_motion();
 
         if distance < px(0.) {
             state.follow_state.stop_following();
@@ -608,6 +619,7 @@ impl ListState {
         let state = &mut *self.0.borrow_mut();
         let item_count = state.items.summary().count;
         state.pending_scroll = None;
+        state.end_follow_motion();
         state.logical_scroll_top = Some(ListOffset {
             item_ix: item_count,
             offset_in_item: px(0.),
@@ -620,6 +632,7 @@ impl ListState {
     /// following occurs.
     pub fn set_follow_mode(&self, mode: FollowMode) {
         let state = &mut *self.0.borrow_mut();
+        state.end_follow_motion();
 
         match mode {
             FollowMode::Normal => {
@@ -648,7 +661,9 @@ impl ListState {
     /// diagram) and the current position should stay put rather than snapping
     /// to the end.
     pub fn pause_following_tail(&self) {
-        self.0.borrow_mut().follow_state.stop_following();
+        let state = &mut *self.0.borrow_mut();
+        state.end_follow_motion();
+        state.follow_state.stop_following();
     }
 
     /// Returns whether the list is currently actively following the
@@ -683,9 +698,33 @@ impl ListState {
         self.0.borrow().wheel.is_some()
     }
 
+    /// Eases following the tail when `smooth` is set. While the list follows
+    /// its tail, content that grows at the end, as an item that streams or
+    /// arrives, moves into view on [`WHEEL_SPRING`](crate::WHEEL_SPRING)
+    /// instead of at once, one frame per display frame; growth during the
+    /// motion extends it and keeps its velocity. Any other change of the
+    /// scroll position, such as a wheel event, [`Self::scroll_to`],
+    /// [`Self::scroll_to_end`] or [`Self::set_follow_mode`], ends the motion,
+    /// and so do [`Self::reset`], [`Self::remeasure`] and a change of the
+    /// list's width. [`Self::pause_following_tail`] ends it where it was
+    /// drawn. Under reduced motion the list shows the end at once.
+    /// Off by default. Turning it off ends a motion at the end.
+    pub fn set_smooth_follow(&self, smooth: bool) {
+        let state = &mut *self.0.borrow_mut();
+        if smooth != state.follow.is_some() {
+            state.follow = smooth.then(FollowEase::new);
+        }
+    }
+
+    /// Whether following the tail eases; see [`Self::set_smooth_follow`].
+    pub fn smooth_follow(&self) -> bool {
+        self.0.borrow().follow.is_some()
+    }
+
     /// Scroll the list to the given offset
     pub fn scroll_to(&self, mut scroll_top: ListOffset) {
         let state = &mut *self.0.borrow_mut();
+        state.end_follow_motion();
         let item_count = state.items.summary().count;
         if scroll_top.item_ix >= item_count {
             scroll_top.item_ix = item_count;
@@ -703,6 +742,7 @@ impl ListState {
     /// Scroll the list to the given item, such that the item is fully visible.
     pub fn scroll_to_reveal_item(&self, ix: usize) {
         let state = &mut *self.0.borrow_mut();
+        state.end_follow_motion();
 
         let mut scroll_top = state.logical_scroll_top();
         let height = state
@@ -943,6 +983,7 @@ impl StateInner {
             return;
         }
 
+        self.end_follow_motion();
         let scroll_max = self.scroll_max(height);
         let current = self.scroll_top(&self.logical_scroll_top()).min(scroll_max);
         let at = self.logical_scroll_top;
@@ -993,6 +1034,13 @@ impl StateInner {
     fn scroll_max(&self, height: Pixels) -> Pixels {
         let padding = self.last_padding.unwrap_or_default();
         (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.))
+    }
+
+    /// Ends a follow motion: the next following layout shows the end.
+    fn end_follow_motion(&mut self) {
+        if let Some(follow) = self.follow.as_mut() {
+            follow.cancel();
+        }
     }
 
     /// Places the scroll top `new_scroll_top` pixels from the top of the
@@ -1098,7 +1146,8 @@ impl StateInner {
         let mut max_item_width = px(0.);
         let mut scroll_top = self.logical_scroll_top();
 
-        if self.follow_state.is_following() {
+        let following = self.follow_state.is_following();
+        if following {
             scroll_top = ListOffset {
                 item_ix: self.items.summary().count,
                 offset_in_item: px(0.),
@@ -1107,6 +1156,19 @@ impl StateInner {
         }
 
         let mut rendered_focused_item = false;
+        // The layout drawn this frame of a following list that eases its
+        // follow walks up to the scroll top the list showed last, measuring
+        // how far the end moved below it, and no further than one viewport
+        // past the end. Under reduced motion nothing eases, so the walk stops
+        // at the viewport and the scroll top it finds is the one shown.
+        let drawn = available_width.is_some();
+        let follow_from = self
+            .follow
+            .as_ref()
+            .filter(|_| drawn && following && !cx.motion_policy().reduced())
+            .and_then(FollowEase::shown)
+            .filter(|shown| shown.item_ix < self.items.summary().count);
+        let mut shown_bottom = None;
 
         let available_item_space = size(
             available_width.map_or(AvailableSpace::MaxContent, |width| {
@@ -1188,7 +1250,11 @@ impl StateInner {
         // If the rendered items do not fill the visible region, then adjust
         // the scroll top upward.
         if rendered_height - scroll_top.offset_in_item < available_height {
-            while rendered_height < available_height {
+            while rendered_height < available_height
+                || (follow_from.is_some()
+                    && shown_bottom.is_none()
+                    && rendered_height < available_height + available_height)
+            {
                 cursor.prev();
                 if let Some(item) = cursor.item() {
                     let item_index = cursor.start().0;
@@ -1196,6 +1262,9 @@ impl StateInner {
                     let element_size = element.layout_as_root(available_item_space, window, cx);
                     let focus_handle = item.focus_handle();
                     rendered_height += element_size.height;
+                    if follow_from.is_some_and(|shown| shown.item_ix == item_index) {
+                        shown_bottom = Some(rendered_height);
+                    }
                     measured_items.push_front(ListItem::Measured {
                         size: element_size,
                         focus_handle,
@@ -1233,8 +1302,38 @@ impl StateInner {
             };
         }
 
+        // A following list that eases its follow shows its end `lag` below
+        // the end of the viewport. The items the walk passed wholly above
+        // the viewport are measured but not drawn.
+        let mut passed = px(0.);
+        if drawn
+            && following
+            && let Some(follow) = self.follow.as_mut()
+        {
+            let behind = follow_from.map(|shown| match shown_bottom {
+                Some(bottom) => bottom - shown.offset_in_item - available_height,
+                None => rendered_height - available_height,
+            });
+            let lag = follow.step(behind, cx);
+            scroll_top.offset_in_item -= lag;
+            while let Some(first) = item_layouts.front()
+                && scroll_top.offset_in_item >= first.size.height
+            {
+                scroll_top = ListOffset {
+                    item_ix: first.index + 1,
+                    offset_in_item: scroll_top.offset_in_item - first.size.height,
+                };
+                passed += first.size.height;
+                item_layouts.pop_front();
+            }
+            if lag > px(0.) {
+                self.logical_scroll_top = Some(scroll_top);
+            }
+            follow.record(scroll_top);
+        }
+
         // Measure items in the leading overdraw
-        let mut leading_overdraw = scroll_top.offset_in_item;
+        let mut leading_overdraw = scroll_top.offset_in_item + passed;
         while leading_overdraw < self.overdraw {
             cursor.prev();
             if let Some(item) = cursor.item() {
@@ -1439,6 +1538,7 @@ impl StateInner {
         let Some(bounds) = self.last_layout_bounds else {
             return;
         };
+        self.end_follow_motion();
         let height = bounds.size.height;
 
         let padding = self.last_padding.unwrap_or_default();
@@ -1622,6 +1722,7 @@ impl Element for List {
 
             state.items = new_items;
             state.measuring_behavior.reset();
+            state.end_follow_motion();
         }
 
         let padding = style
@@ -1630,7 +1731,9 @@ impl Element for List {
         let at = state.logical_scroll_top;
         if let Some(step) = state.wheel.as_mut().and_then(|ease| ease.step(at, cx)) {
             let scroll_max = state.scroll_max(bounds.size.height);
-            let current = state.scroll_top(&state.logical_scroll_top()).min(scroll_max);
+            let current = state
+                .scroll_top(&state.logical_scroll_top())
+                .min(scroll_max);
             let next = (current + step.y).max(px(0.)).min(scroll_max);
             state.set_scroll_top(next, scroll_max);
             let at = state.logical_scroll_top;
@@ -1654,6 +1757,9 @@ impl Element for List {
                         .unwrap()
                 }
             };
+        if let Some(follow) = state.follow.as_ref() {
+            follow.request_frame(bounds, window);
+        }
 
         state.last_layout_bounds = Some(bounds);
         state.last_padding = Some(padding);
@@ -1684,8 +1790,8 @@ impl Element for List {
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
-                let eased = smooth_wheel::eases(&event.delta, cx)
-                    && list_state.0.borrow().wheel.is_some();
+                let eased =
+                    smooth_wheel::eases(&event.delta, cx) && list_state.0.borrow().wheel.is_some();
                 let pixel_delta = if eased {
                     event.delta.pixel_delta(px(20.))
                 } else {

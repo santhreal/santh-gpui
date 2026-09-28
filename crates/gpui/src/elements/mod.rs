@@ -13,6 +13,7 @@ mod motion_ext;
 #[cfg(test)]
 mod motion_harness;
 mod presence;
+mod smooth_follow;
 mod smooth_wheel;
 mod surface;
 mod svg;
