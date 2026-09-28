@@ -2313,6 +2313,31 @@ impl Window {
         self.invalidator.declare_damage(bounds);
     }
 
+    /// Declares, like [`Window::declare_damage`] called from `paint`, the
+    /// window region of every primitive painted since the scene held
+    /// `scene_index` paint operations: shadows, overflowing children, and
+    /// transforms included. Declares nothing when nothing was painted.
+    pub(crate) fn declare_painted_damage(&mut self, scene_index: usize) {
+        self.invalidator.debug_assert_paint();
+        let Some(bounds) = self.next_frame.scene.painted_bounds_since(scene_index) else {
+            return;
+        };
+        let scale_factor = self.scale_factor();
+        let unscale = |value: ScaledPixels, round: fn(f32) -> f32| px(round(value.0) / scale_factor);
+        let origin = bounds.origin;
+        let far = bounds.bottom_right();
+        self.declare_damage(Bounds::from_corners(
+            point(unscale(origin.x, f32::floor), unscale(origin.y, f32::floor)),
+            point(unscale(far.x, f32::ceil), unscale(far.y, f32::ceil)),
+        ));
+    }
+
+    /// The number of paint operations in the scene being painted, the start
+    /// of a range for [`Window::declare_painted_damage`].
+    pub(crate) fn scene_index(&self) -> usize {
+        self.next_frame.scene.len()
+    }
+
     /// The damage the next draw resolves to right now: `None` for the whole
     /// viewport, otherwise the union of the declared rects in window
     /// coordinates, empty when nothing is pending.
@@ -5230,6 +5255,15 @@ impl Window {
         let snapped_offset = self.pixel_snap_point(self.element_offset());
         bounds.origin += snapped_offset;
         bounds
+    }
+
+    /// Whether `ancestor` is `descendant` or one of its ancestors in the
+    /// layout tree of this frame. The roots that a list lays out apart from
+    /// the tree around it are unrelated to that tree.
+    pub(crate) fn layout_contains(&self, ancestor: LayoutId, descendant: LayoutId) -> bool {
+        self.layout_engine
+            .as_ref()
+            .is_some_and(|engine| engine.contains(ancestor, descendant))
     }
 
     /// This method should be called during `prepaint`. You can use

@@ -377,6 +377,20 @@ impl TaffyLayoutEngine {
         self.absolute_layout_bounds.insert(id, bounds);
         bounds
     }
+
+    /// Whether `ancestor` is `descendant` or one of its ancestors in the
+    /// layout tree. Nodes of two trees computed apart, such as the items of a
+    /// list, are unrelated.
+    pub fn contains(&self, ancestor: LayoutId, descendant: LayoutId) -> bool {
+        let mut node = Some(descendant.0);
+        while let Some(id) = node {
+            if id == ancestor.0 {
+                return true;
+            }
+            node = self.taffy.parent(id);
+        }
+        false
+    }
 }
 
 /// A unique identifier for a layout node, generated when requesting a layout from Taffy

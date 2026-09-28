@@ -326,6 +326,45 @@ impl Scene {
         self.store_visible(source.clone(), source.clipped_bounds());
     }
 
+    /// The union of the window regions that the primitives logged at
+    /// `start..` of the paint log draw into, or `None` when none was logged.
+    /// Read during paint, before [`Self::finish`] reorders the primitives.
+    pub(crate) fn painted_bounds_since(&self, start: usize) -> Option<Bounds<ScaledPixels>> {
+        self.paint_operations
+            .get(start..)?
+            .iter()
+            .filter_map(|operation| match *operation {
+                PaintOperation::Primitive(PrimitiveRef { kind, index }) => {
+                    self.clipped_bounds_of(kind, index as usize)
+                }
+                PaintOperation::StartLayer(_)
+                | PaintOperation::EndLayer
+                | PaintOperation::PushZIndex(_)
+                | PaintOperation::PopZIndex => None,
+            })
+            .reduce(|union, bounds| union.union(&bounds))
+    }
+
+    /// The clipped window region of the primitive of `kind` at `index`, or
+    /// `None` for a layer mask marker, which draws nothing itself.
+    fn clipped_bounds_of(&self, kind: PrimitiveKind, index: usize) -> Option<Bounds<ScaledPixels>> {
+        fn stored<P: Stored>(scene: &Scene, index: usize) -> Bounds<ScaledPixels> {
+            Stored::clipped_bounds(&P::stored(scene)[index])
+        }
+        Some(match kind {
+            PrimitiveKind::Shadow => stored::<Shadow>(self, index),
+            PrimitiveKind::Quad => stored::<Quad>(self, index),
+            PrimitiveKind::Path => stored::<Path<ScaledPixels>>(self, index),
+            PrimitiveKind::Underline => stored::<Underline>(self, index),
+            PrimitiveKind::MonochromeSprite => stored::<MonochromeSprite>(self, index),
+            PrimitiveKind::SubpixelSprite => stored::<SubpixelSprite>(self, index),
+            PrimitiveKind::PolychromeSprite => stored::<PolychromeSprite>(self, index),
+            PrimitiveKind::Surface => stored::<PaintSurface>(self, index),
+            PrimitiveKind::BackdropBlur => stored::<BackdropBlur>(self, index),
+            PrimitiveKind::StartLayerMask | PrimitiveKind::EndLayerMask => return None,
+        })
+    }
+
     pub fn finish(&mut self) {
         // The key fixes the draw order. The sort is stable, so primitives of
         // one kind keep paint order within a key, except that sprites order

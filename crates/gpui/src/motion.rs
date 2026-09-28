@@ -37,6 +37,7 @@
 
 mod clock;
 mod drive;
+mod element;
 mod policy;
 #[cfg(test)]
 mod system_preference_tests;
@@ -46,3 +47,4 @@ mod tests;
 pub use ::motion::*;
 pub use clock::FrameInstant;
 pub use drive::{Advance, MotionDriver, MotionFrame};
+pub(crate) use element::{ElementSpring, PIXEL_REST_DISTANCE};
