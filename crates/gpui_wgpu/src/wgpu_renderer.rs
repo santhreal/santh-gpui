@@ -752,7 +752,9 @@ impl WgpuRenderer {
             *last_error_clone.lock() = Some(error.to_string());
         }));
         // After the error handler: a configure error is a frame error, not a
-        // panic on the worker.
+        // panic on the worker. After the pipelines: NVIDIA's X11 driver
+        // creates a swapchain and pipelines at the same time slower than one
+        // after the other, by 36 ms to a cold start's first frame.
         let configuring = match &target {
             WgpuRenderTarget::Surface(surface) => {
                 Configuring::start(surface, &device, &surface_config)
