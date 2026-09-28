@@ -5,11 +5,15 @@ use super::{Animator, FrameInstant, MotionModel, MotionPolicy, SpringConfig};
 
 /// Distance from the target, in pixels, at which a pixel spring lands.
 pub(crate) const PIXEL_REST_DISTANCE: f32 = 0.02;
+/// Distance from the target at which a spring over a unit value, such as an
+/// opacity or the progress of an enter motion, lands.
+pub(crate) const UNIT_REST_DISTANCE: f32 = 1e-3;
 /// Speed, in rest distances per second, under which a spring within its rest
 /// distance of the target lands.
 const REST_SPEED_PER_DISTANCE: f32 = 20.0;
 
-/// One value of an element moved toward a target by a spring.
+/// One value of an element moved toward a target by a spring, or by the
+/// [`MotionModel`] set with [`Self::set_model`].
 ///
 /// The spring is evaluated in closed form from the state where its current
 /// motion started, so a sample depends on the frame instant and not on how
@@ -18,7 +22,7 @@ const REST_SPEED_PER_DISTANCE: f32 = 20.0;
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ElementSpring {
     animator: Animator<FrameInstant>,
-    config: SpringConfig,
+    model: MotionModel,
     rest_distance: f32,
 }
 
@@ -28,7 +32,7 @@ impl ElementSpring {
     pub(crate) fn at_rest(value: f32, config: SpringConfig, rest_distance: f32) -> Self {
         Self {
             animator: Animator::at_rest(value),
-            config,
+            model: MotionModel::Spring(config),
             rest_distance,
         }
     }
@@ -46,7 +50,23 @@ impl ElementSpring {
 
     /// Sets the spring parameters of later motions.
     pub(crate) fn set_config(&mut self, config: SpringConfig) {
-        self.config = config;
+        self.model = MotionModel::Spring(config);
+    }
+
+    /// Sets the model of later motions. A duration model starts from the
+    /// value of the instant of a change and does not carry its velocity.
+    pub(crate) fn set_model(&mut self, model: MotionModel) {
+        self.model = model;
+    }
+
+    /// Moves the value toward `target` from the value and velocity sampled at
+    /// `now`. Under reduced motion, lands on `target`.
+    pub(crate) fn set_target(&mut self, target: f32, policy: MotionPolicy, now: FrameInstant) {
+        if policy.reduced() {
+            self.animator.snap(target);
+            return;
+        }
+        self.animator.retarget(target, self.model, policy, now);
     }
 
     /// Moves the value by `delta` at `now` without changing its velocity or
@@ -63,7 +83,7 @@ impl ElementSpring {
             sample.value + delta,
             sample.velocity,
             target,
-            MotionModel::Spring(self.config),
+            self.model,
             policy,
             now,
         );
