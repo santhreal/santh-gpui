@@ -1,15 +1,17 @@
 //! Smooth tail following sampled frame by frame on the test clock.
 //!
 //! WHY: closes the classes "content growing at the end of a following list
-//! jumps instead of easing", "growth during a motion restarts it from rest or
-//! drops the earlier growth", "a splice mid-motion jumps the list", "a wheel
-//! event cannot interrupt the motion, or the list jumps when it does",
-//! "entering follow mode or resetting the list eases", "reduced motion still
-//! eases", "a list that did not opt in changes behavior", "a growth taller
-//! than the viewport draws past the laid-out items", "pausing mid-motion
-//! keeps requesting frames", "a reduced-motion layout reports a scroll top
-//! above the one it shows", "a resting list keeps requesting frames", "a
-//! spring carried past the end draws the list past its end", and "rows
+//! jumps instead of easing", "the frame that draws a growth hides it, so
+//! arriving content shows a frame late", "growth during a motion restarts it
+//! from rest or drops the earlier growth", "a splice mid-motion jumps the
+//! list", "a wheel event cannot interrupt the motion, or the list jumps when
+//! it does", "entering follow mode or resetting the list eases", "reduced
+//! motion still eases", "a list that did not opt in changes behavior", "a
+//! growth taller than the viewport draws past the laid-out items", "pausing
+//! mid-motion keeps requesting frames", "a reduced-motion layout reports a
+//! scroll top above the one it shows", "a resting list keeps requesting
+//! frames", "a spring carried past the end draws the list past its end",
+//! "content that shrinks mid-motion scrolls the list back", and "rows
 //! arriving in an empty list ease from where nothing was shown".
 //! The lag is read from where the last item was painted and compared with
 //! the closed-form spring at each frame instant. Not caught: growth of an
@@ -175,23 +177,41 @@ fn run_to_rest(
     }
 }
 
-/// Asserts that `frames`, one per display frame after the end moved `from`
-/// below the viewport at rest, follow [`WHEEL_SPRING`] to the end.
+/// The lag and velocity a growth of `by` at the end of a list at rest joins
+/// the motion with: the share [`GROWTH_HELD`], moving along the decay of
+/// the critically damped [`WHEEL_SPRING`].
+fn held(by: f32) -> (f32, f32) {
+    let held = by * GROWTH_HELD;
+    let rate = (WHEEL_SPRING.stiffness / WHEEL_SPRING.mass).sqrt();
+    (held, -held * rate)
+}
+
+/// Asserts that `frames`, one per display frame after the end moved `by`
+/// below the viewport at rest, follow [`WHEEL_SPRING`] from the share of
+/// `by` held back to the end, closer on every frame.
 fn assert_eases(
     window: &WindowHandle<Feed>,
     cx: &mut TestAppContext,
     frames: &[(f32, Option<Bounds<Pixels>>)],
-    from: f32,
+    by: f32,
 ) {
     let tolerance = tolerance(window, cx);
+    let (start, velocity) = held(by);
     assert!(frames.len() > 5, "the motion took {} frames", frames.len());
+    let mut previous = start;
     for (ix, (lag, _)) in frames.iter().enumerate() {
-        let (expected, _) = spring_at(WHEEL_SPRING, from, 0.0, 0.0, ix as u32 + 1);
+        let (expected, _) = spring_at(WHEEL_SPRING, start, velocity, 0.0, ix as u32 + 1);
         assert!(
             (lag - expected).abs() <= tolerance,
             "frame {}: {lag} behind, the spring {expected}",
             ix + 1
         );
+        assert!(
+            *lag < previous || previous.abs() <= tolerance,
+            "frame {}: the list moves on, {lag} behind after {previous}",
+            ix + 1
+        );
+        previous = *lag;
     }
     let (last, _) = frames.last().unwrap();
     assert!(
@@ -215,9 +235,11 @@ fn growth_at_the_end_eases_into_view_along_the_spring(cx: &mut TestAppContext) {
     );
 
     grow(&window, cx, 40.0);
+    let (start, _) = held(40.0);
+    let drawn = lag(&window, cx);
     assert!(
-        (lag(&window, cx) - 40.0).abs() <= tolerance,
-        "the frame that draws the growth moves nothing yet"
+        (drawn - start).abs() <= tolerance && drawn > 1.0,
+        "the frame that draws the growth shows all but {start} of it, not {drawn}"
     );
     let viewport = painted_bounds(&window, cx, LIST).unwrap();
     let frames = run_to_rest(&window, cx);
@@ -254,15 +276,17 @@ fn growth_during_the_motion_extends_it_and_keeps_its_velocity(cx: &mut TestAppCo
     grow(&window, cx, 40.0);
     next_frame(&window, cx);
     next_frame(&window, cx);
-    let (behind, velocity) = spring_at(WHEEL_SPRING, 40.0, 0.0, 0.0, 2);
+    let (start, pull) = held(40.0);
+    let (behind, velocity) = spring_at(WHEEL_SPRING, start, pull, 0.0, 2);
 
     grow(&window, cx, 30.0);
+    let (more, more_pull) = held(30.0);
     assert!(
-        (lag(&window, cx) - (behind + 30.0)).abs() <= tolerance,
-        "the growth adds to the lag at once"
+        (lag(&window, cx) - (behind + more)).abs() <= tolerance,
+        "the growth adds its held share to the lag at once"
     );
     next_frame(&window, cx);
-    let (expected, _) = spring_at(WHEEL_SPRING, behind + 30.0, velocity, 0.0, 1);
+    let (expected, _) = spring_at(WHEEL_SPRING, behind + more, velocity + more_pull, 0.0, 1);
     let lag = lag(&window, cx);
     assert!(
         (lag - expected).abs() <= tolerance,
@@ -282,7 +306,8 @@ fn splices_that_keep_the_shown_row_continue_the_motion(cx: &mut TestAppContext) 
     grow(&window, cx, 40.0);
     next_frame(&window, cx);
     next_frame(&window, cx);
-    let (behind, velocity) = spring_at(WHEEL_SPRING, 40.0, 0.0, 0.0, 2);
+    let (start, pull) = held(40.0);
+    let (behind, velocity) = spring_at(WHEEL_SPRING, start, pull, 0.0, 2);
 
     // Rows loaded above the view, and the shown row replaced in place by a
     // row of its height, as a streamed reply by its committed entry.
@@ -308,8 +333,8 @@ fn removing_the_shown_row_ends_the_motion_at_the_end(cx: &mut TestAppContext) {
     let tolerance = tolerance(&window, cx);
     // The lag outruns a row, so a shown index that kept naming the row after
     // the removed one would measure the end still behind and keep easing.
+    // The frame that draws the growth is mid-motion.
     grow(&window, cx, 3.0 * ROW);
-    next_frame(&window, cx);
     assert!(
         lag(&window, cx) > ROW,
         "mid-motion, {} behind",
@@ -503,8 +528,8 @@ fn growth_taller_than_the_viewport_eases_from_laid_out_rows(cx: &mut TestAppCont
     let first = lag(&window, cx);
     let top = painted_bounds(&window, cx, LAST).unwrap().top().0;
     assert!(
-        first >= VIEWPORT && top <= tolerance,
-        "the view starts within the new row: {first} behind, its top at {top}"
+        first > tolerance && top <= tolerance,
+        "the view starts within the new row, short of its end: {first} behind, its top at {top}"
     );
     let frames = run_to_rest(&window, cx);
     let mut lags = vec![first];
@@ -525,13 +550,17 @@ fn content_that_shrinks_mid_motion_never_draws_the_list_past_its_end(cx: &mut Te
     let tolerance = tolerance(&window, cx);
     grow(&window, cx, 4.0 * ROW);
     next_frame(&window, cx);
-    next_frame(&window, cx);
     let behind = lag(&window, cx);
-    assert!(behind > ROW, "mid-motion, {behind} behind");
+    assert!(behind > 10.0, "mid-motion, {behind} behind");
     // The end moves up to just below the viewport while the list moves
     // toward it fast enough that the spring alone would carry it past.
     grow(&window, cx, 2.0 - behind);
     let mut lags = vec![lag(&window, cx)];
+    assert!(
+        lags[0] <= 2.0 + tolerance,
+        "the frame that draws the shrink shows it whole, {} behind",
+        lags[0]
+    );
     // The draw the change caused asked for a frame beside the pending one.
     next_frame(&window, cx);
     lags.push(lag(&window, cx));

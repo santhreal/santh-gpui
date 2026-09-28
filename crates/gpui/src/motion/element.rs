@@ -73,6 +73,24 @@ impl ElementSpring {
     /// target, as when the frame the value is measured in moves by `-delta`.
     /// Under reduced motion, lands on the target.
     pub(crate) fn displace(&mut self, delta: f32, policy: MotionPolicy, now: FrameInstant) {
+        self.push(delta, 0.0, policy, now);
+    }
+
+    /// Moves the value by `delta` at `now` as [`Self::displace`] does, and
+    /// adds the velocity at which a critically damped spring carries `delta`
+    /// back along `delta * e^(-w0 t)`, so the value is already moving at the
+    /// next sample. A model other than a spring adds no velocity.
+    pub(crate) fn displace_moving(&mut self, delta: f32, policy: MotionPolicy, now: FrameInstant) {
+        let pull = match self.model {
+            MotionModel::Spring(config) => -delta * (config.stiffness / config.mass).sqrt(),
+            _ => 0.0,
+        };
+        self.push(delta, pull, policy, now);
+    }
+
+    /// Moves the value by `delta` and its velocity by `velocity` at `now`,
+    /// keeping the target. Under reduced motion, lands on the target.
+    fn push(&mut self, delta: f32, velocity: f32, policy: MotionPolicy, now: FrameInstant) {
         let target = self.animator.target();
         if policy.reduced() {
             self.animator.snap(target);
@@ -81,7 +99,7 @@ impl ElementSpring {
         let sample = self.animator.sample(now);
         self.animator.start(
             sample.value + delta,
-            sample.velocity,
+            sample.velocity + velocity,
             target,
             self.model,
             policy,
