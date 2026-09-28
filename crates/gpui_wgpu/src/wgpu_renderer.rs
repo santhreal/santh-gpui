@@ -6,6 +6,7 @@ mod layers;
 mod path_mask_tests;
 mod pipeline_cache;
 mod pipelines;
+mod trial;
 
 #[cfg(not(target_family = "wasm"))]
 use crate::wgpu_context::create_surface;
@@ -29,6 +30,7 @@ use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::Arc;
+use trial::Trial;
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -343,6 +345,8 @@ pub struct WgpuRenderer {
     configuring: Configuring,
     /// Called on the configure worker when a first configure returns.
     configured_notify: Option<Notify>,
+    /// Whether the surface's first configure keeps the context.
+    trial: Trial,
     needs_redraw: bool,
 }
 
@@ -755,6 +759,12 @@ impl WgpuRenderer {
             }
             WgpuRenderTarget::Offscreen { .. } => Configuring::done(),
         };
+        // A window's renderer shares its context with the display's other
+        // windows through `gpu_context`.
+        let trial = Trial::new(
+            gpu_context.is_some() && matches!(target, WgpuRenderTarget::Surface(_)),
+            context.surface_tested(),
+        );
 
         let resources = WgpuResources {
             device,
@@ -810,6 +820,7 @@ impl WgpuRenderer {
             surface_configured: true,
             configuring,
             configured_notify: None,
+            trial,
             needs_redraw: false,
             last_frame_extent: FrameExtent::Whole,
         })
@@ -2436,15 +2447,61 @@ impl WgpuRenderer {
         self.device_lost.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Whether `recover` must run before the next `draw`: the device was
+    /// lost, or the surface's first configure failed on a context that has
+    /// configured no window surface. Reads the first configure's result
+    /// once the configure has returned.
+    pub fn needs_recovery(&mut self) -> bool {
+        if self.trial == Trial::Pending && self.configuring.is_done() {
+            self.settle_trial();
+        }
+        self.device_lost() || self.trial == Trial::Rejected
+    }
+
+    /// Settles the trial of the renderer's context by the surface's first
+    /// configure, which has returned. A configure that succeeded on the
+    /// display's context records that the context configured a surface;
+    /// one that failed on a context that has configured none rejects the
+    /// context, and its error goes with it instead of failing a frame.
+    fn settle_trial(&mut self) {
+        let failed = self.last_error.lock().is_some();
+        let surface_tested = {
+            let shared = self.context.as_ref().map(GpuContext::borrow);
+            let own = shared
+                .as_deref()
+                .and_then(Option::as_ref)
+                .filter(|context| {
+                    self.resources
+                        .as_ref()
+                        .is_some_and(|resources| Arc::ptr_eq(&resources.device, &context.device))
+                });
+            if let Some(context) = own
+                && !failed
+            {
+                context.pass_surface_test();
+            }
+            own.is_some_and(WgpuContext::surface_tested)
+        };
+        self.trial = self.trial.settle(failed, surface_tested);
+        if self.trial == Trial::Rejected {
+            let error = self.last_error.lock().take().unwrap_or_default();
+            log::info!(
+                "The GPU context selected without a surface cannot configure this window's \
+                 surface ({error}); creating one selected by configuring the surface"
+            );
+        }
+    }
+
     /// Returns true if a redraw is needed because GPU state was cleared.
     /// Calling this method clears the flag.
     pub fn needs_redraw(&mut self) -> bool {
         std::mem::take(&mut self.needs_redraw)
     }
 
-    /// Recovers from a lost GPU device by recreating the renderer with a new context.
+    /// Recreates the renderer on a new context: after its device was lost,
+    /// or after its surface's first configure rejected its context.
     ///
-    /// Call this after detecting `device_lost()` returns true.
+    /// Call this after `needs_recovery()` returns true.
     ///
     /// This method coordinates recovery across multiple windows:
     /// - The first window to call this will recreate the shared context
@@ -2456,31 +2513,40 @@ impl WgpuRenderer {
     {
         self.configuring.finish();
         let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
+        let lost = self.device_lost();
+        let rejected = self.trial == Trial::Rejected;
 
-        // Check if another window already recovered the context
-        let needs_new_context = gpu_context
-            .borrow()
-            .as_ref()
-            .is_none_or(|ctx| ctx.device_lost());
+        // Another window may have recovered the context already. A rejected
+        // context is replaced only while it is still the display's.
+        let needs_new_context = gpu_context.borrow().as_ref().is_none_or(|ctx| {
+            ctx.device_lost()
+                || rejected
+                    && self
+                        .resources
+                        .as_ref()
+                        .is_some_and(|resources| Arc::ptr_eq(&resources.device, &ctx.device))
+        });
 
         let surface = if needs_new_context {
-            log::warn!("GPU device lost, recreating context...");
-
             // Drop old resources to release Arc<Device>/Arc<Queue> and GPU resources
             self.resources = None;
             *gpu_context.borrow_mut() = None;
 
-            // Wait briefly for the GPU driver to stabilize, then try to
-            // recreate the context without software renderers. If this fails
-            // the caller should request another frame and retry — the real GPU
-            // may need more time to come back (e.g. after suspend/resume).
-            std::thread::sleep(std::time::Duration::from_millis(350));
+            if lost {
+                log::warn!("GPU device lost, recreating context...");
+                // Wait briefly for the GPU driver to stabilize, then try to
+                // recreate the context without software renderers. If this
+                // fails the caller should request another frame and retry —
+                // the real GPU may need more time to come back (e.g. after
+                // suspend/resume).
+                std::thread::sleep(std::time::Duration::from_millis(350));
+            }
 
             let (new_context, surface) = WgpuContext::for_window(
                 gpu_context.instances(window),
                 window,
                 self.compositor_gpu,
-                true,
+                lost,
             )?;
             *gpu_context.borrow_mut() = Some(new_context);
             surface

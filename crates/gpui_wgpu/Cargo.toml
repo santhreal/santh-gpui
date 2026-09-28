@@ -49,6 +49,9 @@ naga = { version = "29.0.4", features = ["wgsl-in"] }
 [target.'cfg(all(target_os = "linux", target_env = "gnu"))'.dev-dependencies]
 libc.workspace = true
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+x11rb = { version = "0.13.1", features = ["allow-unsafe-code"] }
+
 [[bench]]
 name = "layout_line"
 harness = false

@@ -31,7 +31,8 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo test -p gpui --lib
       - run: cargo test -p motion
-      - run: cargo test -p gpui_wgpu --lib
+      # The ignored tests open windows on the X server GPUI_X11_TEST_DISPLAY names.
+      - run: xvfb-run -a sh -c 'GPUI_X11_TEST_DISPLAY=$DISPLAY cargo test -p gpui_wgpu --lib -- --include-ignored'
       - run: xvfb-run -a cargo test -p gpui_linux --lib
 
   macos:

@@ -220,6 +220,9 @@ impl WgpuContext {
             dual_source_blending: selected.dual_source_blending,
             color_texture_format: selected.color_texture_format,
             device_lost,
+            // The adapter of a source with a surface is selected by
+            // configuring the surface.
+            surface_tested: AtomicBool::new(sources[selected.source].1.is_some()),
             pipeline_cache: Arc::default(),
         };
         Ok((context, selected.source))

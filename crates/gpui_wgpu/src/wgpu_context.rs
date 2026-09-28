@@ -29,6 +29,10 @@ pub struct WgpuContext {
     dual_source_blending: bool,
     color_texture_format: wgpu::TextureFormat,
     device_lost: Arc<AtomicBool>,
+    /// The device has configured a window surface of the display: its
+    /// adapter was selected by configuring one, or a renderer's first
+    /// configure on it succeeded.
+    surface_tested: AtomicBool,
     /// The shader modules, bind group layouts, and render pipelines of the
     /// renderers on `device`, dropped with the context.
     pub(crate) pipeline_cache: Arc<PipelineCache>,
@@ -246,6 +250,7 @@ impl WgpuContext {
             dual_source_blending,
             color_texture_format,
             device_lost,
+            surface_tested: AtomicBool::new(false),
             pipeline_cache: Arc::default(),
         };
         Ok(PreparedWebGraphics { context, surface })
@@ -425,6 +430,18 @@ impl WgpuContext {
     /// Returns a clone of the device_lost flag for sharing with renderers.
     pub(crate) fn device_lost_flag(&self) -> Arc<AtomicBool> {
         Arc::clone(&self.device_lost)
+    }
+
+    /// Whether the device has configured a window surface of the display.
+    /// A context whose adapter was selected without a surface has not,
+    /// until a renderer's first configure on it succeeds.
+    pub fn surface_tested(&self) -> bool {
+        self.surface_tested.load(Ordering::Relaxed)
+    }
+
+    /// Records that the device configured a window surface of the display.
+    pub(crate) fn pass_surface_test(&self) {
+        self.surface_tested.store(true, Ordering::Relaxed);
     }
 }
 

@@ -2794,6 +2794,7 @@ dependencies = [
  "unicode-segmentation",
  "web-sys",
  "wgpu",
+ "x11rb",
  "zed-font-kit",
 ]
 

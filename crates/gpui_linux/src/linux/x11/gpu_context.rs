@@ -13,11 +13,14 @@
 //!
 //! The thread creates the instances the client's contexts are created
 //! from, and selects the adapter without a surface. The first window
-//! keeps that context only if the renderer of its surface is created on it
-//! with no error, the surface configuration included; otherwise the window
-//! creates a context whose adapter is tested against its surface, on the
-//! same instances. On a host with more than one GPU, an adapter can report
-//! a surface as compatible and fail to configure it.
+//! keeps that context if the renderer of its surface is created on it with
+//! no error; otherwise the window creates a context whose adapter is tested
+//! against its surface, on the same instances. On a host with more than
+//! one GPU, an adapter can report a surface as compatible and fail to
+//! configure it. The window does not wait for its surface's configure,
+//! which runs on a worker: a configure that fails on a context that has
+//! configured no surface rejects the context, and the window's next draw
+//! replaces it (`WgpuRenderer::needs_recovery`).
 
 use std::{ffi::c_void, fmt::Debug, ptr::NonNull, rc::Rc, sync::Arc, thread::JoinHandle};
 
@@ -190,7 +193,9 @@ impl WindowGpu {
 
 /// Creates the renderer on `prewarmed`, which becomes the client's context.
 /// Fails, and leaves the client without a context, if creating the
-/// renderer or configuring the surface reports an error.
+/// renderer reports an error. The surface's configure, which runs on a
+/// worker outside this thread's error scope, is not waited for: its
+/// failure rejects `prewarmed` as the window next draws.
 fn renderer_on<W>(
     context: &GpuContext,
     prewarmed: WgpuContext,
@@ -209,15 +214,7 @@ where
         transparent: config.transparent,
         preferred_present_mode: config.preferred_present_mode,
     };
-    // The configure runs on a worker, outside this thread's error scope, and
-    // reports to the renderer instead: wait for it so its error rejects
-    // `prewarmed` too.
-    let renderer = WgpuRenderer::new(context.clone(), window, config, compositor_gpu).and_then(
-        |mut renderer| {
-            renderer.finish_configure()?;
-            Ok(renderer)
-        },
-    );
+    let renderer = WgpuRenderer::new(context.clone(), window, config, compositor_gpu);
     let result = adopted(renderer, gpui::block_on(scope.pop()));
     if result.is_err() {
         *context.borrow_mut() = None;

@@ -1828,7 +1828,7 @@ impl PlatformWindow for X11Window {
     fn draw(&self, scene: &Scene) {
         let mut inner = self.0.state.borrow_mut();
 
-        if inner.renderer.device_lost() {
+        if inner.renderer.needs_recovery() {
             let raw_window = RawWindow {
                 connection: as_raw_xcb_connection::AsRawXcbConnection::as_raw_xcb_connection(
                     &*self.0.xcb,

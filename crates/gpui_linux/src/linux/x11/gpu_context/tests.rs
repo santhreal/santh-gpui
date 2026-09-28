@@ -5,12 +5,12 @@
 //! or the client ends before its first window, and the connection closes
 //! while the thread creates the instance on it), and a first window that
 //! keeps the unchecked context although creating its renderer reported an
-//! error (on a host with more than one GPU, an adapter can report a
-//! surface as compatible and fail to configure it). Not covered: the order
-//! of the X connection's setup and the driver's load, which iris's
-//! tests/startup.rs checks against a fresh Xvfb; the adapter selection;
-//! and the error scope around the renderer's creation, which needs a GPU
-//! device.
+//! error. Not covered: the order of the X connection's setup and the
+//! driver's load, which iris's tests/startup.rs checks against a fresh
+//! Xvfb; the adapter selection; the error scope around the renderer's
+//! creation, which needs a GPU device; and the surface's configure, which
+//! the window does not wait for and whose failure the renderer's trial
+//! (gpui_wgpu `wgpu_renderer/trial`) turns into a new context.
 
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},
@@ -61,8 +61,8 @@ fn a_joined_pending_result_is_the_value_of_its_thread_and_continues_its_panic() 
 
 fn validation_error() -> wgpu::Error {
     wgpu::Error::Validation {
-        source: "surface configuration failed".into(),
-        description: "the adapter cannot present to this surface".into(),
+        source: "render pipeline creation failed".into(),
+        description: "the adapter does not support the pipeline's format".into(),
     }
 }
 
@@ -70,8 +70,8 @@ fn validation_error() -> wgpu::Error {
 fn a_window_adopts_the_threads_context_only_if_its_renderer_reported_no_error() {
     assert_eq!(adopted(Ok(1), None).unwrap(), 1);
     // Every other outcome rebuilds the context against the surface: a
-    // configuration the renderer did not see fail, and a failed creation
-    // whether or not it also reported a validation error.
+    // validation error the renderer's creation did not return, and a
+    // failed creation whether or not it also reported a validation error.
     let reported = validation_error().to_string();
     for (renderer, validation, expected) in [
         (Ok(1), Some(validation_error()), reported.as_str()),
