@@ -8,7 +8,9 @@
 //! eases", "a list that did not opt in changes behavior", "a growth taller
 //! than the viewport draws past the laid-out items", "pausing mid-motion
 //! keeps requesting frames", "a reduced-motion layout reports a scroll top
-//! above the one it shows", and "a resting list keeps requesting frames".
+//! above the one it shows", "a resting list keeps requesting frames", "a
+//! spring carried past the end draws the list past its end", and "rows
+//! arriving in an empty list ease from where nothing was shown".
 //! The lag is read from where the last item was painted and compared with
 //! the closed-form spring at each frame instant. Not caught: growth of an
 //! item above the viewport of a following list, which the list does not
@@ -76,10 +78,20 @@ fn feed_aligned(
     smooth: bool,
     alignment: ListAlignment,
 ) -> WindowHandle<Feed> {
-    let state = ListState::new(ROWS, alignment, px(0.0));
+    feed_rows(cx, smooth, alignment, ROWS)
+}
+
+/// [`feed_aligned`] with `rows` rows.
+fn feed_rows(
+    cx: &mut TestAppContext,
+    smooth: bool,
+    alignment: ListAlignment,
+    rows: usize,
+) -> WindowHandle<Feed> {
+    let state = ListState::new(rows, alignment, px(0.0));
     state.set_follow_mode(FollowMode::Tail);
     state.set_smooth_follow(smooth);
-    let heights = Rc::new(RefCell::new(vec![ROW; ROWS]));
+    let heights = Rc::new(RefCell::new(vec![ROW; rows]));
     let window = cx.open_window(size(px(VIEWPORT), px(400.0)), move |_, _| Feed {
         state,
         heights,
@@ -504,5 +516,43 @@ fn growth_taller_than_the_viewport_eases_from_laid_out_rows(cx: &mut TestAppCont
         );
     }
     assert!(lags.last().unwrap().abs() <= tolerance);
+    assert_eq!(idle_requests(&window, cx), 0);
+}
+
+#[gpui::test]
+fn content_that_shrinks_mid_motion_never_draws_the_list_past_its_end(cx: &mut TestAppContext) {
+    let window = feed(cx, true);
+    let tolerance = tolerance(&window, cx);
+    grow(&window, cx, 4.0 * ROW);
+    next_frame(&window, cx);
+    next_frame(&window, cx);
+    let behind = lag(&window, cx);
+    assert!(behind > ROW, "mid-motion, {behind} behind");
+    // The end moves up to just below the viewport while the list moves
+    // toward it fast enough that the spring alone would carry it past.
+    grow(&window, cx, 2.0 - behind);
+    let mut lags = vec![lag(&window, cx)];
+    // The draw the change caused asked for a frame beside the pending one.
+    next_frame(&window, cx);
+    lags.push(lag(&window, cx));
+    lags.extend(run_to_rest(&window, cx).iter().map(|(lag, _)| *lag));
+    assert!(
+        lags.iter().all(|lag| *lag >= -tolerance),
+        "the list is never drawn past its end: {lags:?}"
+    );
+    assert!(lags.last().unwrap().abs() <= tolerance);
+    assert_eq!(idle_requests(&window, cx), 0);
+}
+
+#[gpui::test]
+fn rows_arriving_in_an_empty_list_show_their_end_at_once(cx: &mut TestAppContext) {
+    let window = feed_rows(cx, true, ListAlignment::Bottom, 0);
+    let tolerance = tolerance(&window, cx);
+    splice(&window, cx, 0..0, &[ROW; ROWS]);
+    let behind = lag(&window, cx);
+    assert!(
+        behind.abs() <= tolerance,
+        "the list shows its end, {behind} behind"
+    );
     assert_eq!(idle_requests(&window, cx), 0);
 }
