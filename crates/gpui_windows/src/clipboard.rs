@@ -334,15 +334,31 @@ fn gpui_to_image_format(value: ImageFormat) -> Option<image::ImageFormat> {
     }
 }
 
+/// How many times an open of the clipboard is tried, and the wait between
+/// tries. Another window holds the clipboard open while it reads it, as a
+/// clipboard listener (clipboard history, a remote desktop's clipboard
+/// sync) does right after every change, and an open in that span fails
+/// with `ERROR_ACCESS_DENIED`. The wait bounds the stall on the UI thread
+/// to `(OPEN_ATTEMPTS - 1) * OPEN_RETRY`.
+const OPEN_ATTEMPTS: u32 = 5;
+const OPEN_RETRY: std::time::Duration = std::time::Duration::from_millis(5);
+
 struct ClipboardGuard;
 
 impl ClipboardGuard {
     fn open() -> Option<Self> {
-        match unsafe { OpenClipboard(None) } {
-            Ok(()) => Some(Self),
-            Err(e) => {
-                log::error!("Failed to open clipboard: {e}");
-                None
+        let mut attempt = 1;
+        loop {
+            match unsafe { OpenClipboard(None) } {
+                Ok(()) => return Some(Self),
+                Err(_) if attempt < OPEN_ATTEMPTS => {
+                    attempt += 1;
+                    std::thread::sleep(OPEN_RETRY);
+                }
+                Err(e) => {
+                    log::error!("Failed to open clipboard in {OPEN_ATTEMPTS} attempts: {e}");
+                    return None;
+                }
             }
         }
     }
@@ -386,3 +402,6 @@ impl Drop for LockedGlobal {
         unsafe { GlobalUnlock(self.global).ok() };
     }
 }
+
+#[cfg(test)]
+mod tests;

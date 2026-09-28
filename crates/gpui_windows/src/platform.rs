@@ -1594,9 +1594,6 @@ unsafe extern "system" fn window_procedure(
 mod tests {
     use std::ffi::{OsStr, OsString};
 
-    use crate::{read_from_clipboard, write_to_clipboard};
-    use gpui::ClipboardItem;
-
     use super::encode_restart_arguments;
 
     #[test]
@@ -1613,20 +1610,5 @@ mod tests {
             encode_restart_arguments(&[OsString::from(r"C:\")]),
             OsStr::new(r#""C:\\""#)
         );
-    }
-
-    #[test]
-    fn test_clipboard() {
-        let item = ClipboardItem::new_string("你好，我是张小白".to_string());
-        write_to_clipboard(item.clone());
-        assert_eq!(read_from_clipboard(), Some(item));
-
-        let item = ClipboardItem::new_string("12345".to_string());
-        write_to_clipboard(item.clone());
-        assert_eq!(read_from_clipboard(), Some(item));
-
-        let item = ClipboardItem::new_string_with_json_metadata("abcdef".to_string(), vec![3, 4]);
-        write_to_clipboard(item.clone());
-        assert_eq!(read_from_clipboard(), Some(item));
     }
 }
