@@ -286,6 +286,51 @@ fn under_reduced_motion_a_line_tick_applies_at_once(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
+fn the_target_offset_holds_where_a_motion_lands_for_every_frame_of_it(cx: &mut TestAppContext) {
+    let (handle, window) = scroller(cx, true);
+    let line = line_height(&window, cx);
+    assert_eq!(handle.target_offset(), handle.offset(), "at rest");
+
+    wheel(&window, cx, lines(-3.0));
+    assert_eq!(handle.offset().y, px(0.0));
+    assert_eq!(handle.target_offset().y.0, -3.0 * line, "a tick moves the target at once");
+    next_frame(&window, cx);
+    wheel(&window, cx, lines(-2.0));
+    let target = -5.0 * line;
+    assert!(
+        (handle.target_offset().y.0 - target).abs() <= 1e-3,
+        "a tick mid-motion moves the target on: {:?}, expected {target}",
+        handle.target_offset()
+    );
+    // The tick's frame request queues beside the last frame's, and both
+    // draw in one display frame.
+    assert!(next_frame(&window, cx) <= 2);
+    for (offset, _) in run_to_rest(&window, cx, || handle.offset().y.0) {
+        let lead = handle.target_offset().y.0;
+        assert!(
+            offset >= target - TOLERANCE && (lead - target).abs() <= 1e-3,
+            "at {offset} the target is {lead}, the motion lands on {target}"
+        );
+    }
+    assert_eq!(handle.target_offset(), handle.offset(), "at rest again");
+
+    // A tick past the end moves the target to the end; a write mid-motion
+    // ends the motion, and the target is the written offset.
+    wheel(&window, cx, lines(-100.0));
+    assert_eq!(handle.target_offset().y.0, -MAX);
+    next_frame(&window, cx);
+    handle.set_offset(point(px(0.0), px(-10.0)));
+    assert_eq!(handle.target_offset().y, px(-10.0));
+    next_frame(&window, cx);
+    assert_eq!(handle.offset().y, px(-10.0));
+    assert_eq!(handle.target_offset().y, px(-10.0));
+
+    let (handle, window) = scroller(cx, false);
+    wheel(&window, cx, lines(-3.0));
+    assert_eq!(handle.target_offset(), handle.offset(), "without smooth wheel");
+}
+
+#[gpui::test]
 fn a_line_tick_eases_a_uniform_list(cx: &mut TestAppContext) {
     let handle = UniformListScrollHandle::new();
     handle.set_smooth_wheel(true);

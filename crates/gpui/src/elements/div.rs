@@ -4454,6 +4454,21 @@ impl ScrollHandle {
         self.0.borrow().wheel.is_some()
     }
 
+    /// The offset the element that tracks this handle scrolls to: the target
+    /// of a smooth wheel motion in flight, or the current offset at rest. The
+    /// offset moves toward the target during prepaint, after the views render,
+    /// so a view that renders only the children in view renders those between
+    /// [`Self::offset`] and this offset to keep every frame of the motion
+    /// filled.
+    pub fn target_offset(&self) -> Point<Pixels> {
+        let state = self.0.borrow();
+        let offset = *state.offset.borrow();
+        state
+            .wheel
+            .as_ref()
+            .map_or(offset, |wheel| wheel.target(offset, offset))
+    }
+
     /// Get the logical scroll top, based on a child index and a pixel offset.
     pub fn logical_scroll_top(&self) -> (usize, Pixels) {
         let ix = self.top_item();
