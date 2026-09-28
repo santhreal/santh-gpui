@@ -1,3 +1,4 @@
+mod configure;
 #[cfg(test)]
 mod layer_mask_tests;
 mod layers;
@@ -11,6 +12,7 @@ use crate::wgpu_context::create_surface;
 use crate::{CompositorGpuHint, GpuContext, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
+use configure::{Configuring, Notify};
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EdgeFadeMask, GpuSpecs,
     LayerMask, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, TransformationMatrix,
@@ -18,6 +20,7 @@ use gpui::{
 };
 use layers::{LayerTextures, OpenLayer};
 use log::warn;
+use parking_lot::Mutex;
 pub(crate) use pipeline_cache::PipelineCache;
 use pipeline_cache::{ModuleKey, PipelineKey};
 use pipelines::WgpuPipelines;
@@ -25,7 +28,7 @@ use pipelines::WgpuPipelines;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use std::num::NonZeroU64;
 use std::ops::Range;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
@@ -197,7 +200,8 @@ enum InstanceData {
 
 /// The render target backing a WgpuRenderer (either an on-screen window surface or an offscreen texture).
 enum WgpuRenderTarget {
-    Surface(wgpu::Surface<'static>),
+    /// Shared with the worker that configures the surface first.
+    Surface(Arc<wgpu::Surface<'static>>),
     Offscreen {
         texture: wgpu::Texture,
         view: wgpu::TextureView,
@@ -335,6 +339,10 @@ pub struct WgpuRenderer {
     /// How much of the target the last `draw` repainted.
     last_frame_extent: FrameExtent,
     surface_configured: bool,
+    /// The surface's first configure, which `draw` waits out.
+    configuring: Configuring,
+    /// Called on the configure worker when a first configure returns.
+    configured_notify: Option<Notify>,
     needs_redraw: bool,
 }
 
@@ -395,7 +403,7 @@ impl WgpuRenderer {
         Self::new_internal(
             Some(gpu_context.clone()),
             context,
-            WgpuRenderTarget::Surface(surface),
+            WgpuRenderTarget::Surface(Arc::new(surface)),
             config,
             compositor_gpu,
             atlas,
@@ -426,7 +434,7 @@ impl WgpuRenderer {
         Self::new_internal(
             None,
             context,
-            WgpuRenderTarget::Surface(surface),
+            WgpuRenderTarget::Surface(Arc::new(surface)),
             config,
             None,
             atlas,
@@ -485,27 +493,30 @@ impl WgpuRenderer {
         compositor_gpu: Option<CompositorGpuHint>,
         atlas: Arc<WgpuAtlas>,
     ) -> anyhow::Result<Self> {
-        let (surface_format, transparent_alpha_mode, opaque_alpha_mode) = match &target {
-            WgpuRenderTarget::Surface(surface) => {
-                let surface_caps = surface.get_capabilities(&context.adapter);
-                let preferred_formats = [
-                    wgpu::TextureFormat::Bgra8Unorm,
-                    wgpu::TextureFormat::Rgba8Unorm,
-                ];
-                let surface_format = preferred_formats
-                    .iter()
-                    .find(|f| surface_caps.formats.contains(f))
-                    .copied()
-                    .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
-                    .or_else(|| surface_caps.formats.first().copied())
-                    .ok_or_else(|| {
-                        anyhow::anyhow!(
-                            "Surface reports no supported texture formats for adapter {:?}",
-                            context.adapter.get_info().name
-                        )
-                    })?;
+        // One capability query per surface: each is a round trip to the
+        // window system.
+        let (surface_format, transparent_alpha_mode, opaque_alpha_mode, surface_caps) =
+            match &target {
+                WgpuRenderTarget::Surface(surface) => {
+                    let surface_caps = surface.get_capabilities(&context.adapter);
+                    let preferred_formats = [
+                        wgpu::TextureFormat::Bgra8Unorm,
+                        wgpu::TextureFormat::Rgba8Unorm,
+                    ];
+                    let surface_format = preferred_formats
+                        .iter()
+                        .find(|f| surface_caps.formats.contains(f))
+                        .copied()
+                        .or_else(|| surface_caps.formats.iter().find(|f| !f.is_srgb()).copied())
+                        .or_else(|| surface_caps.formats.first().copied())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Surface reports no supported texture formats for adapter {:?}",
+                                context.adapter.get_info().name
+                            )
+                        })?;
 
-                let pick_alpha_mode =
+                    let pick_alpha_mode =
                     |preferences: &[wgpu::CompositeAlphaMode]| -> anyhow::Result<wgpu::CompositeAlphaMode> {
                         preferences
                             .iter()
@@ -520,29 +531,35 @@ impl WgpuRenderer {
                             })
                     };
 
-                let transparent_alpha_mode = pick_alpha_mode(&[
-                    wgpu::CompositeAlphaMode::PreMultiplied,
-                    wgpu::CompositeAlphaMode::Inherit,
-                ])?;
+                    let transparent_alpha_mode = pick_alpha_mode(&[
+                        wgpu::CompositeAlphaMode::PreMultiplied,
+                        wgpu::CompositeAlphaMode::Inherit,
+                    ])?;
 
-                let opaque_alpha_mode = pick_alpha_mode(&[
-                    wgpu::CompositeAlphaMode::Opaque,
-                    wgpu::CompositeAlphaMode::Inherit,
-                ])?;
-                (surface_format, transparent_alpha_mode, opaque_alpha_mode)
-            }
-            WgpuRenderTarget::Offscreen { format, .. } => {
-                // Note: For offscreen rendering on this platform, we explicitly use the color texture format
-                // selected by the WgpuContext (typically Bgra8Unorm on native platforms), matching the windowed path.
-                // A format change here changes the readback byte order.
-                // For offscreen rendering without a compositor, we use Auto/PostMultiplied for straight alpha.
-                (
-                    *format,
-                    wgpu::CompositeAlphaMode::Auto,
-                    wgpu::CompositeAlphaMode::Opaque,
-                )
-            }
-        };
+                    let opaque_alpha_mode = pick_alpha_mode(&[
+                        wgpu::CompositeAlphaMode::Opaque,
+                        wgpu::CompositeAlphaMode::Inherit,
+                    ])?;
+                    (
+                        surface_format,
+                        transparent_alpha_mode,
+                        opaque_alpha_mode,
+                        Some(surface_caps),
+                    )
+                }
+                WgpuRenderTarget::Offscreen { format, .. } => {
+                    // Note: For offscreen rendering on this platform, we explicitly use the color texture format
+                    // selected by the WgpuContext (typically Bgra8Unorm on native platforms), matching the windowed path.
+                    // A format change here changes the readback byte order.
+                    // For offscreen rendering without a compositor, we use Auto/PostMultiplied for straight alpha.
+                    (
+                        *format,
+                        wgpu::CompositeAlphaMode::Auto,
+                        wgpu::CompositeAlphaMode::Opaque,
+                        None,
+                    )
+                }
+            };
 
         let alpha_mode = if config.transparent {
             transparent_alpha_mode
@@ -569,15 +586,14 @@ impl WgpuRenderer {
         // Prefer texture copies for presentation when supported; otherwise
         // a fullscreen pass presents the retained frame.
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: match &target {
-                WgpuRenderTarget::Surface(surface) => {
-                    let surface_caps = surface.get_capabilities(&context.adapter);
+            usage: match &surface_caps {
+                Some(surface_caps) => {
                     let copyable = surface_caps.usages.intersection(
                         wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
                     );
                     wgpu::TextureUsages::RENDER_ATTACHMENT | copyable
                 }
-                WgpuRenderTarget::Offscreen { .. } => {
+                None => {
                     wgpu::TextureUsages::RENDER_ATTACHMENT
                         | wgpu::TextureUsages::COPY_SRC
                         | wgpu::TextureUsages::COPY_DST
@@ -586,23 +602,17 @@ impl WgpuRenderer {
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
-            present_mode: match &target {
-                WgpuRenderTarget::Surface(surface) => {
-                    let surface_caps = surface.get_capabilities(&context.adapter);
-                    config
-                        .preferred_present_mode
-                        .filter(|mode| surface_caps.present_modes.contains(mode))
-                        .unwrap_or(wgpu::PresentMode::Fifo)
-                }
-                WgpuRenderTarget::Offscreen { .. } => wgpu::PresentMode::Fifo,
+            present_mode: match &surface_caps {
+                Some(surface_caps) => config
+                    .preferred_present_mode
+                    .filter(|mode| surface_caps.present_modes.contains(mode))
+                    .unwrap_or(wgpu::PresentMode::Fifo),
+                None => wgpu::PresentMode::Fifo,
             },
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
         };
-        if let WgpuRenderTarget::Surface(surface) = &target {
-            surface.configure(&context.device, &surface_config);
-        }
         let queue = Arc::clone(&context.queue);
         let rendering_params = RenderingParameters::new(&context.adapter, surface_format);
         let uses_webgl_instance_data = context.uses_webgl_instance_data();
@@ -735,9 +745,16 @@ impl WgpuRenderer {
         let last_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let last_error_clone = Arc::clone(&last_error);
         device.on_uncaptured_error(Arc::new(move |error| {
-            let mut guard = last_error_clone.lock().unwrap();
-            *guard = Some(error.to_string());
+            *last_error_clone.lock() = Some(error.to_string());
         }));
+        // After the error handler: a configure error is a frame error, not a
+        // panic on the worker.
+        let configuring = match &target {
+            WgpuRenderTarget::Surface(surface) => {
+                Configuring::start(surface, &device, &surface_config)
+            }
+            WgpuRenderTarget::Offscreen { .. } => Configuring::done(),
+        };
 
         let resources = WgpuResources {
             device,
@@ -791,6 +808,8 @@ impl WgpuRenderer {
             failed_frame_count: 0,
             device_lost: context.device_lost_flag(),
             surface_configured: true,
+            configuring,
+            configured_notify: None,
             needs_redraw: false,
             last_frame_extent: FrameExtent::Whole,
         })
@@ -1024,6 +1043,7 @@ impl WgpuRenderer {
         let height = size.height.0 as u32;
 
         if width != self.surface_config.width || height != self.surface_config.height {
+            self.configuring.finish();
             let clamped_width = width.min(self.max_texture_size);
             let clamped_height = height.min(self.max_texture_size);
 
@@ -1198,6 +1218,7 @@ impl WgpuRenderer {
         };
 
         if new_alpha_mode != self.surface_config.alpha_mode {
+            self.configuring.finish();
             self.surface_config.alpha_mode = new_alpha_mode;
             let surface_config = self.surface_config.clone();
             let path_sample_count = self.rendering_params.path_sample_count;
@@ -1260,8 +1281,14 @@ impl WgpuRenderer {
         if !self.surface_configured {
             return false;
         }
+        // The first configure is still running on its worker. The frame is
+        // not presented; the platform presents the same scene again once
+        // the configure returns.
+        if !self.configuring.is_done() {
+            return false;
+        }
 
-        let last_error = self.last_error.lock().unwrap().take();
+        let last_error = self.last_error.lock().take();
         if let Some(error) = last_error {
             self.failed_frame_count += 1;
             log::error!(
@@ -1322,8 +1349,7 @@ impl WgpuRenderer {
                     return false;
                 }
                 wgpu::CurrentSurfaceTexture::Validation => {
-                    *self.last_error.lock().unwrap() =
-                        Some("Surface texture validation error".to_string());
+                    *self.last_error.lock() = Some("Surface texture validation error".to_string());
                     return false;
                 }
             },
@@ -2313,6 +2339,7 @@ impl WgpuRenderer {
     /// (e.g. Android `TerminateWindow`) but you intend to re-create the
     /// surface later without losing cached atlas textures.
     pub fn unconfigure_surface(&mut self) {
+        self.configuring.finish();
         self.surface_configured = false;
         // Drop intermediate textures since they reference the old surface size.
         if let Some(res) = self.resources.as_mut() {
@@ -2335,6 +2362,7 @@ impl WgpuRenderer {
         config: WgpuSurfaceConfig,
         instance: &wgpu::Instance,
     ) -> anyhow::Result<()> {
+        self.configuring.finish();
         let surface = create_surface(instance, window)?;
 
         let width = (config.size.width.0 as u32).max(1);
@@ -2359,7 +2387,7 @@ impl WgpuRenderer {
                 .as_mut()
                 .expect("GPU resources not available");
             surface.configure(&res.device, &self.surface_config);
-            res.target = WgpuRenderTarget::Surface(surface);
+            res.target = WgpuRenderTarget::Surface(Arc::new(surface));
 
             // Invalidate intermediate textures — they'll be recreated lazily.
             res.invalidate_intermediate_textures();
@@ -2372,8 +2400,35 @@ impl WgpuRenderer {
 
     pub fn destroy(&mut self) {
         // Release surface-bound GPU resources eagerly so the underlying native
-        // window can be destroyed before the renderer itself is dropped.
+        // window can be destroyed before the renderer itself is dropped. No
+        // swapchain is created for it after this returns.
+        self.configuring.finish();
         self.resources.take();
+    }
+
+    /// Waits for the surface's first configure, which runs on a worker, and
+    /// reports the error the device raised while it ran. The error stays for
+    /// the next `draw` to count as a failed frame.
+    pub fn finish_configure(&mut self) -> anyhow::Result<()> {
+        self.configuring.finish();
+        match self.last_error.lock().as_deref() {
+            Some(error) => Err(anyhow::anyhow!("configuring the surface failed: {error}")),
+            None => Ok(()),
+        }
+    }
+
+    /// Whether the surface's first configure is still running on its worker.
+    /// A `draw` until then presents nothing.
+    pub fn is_configuring(&mut self) -> bool {
+        !self.configuring.is_done()
+    }
+
+    /// Calls `notify` on the configure worker each time a first configure of
+    /// the surface returns: the one running now, and the one `recover`
+    /// starts. A configure that has already returned calls nothing.
+    pub fn notify_configured(&mut self, notify: Arc<dyn Fn() + Send + Sync>) {
+        self.configuring.when_done(Arc::clone(&notify));
+        self.configured_notify = Some(notify);
     }
 
     /// Returns true if the GPU device was lost and recovery is needed.
@@ -2399,6 +2454,7 @@ impl WgpuRenderer {
     where
         W: HasWindowHandle + HasDisplayHandle + std::fmt::Debug + Send + Sync + Clone + 'static,
     {
+        self.configuring.finish();
         let gpu_context = self.context.as_ref().expect("recover requires gpu_context");
 
         // Check if another window already recovered the context
@@ -2449,14 +2505,19 @@ impl WgpuRenderer {
         self.resources = None;
         self.atlas.handle_device_lost(context);
 
-        *self = Self::new_internal(
+        let recovered = Self::new_internal(
             Some(gpu_context.clone()),
             context,
-            WgpuRenderTarget::Surface(surface),
+            WgpuRenderTarget::Surface(Arc::new(surface)),
             config,
             self.compositor_gpu,
             self.atlas.clone(),
         )?;
+        let configured_notify = self.configured_notify.take();
+        *self = recovered;
+        if let Some(notify) = configured_notify {
+            self.notify_configured(notify);
+        }
 
         log::info!("GPU recovery complete");
         Ok(())
@@ -3067,7 +3128,7 @@ mod tests {
                     })
                     .expect("bounded GPU completion");
                 assert_eq!(
-                    renderer.last_error.lock().expect("GPU error lock").take(),
+                    renderer.last_error.lock().take(),
                     None,
                     "{usage:?}, step {step}",
                 );

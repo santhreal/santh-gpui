@@ -38,7 +38,10 @@ use super::{
 
 mod placement;
 pub(crate) use placement::xi_root_position;
-use placement::{ConfigureChange, configure_change, creation_background_pixel, normal_hints};
+use placement::{
+    ConfigureChange, configure_change, creation_background_pixel, map_waits_for_configure,
+    normal_hints,
+};
 
 x11rb::atom_manager! {
     pub XcbAtoms: AtomsCookie {
@@ -286,10 +289,17 @@ pub struct X11WindowState {
     active: bool,
     hovered: bool,
     pub(crate) force_render_after_recovery: bool,
+    /// A frame was drawn while the surface's first configure ran and not
+    /// presented: the configure's ping, or the next frame if it runs first,
+    /// presents it.
+    pub(crate) present_when_configured: bool,
     fullscreen: bool,
     /// Whether a compositing manager ran when the window opened. A window
     /// that draws its own frame needs one to blend its transparent corners.
     compositor_present: bool,
+    /// Whether the map waits for the surface's first configure; see
+    /// `map_waits_for_configure`.
+    map_waits_for_configure: bool,
     decorations: WindowDecorations,
     edge_constraints: Option<EdgeConstraints>,
     pub handle: AnyWindowHandle,
@@ -521,13 +531,13 @@ impl X11WindowState {
                     | xproto::EventMask::PROPERTY_CHANGE
                     | xproto::EventMask::VISIBILITY_CHANGE,
             );
-        if let Some(pixel) = creation_background_pixel(
-            transparent,
-            compositor_present,
-            visual_set.transparent.is_some(),
-        ) {
+        let argb_visual = visual_set.transparent.is_some();
+        if let Some(pixel) = creation_background_pixel(transparent, compositor_present, argb_visual)
+        {
             win_aux = win_aux.background_pixel(pixel);
         }
+        let map_waits_for_configure =
+            map_waits_for_configure(transparent, compositor_present, argb_visual);
 
         let mut bounds = params.bounds.to_device_pixels(scale_factor);
         if bounds.size.width.0 == 0 || bounds.size.height.0 == 0 {
@@ -837,6 +847,7 @@ impl X11WindowState {
                 active: false,
                 hovered: false,
                 force_render_after_recovery: false,
+                present_when_configured: false,
                 fullscreen: false,
                 maximized_vertical: false,
                 maximized_horizontal: false,
@@ -846,6 +857,7 @@ impl X11WindowState {
                 background_appearance: params.window_background,
                 destroyed: false,
                 compositor_present,
+                map_waits_for_configure,
                 decorations: WindowDecorations::Server,
                 last_insets: [0, 0, 0, 0],
                 edge_constraints: None,
@@ -1210,6 +1222,29 @@ impl X11WindowStatePtr {
         if let Some(mut fun) = callback {
             fun(request_frame_options);
             self.callbacks.borrow_mut().request_frame = Some(fun);
+        }
+    }
+
+    /// Presents the frame a window could not present while its surface's
+    /// first configure ran, once that configure has returned. Like an
+    /// exposure, the present runs at once instead of on the frame loop:
+    /// nothing the window drew before reached the screen, so there is no
+    /// frame to pace it against, and a frame loop timer can be an interval
+    /// out.
+    pub(crate) fn present_if_configured(&self) {
+        let configured = {
+            let mut state = self.state.borrow_mut();
+            let configured = state.present_when_configured && !state.renderer.is_configuring();
+            if configured {
+                state.present_when_configured = false;
+            }
+            configured
+        };
+        if configured {
+            self.refresh(RequestFrameOptions {
+                require_presentation: true,
+                force_render: false,
+            });
         }
     }
 
@@ -1649,6 +1684,12 @@ impl PlatformWindow for X11Window {
     }
 
     fn map_window(&mut self) -> anyhow::Result<()> {
+        {
+            let mut state = self.0.state.borrow_mut();
+            if state.map_waits_for_configure {
+                state.renderer.finish_configure().log_err();
+            }
+        }
         check_reply(
             || "X11 MapWindow failed.",
             self.0.xcb.map_window(self.0.x_window),
@@ -1808,6 +1849,10 @@ impl PlatformWindow for X11Window {
             return;
         }
 
+        if inner.renderer.is_configuring() {
+            inner.present_when_configured = true;
+            return;
+        }
         inner.renderer.draw(scene);
 
         if inner.renderer.needs_redraw() {

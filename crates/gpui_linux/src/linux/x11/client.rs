@@ -3,6 +3,7 @@ use ashpd::WindowIdentifier;
 use calloop::{
     EventLoop, LoopHandle,
     generic::{FdWrapper, Generic},
+    ping::Ping,
     timer::TimeoutAction,
 };
 use collections::HashMap;
@@ -191,6 +192,8 @@ pub struct X11ClientState {
     pub(crate) compositor_gpu: Option<CompositorGpuHint>,
     /// The context from the GPU context thread, until the first window.
     pending_gpu_context: Option<gpu_context::PendingContext>,
+    /// Pinged by a window's configure worker as the configure returns.
+    configured: Ping,
 
     pub(crate) scale_factor: f32,
 
@@ -526,6 +529,31 @@ impl X11Client {
             })
             .map_err(|err| anyhow!("Failed to initialize XDP event source: {err:?}"))?;
 
+        // A window's surface is configured on a worker, and the driver's
+        // replies on that thread read the X events ahead of them into xcb's
+        // queue. A queued event leaves the socket unreadable, so the X11
+        // source does not fire for it: the worker pings as it returns, and
+        // the events are handled here.
+        let (configured, configured_source) =
+            calloop::ping::make_ping().context("Failed to create the surface configure ping")?;
+        handle
+            .insert_source(configured_source, |(), _, client: &mut X11Client| {
+                let xcb_connection = client.0.borrow().xcb_connection.clone();
+                client.process_x11_events(&xcb_connection).log_err();
+                let windows: Vec<_> = client
+                    .0
+                    .borrow()
+                    .windows
+                    .values()
+                    .filter(|window| window.is_mapped)
+                    .map(|window| window.window.clone())
+                    .collect();
+                for window in windows {
+                    window.present_if_configured();
+                }
+            })
+            .map_err(|err| anyhow!("Failed to initialize the surface configure ping: {err:?}"))?;
+
         xcb_flush(&xcb_connection);
 
         Ok(X11Client(Rc::new(RefCell::new(X11ClientState {
@@ -544,6 +572,7 @@ impl X11Client {
             gpu_context: GpuContext::new(),
             compositor_gpu,
             pending_gpu_context: Some(pending_gpu_context),
+            configured,
             scale_factor,
 
             xkb_context,
@@ -749,11 +778,16 @@ impl X11Client {
             };
             (window_ref.window.clone(), state.xcb_connection.clone())
         };
-        let force_render =
-            std::mem::take(&mut window.state.borrow_mut().force_render_after_recovery);
+        let (force_render, require_presentation) = {
+            let mut state = window.state.borrow_mut();
+            (
+                std::mem::take(&mut state.force_render_after_recovery),
+                std::mem::take(&mut state.present_when_configured),
+            )
+        };
         window.frame_loop.begin_frame();
         window.refresh(RequestFrameOptions {
-            require_presentation: false,
+            require_presentation,
             force_render,
         });
         // A reply the frame waited on reads the events ahead of it into
@@ -1674,6 +1708,7 @@ impl LinuxClient for X11Client {
             context: state.gpu_context.clone(),
             compositor_gpu: state.compositor_gpu.take(),
             pending: state.pending_gpu_context.take(),
+            configured: state.configured.clone(),
         };
         let supports_xinput_gestures = state.supports_xinput_gestures;
         let is_bgr = state

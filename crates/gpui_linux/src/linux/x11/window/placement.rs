@@ -51,6 +51,21 @@ pub(super) fn creation_background_pixel(
     (transparent && compositor_present && argb_visual).then_some(0)
 }
 
+/// Whether a new window's map waits for its surface's first configure,
+/// which runs on a worker. Under a compositor, a window without a
+/// background pixel shows its unfilled backing, black, until the first frame
+/// is presented; it maps once the frame can be. Every other window shows
+/// nothing before its first frame, maps at once, and draws when the
+/// configure returns.
+pub(super) fn map_waits_for_configure(
+    transparent: bool,
+    compositor_present: bool,
+    argb_visual: bool,
+) -> bool {
+    compositor_present
+        && creation_background_pixel(transparent, compositor_present, argb_visual).is_none()
+}
+
 /// What a `ConfigureNotify` changes on a window whose bounds are `current`.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum ConfigureChange {
@@ -130,10 +145,19 @@ mod tests {
             (2.0, (600, 402)),
             (1.25, (375, 251)),
         ] {
-            let hints = normal_hints(point(DevicePixels(0), DevicePixels(0)), Some(min), scale, 8192);
+            let hints = normal_hints(
+                point(DevicePixels(0), DevicePixels(0)),
+                Some(min),
+                scale,
+                8192,
+            );
             let words = words(&hints);
             assert_eq!(words[0] & P_MIN_SIZE, P_MIN_SIZE, "scale {scale}");
-            assert_eq!((words[5] as i32, words[6] as i32), expected, "scale {scale}");
+            assert_eq!(
+                (words[5] as i32, words[6] as i32),
+                expected,
+                "scale {scale}"
+            );
         }
     }
 
@@ -157,6 +181,24 @@ mod tests {
                     assert_eq!(
                         creation_background_pixel(transparent, compositor, argb),
                         expected,
+                        "transparent {transparent} compositor {compositor} argb {argb}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Under a compositor, only a window whose backing shows black before
+    /// its first frame, an opaque one or one without an ARGB visual, waits
+    /// for the configure to map. Without a compositor none waits.
+    #[test]
+    fn only_a_composited_window_without_background_waits_to_map() {
+        for transparent in [false, true] {
+            for compositor in [false, true] {
+                for argb in [false, true] {
+                    assert_eq!(
+                        map_waits_for_configure(transparent, compositor, argb),
+                        compositor && !(transparent && argb),
                         "transparent {transparent} compositor {compositor} argb {argb}"
                     );
                 }
@@ -188,7 +230,11 @@ mod tests {
             ),
         ];
         for (reported, expected) in cases {
-            assert_eq!(configure_change(current, reported), expected, "{reported:?}");
+            assert_eq!(
+                configure_change(current, reported),
+                expected,
+                "{reported:?}"
+            );
         }
     }
 
@@ -198,7 +244,10 @@ mod tests {
     fn xi_root_position_reads_fixed_point() {
         let fp = |whole: i32, frac: i32| (whole << 16) | frac;
         assert_eq!(xi_root_position(fp(0, 0), fp(0, 0)), (0, 0));
-        assert_eq!(xi_root_position(fp(1234, 0x8000), fp(56, 0xffff)), (1234, 56));
+        assert_eq!(
+            xi_root_position(fp(1234, 0x8000), fp(56, 0xffff)),
+            (1234, 56)
+        );
         assert_eq!(xi_root_position(fp(-1, 0x8000), fp(-300, 0)), (-1, -300));
         assert_eq!(xi_root_position(fp(3839, 0), fp(2159, 0)), (3839, 2159));
     }

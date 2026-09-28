@@ -129,6 +129,9 @@ pub(crate) struct WindowGpu {
     /// The instances and the context from the GPU context thread, for the
     /// client's first window.
     pub pending: Option<PendingContext>,
+    /// Pinged by the worker that configures the window's surface as the
+    /// configure returns.
+    pub configured: calloop::ping::Ping,
 }
 
 impl WindowGpu {
@@ -145,7 +148,23 @@ impl WindowGpu {
             context,
             compositor_gpu,
             pending,
+            configured,
         } = self;
+        let mut renderer = Self::create(context, compositor_gpu, pending, window, config)?;
+        renderer.notify_configured(Arc::new(move || configured.ping()));
+        Ok(renderer)
+    }
+
+    fn create<W>(
+        context: GpuContext,
+        compositor_gpu: Option<CompositorGpuHint>,
+        pending: Option<PendingContext>,
+        window: &W,
+        config: WgpuSurfaceConfig,
+    ) -> anyhow::Result<WgpuRenderer>
+    where
+        W: rwh::HasWindowHandle + rwh::HasDisplayHandle + Debug + Send + Sync + Clone + 'static,
+    {
         if let Some(pending) = pending {
             let (instances, prewarmed) = pending.join();
             context.set_instances(instances)?;
@@ -190,7 +209,15 @@ where
         transparent: config.transparent,
         preferred_present_mode: config.preferred_present_mode,
     };
-    let renderer = WgpuRenderer::new(context.clone(), window, config, compositor_gpu);
+    // The configure runs on a worker, outside this thread's error scope, and
+    // reports to the renderer instead: wait for it so its error rejects
+    // `prewarmed` too.
+    let renderer = WgpuRenderer::new(context.clone(), window, config, compositor_gpu).and_then(
+        |mut renderer| {
+            renderer.finish_configure()?;
+            Ok(renderer)
+        },
+    );
     let result = adopted(renderer, gpui::block_on(scope.pop()));
     if result.is_err() {
         *context.borrow_mut() = None;

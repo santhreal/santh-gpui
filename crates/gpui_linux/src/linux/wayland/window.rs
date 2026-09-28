@@ -116,6 +116,9 @@ pub struct WaylandWindowState {
     hovered: bool,
     redraw_requested: bool,
     presentation: PresentationState,
+    /// A draw failed while the surface's first configure ran on its worker.
+    /// The worker's ping presents the next frame as the configure returns.
+    awaiting_configure: bool,
     pending_frame_callback: Option<wl_callback::WlCallback>,
     in_progress_configure: Option<InProgressConfigure>,
     configure_throttle: ConfigureThrottle,
@@ -566,7 +569,10 @@ impl WaylandWindowState {
                 // Prefer Mailbox to avoid blocking. Falls back to FIFO if Mailbox is unsupported.
                 preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
             };
-            WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?
+            let mut renderer = WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?;
+            let frame_ping = globals.frame_ping.clone();
+            renderer.notify_configured(Arc::new(move || frame_ping.ping()));
+            renderer
         };
 
         if let WaylandSurfaceState::Xdg(ref xdg_state) = surface_state {
@@ -616,6 +622,7 @@ impl WaylandWindowState {
             hovered: false,
             redraw_requested: false,
             presentation: PresentationState::Unpresented,
+            awaiting_configure: false,
             pending_frame_callback: None,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
@@ -993,7 +1000,18 @@ impl WaylandWindowStatePtr {
     }
 
     pub fn scheduled_frame_fired(&self) {
-        if self.frame_loop.get() == FrameLoop::Scheduled {
+        let frame_loop = self.frame_loop.get();
+        let configure_returned = frame_loop == FrameLoop::RetryScheduled && {
+            let mut state = self.state.borrow_mut();
+            let returned = state.awaiting_configure && !state.renderer.is_configuring();
+            if returned {
+                state.awaiting_configure = false;
+            }
+            returned
+        };
+        // A frame that failed on the surface's first configure presents as
+        // the configure returns, ahead of its retry timer.
+        if frame_loop == FrameLoop::Scheduled || configure_returned {
             self.frame();
         }
     }
@@ -1930,11 +1948,15 @@ impl PlatformWindow for WaylandWindow {
             let callback = state.surface.frame(&state.globals.qh, state.surface.id());
             state.pending_frame_callback = Some(callback);
         }
+        let configuring = state.renderer.is_configuring();
         if state.renderer.draw(scene) {
             state.presentation = PresentationState::Presented;
             self.0.frame_loop.set(FrameLoop::AwaitingCallback);
         } else {
             state.presentation = state.presentation.failed();
+            // Checked before the draw: a configure that returns after it
+            // pings once this draw is done.
+            state.awaiting_configure = configuring;
             self.0.frame_loop.set(FrameLoop::PresentationFailed);
         }
 
