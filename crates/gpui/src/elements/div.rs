@@ -26,6 +26,7 @@ use crate::{
     StyleRefinement, StyleTransition, Styled, Task, TooltipId, Visibility, Window,
     WindowControlArea, point, px, size,
 };
+use super::smooth_wheel::{self, WheelEase};
 use collections::HashMap;
 use gpui_util::ResultExt;
 use refineable::Refineable;
@@ -2370,7 +2371,7 @@ impl Interactivity {
         bounds: Bounds<Pixels>,
         style: &Style,
         window: &mut Window,
-        _cx: &mut App,
+        cx: &mut App,
     ) -> Point<Pixels> {
         fn round_to_two_decimals(pixels: Pixels) -> Pixels {
             const ROUNDING_FACTOR: f32 = 100.0;
@@ -2404,12 +2405,29 @@ impl Interactivity {
             // Clamp scroll offset in case scroll max is smaller now (e.g., if children
             // were removed or the bounds became larger).
             let mut scroll_offset = scroll_offset.borrow_mut();
+            let mut wheel = tracked_scroll_handle
+                .as_deref_mut()
+                .and_then(|state| state.wheel.as_mut());
+            let stepped = wheel
+                .as_deref_mut()
+                .and_then(|ease| ease.step(*scroll_offset, cx))
+                .map(|step| {
+                    *scroll_offset = *scroll_offset + step;
+                    *scroll_offset
+                });
 
             scroll_offset.x = scroll_offset.x.clamp(-scroll_max.x, px(0.));
             if scroll_to_bottom {
                 scroll_offset.y = -scroll_max.y;
             } else {
                 scroll_offset.y = scroll_offset.y.clamp(-scroll_max.y, px(0.));
+            }
+            if let Some(ease) = wheel {
+                if stepped.is_some_and(|stepped| stepped != *scroll_offset) {
+                    ease.cancel();
+                }
+                ease.record(*scroll_offset);
+                ease.request_frame(bounds, window);
             }
 
             if let Some(mut scroll_handle_state) = tracked_scroll_handle {
@@ -3257,6 +3275,7 @@ impl Interactivity {
             let line_height = window.line_height();
             let hitbox = hitbox.clone();
             let current_view = window.current_view();
+            let tracked_scroll_handle = self.tracked_scroll_handle.clone();
             window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
                 if phase == DispatchPhase::Bubble && hitbox.should_handle_scroll(window) {
                     let mut scroll_offset = scroll_offset.borrow_mut();
@@ -3296,6 +3315,27 @@ impl Interactivity {
                         } else {
                             delta_x = Pixels::ZERO;
                         }
+                    }
+                    let mut handle_state = tracked_scroll_handle
+                        .as_ref()
+                        .map(|handle| handle.0.borrow_mut());
+                    if let Some(state) = handle_state.as_deref_mut()
+                        && let Some(ease) = state.wheel.as_mut()
+                    {
+                        if smooth_wheel::eases(&event.delta, cx) {
+                            let target = ease.target(*scroll_offset, *scroll_offset);
+                            let max = state.max_offset;
+                            let next = point(
+                                (target.x + delta_x).clamp(-max.x, Pixels::ZERO),
+                                (target.y + delta_y).clamp(-max.y, Pixels::ZERO),
+                            );
+                            if next != target {
+                                ease.retarget(next - target, *scroll_offset, cx);
+                                cx.notify(current_view);
+                            }
+                            return;
+                        }
+                        ease.cancel();
                     }
                     scroll_offset.y += delta_y;
                     scroll_offset.x += delta_x;
@@ -4217,6 +4257,7 @@ struct ScrollHandleState {
     scroll_to_bottom: bool,
     overflow: Point<Overflow>,
     active_item: Option<ScrollActiveItem>,
+    wheel: Option<WheelEase<Point<Pixels>>>,
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -4390,6 +4431,27 @@ impl ScrollHandle {
     pub fn set_offset(&self, mut position: Point<Pixels>) {
         let state = self.0.borrow();
         *state.offset.borrow_mut() = position;
+    }
+
+    /// Eases line wheel scrolling of the element that tracks this handle when
+    /// `smooth` is set. A line wheel tick, as from a mouse wheel, moves the
+    /// target offset, clamped to the content, and the offset follows the
+    /// target on [`WHEEL_SPRING`](crate::WHEEL_SPRING), one frame per display
+    /// frame; a tick during the motion moves the target again and keeps the
+    /// motion's velocity. A pixel wheel event, as from a touchpad, applies at
+    /// once and ends the motion, and so does [`Self::set_offset`] or any other
+    /// write to the offset. Under reduced motion every wheel event applies at
+    /// once. Off by default. Turning it off ends a motion where it is.
+    pub fn set_smooth_wheel(&self, smooth: bool) {
+        let mut state = self.0.borrow_mut();
+        if smooth != state.wheel.is_some() {
+            state.wheel = smooth.then(WheelEase::new);
+        }
+    }
+
+    /// Whether line wheel scrolling eases; see [`Self::set_smooth_wheel`].
+    pub fn smooth_wheel(&self) -> bool {
+        self.0.borrow().wheel.is_some()
     }
 
     /// Get the logical scroll top, based on a child index and a pixel offset.

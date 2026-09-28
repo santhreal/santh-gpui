@@ -142,6 +142,19 @@ impl UniformListScrollHandle {
         })))
     }
 
+    /// Eases line wheel scrolling of the list that tracks this handle when
+    /// `smooth` is set; see [`ScrollHandle::set_smooth_wheel`]. Off by
+    /// default.
+    pub fn set_smooth_wheel(&self, smooth: bool) {
+        self.0.borrow().base_handle.set_smooth_wheel(smooth);
+    }
+
+    /// Whether line wheel scrolling of the list eases; see
+    /// [`Self::set_smooth_wheel`].
+    pub fn smooth_wheel(&self) -> bool {
+        self.0.borrow().base_handle.smooth_wheel()
+    }
+
     /// Scroll the list so that the given item index is visible.
     ///
     /// This uses non-strict scrolling: if the item is already fully visible, no scrolling occurs.

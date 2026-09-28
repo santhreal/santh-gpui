@@ -18,6 +18,8 @@ use refineable::Refineable as _;
 use std::{cell::RefCell, ops::Range, rc::Rc};
 use sum_tree::{Bias, Dimensions, SumTree};
 
+use super::smooth_wheel::{self, WheelEase};
+
 type RenderItemFn = dyn FnMut(usize, &mut Window, &mut App) -> AnyElement + 'static;
 
 /// Construct a new list element
@@ -73,6 +75,7 @@ struct StateInner {
     measuring_behavior: ListMeasuringBehavior,
     pending_scroll: Option<PendingScroll>,
     follow_state: FollowState,
+    wheel: Option<WheelEase<Option<ListOffset>>>,
 }
 
 /// Deferred scroll adjustment applied after the scroll-top item has been remeasured.
@@ -325,6 +328,7 @@ impl ListState {
             measuring_behavior: ListMeasuringBehavior::default(),
             pending_scroll: None,
             follow_state: FollowState::default(),
+            wheel: None,
         })));
         this.splice(0..0, item_count);
         this
@@ -656,6 +660,29 @@ impl ListState {
         )
     }
 
+    /// Eases line wheel scrolling when `smooth` is set. A line wheel tick, as
+    /// from a mouse wheel, moves the target scroll position, clamped to the
+    /// content, and the list follows the target on
+    /// [`WHEEL_SPRING`](crate::WHEEL_SPRING), one frame per display frame; a
+    /// tick during the motion moves the target again and keeps the motion's
+    /// velocity. A pixel wheel event, as from a touchpad, applies at once and
+    /// ends the motion, and so does any other change of the scroll position,
+    /// such as [`Self::scroll_to`]. A tick up stops following the tail at
+    /// once, and a motion that lands at the end resumes it, as a pixel scroll
+    /// does. Under reduced motion every wheel event applies at once. Off by
+    /// default. Turning it off ends a motion where it is.
+    pub fn set_smooth_wheel(&self, smooth: bool) {
+        let state = &mut *self.0.borrow_mut();
+        if smooth != state.wheel.is_some() {
+            state.wheel = smooth.then(WheelEase::new);
+        }
+    }
+
+    /// Whether line wheel scrolling eases; see [`Self::set_smooth_wheel`].
+    pub fn smooth_wheel(&self) -> bool {
+        self.0.borrow().wheel.is_some()
+    }
+
     /// Scroll the list to the given offset
     pub fn scroll_to(&self, mut scroll_top: ListOffset) {
         let state = &mut *self.0.borrow_mut();
@@ -895,11 +922,17 @@ impl StateInner {
         scroll_top.item_ix..cursor.start().count + 1
     }
 
+    /// Scrolls by `delta` from `scroll_top`, the scroll top of the frame the
+    /// wheel event arrived in. An `eased` delta moves the wheel target of a
+    /// list with smooth wheel scrolling; any other delta applies at once and
+    /// ends a wheel motion.
+    #[allow(clippy::too_many_arguments)]
     fn scroll(
         &mut self,
         scroll_top: &ListOffset,
         height: Pixels,
         delta: Point<Pixels>,
+        eased: bool,
         current_view: EntityId,
         window: &mut Window,
         cx: &mut App,
@@ -910,29 +943,26 @@ impl StateInner {
             return;
         }
 
-        let padding = self.last_padding.unwrap_or_default();
-        let scroll_max =
-            (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.));
-        let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
-            .max(px(0.))
-            .min(scroll_max);
-
-        if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
-            self.pending_scroll = None;
-            self.logical_scroll_top = None;
-        } else {
-            let (start, ..) =
-                self.items
-                    .find::<ListItemSummary, _>((), &Height(new_scroll_top), Bias::Right);
-            let scroll_top = ListOffset {
-                item_ix: start.count,
-                offset_in_item: new_scroll_top - start.height,
-            };
-            // The user's scroll supersedes the position stashed by a
-            // remeasure; re-anchor the pending adjustment so it doesn't revert
-            // this scroll on the next layout.
-            self.rebase_pending_scroll(scroll_top);
-            self.logical_scroll_top = Some(scroll_top);
+        let scroll_max = self.scroll_max(height);
+        let current = self.scroll_top(&self.logical_scroll_top()).min(scroll_max);
+        let at = self.logical_scroll_top;
+        match self.wheel.as_mut() {
+            Some(ease) if eased => {
+                let target = ease.target(point(px(0.), current), at).y;
+                let next = (target - delta.y).max(px(0.)).min(scroll_max);
+                if next != target {
+                    ease.retarget(point(px(0.), next - target), at, cx);
+                }
+            }
+            wheel => {
+                if let Some(ease) = wheel {
+                    ease.cancel();
+                }
+                let new_scroll_top = (self.scroll_top(scroll_top) - delta.y)
+                    .max(px(0.))
+                    .min(scroll_max);
+                self.set_scroll_top(new_scroll_top, scroll_max);
+            }
         }
 
         if delta.y > px(0.) {
@@ -957,6 +987,34 @@ impl StateInner {
         }
 
         cx.notify(current_view);
+    }
+
+    /// The largest scroll top of a viewport `height` pixels tall.
+    fn scroll_max(&self, height: Pixels) -> Pixels {
+        let padding = self.last_padding.unwrap_or_default();
+        (self.items.summary().height + padding.top + padding.bottom - height).max(px(0.))
+    }
+
+    /// Places the scroll top `new_scroll_top` pixels from the top of the
+    /// content, a value in `0..=scroll_max`.
+    fn set_scroll_top(&mut self, new_scroll_top: Pixels, scroll_max: Pixels) {
+        if self.alignment == ListAlignment::Bottom && new_scroll_top == scroll_max {
+            self.pending_scroll = None;
+            self.logical_scroll_top = None;
+        } else {
+            let (start, ..) =
+                self.items
+                    .find::<ListItemSummary, _>((), &Height(new_scroll_top), Bias::Right);
+            let scroll_top = ListOffset {
+                item_ix: start.count,
+                offset_in_item: new_scroll_top - start.height,
+            };
+            // The user's scroll supersedes the position stashed by a
+            // remeasure; re-anchor the pending adjustment so it doesn't revert
+            // this scroll on the next layout.
+            self.rebase_pending_scroll(scroll_top);
+            self.logical_scroll_top = Some(scroll_top);
+        }
     }
 
     fn logical_scroll_top(&self) -> ListOffset {
@@ -1207,8 +1265,11 @@ impl StateInner {
 
         // If follow_tail mode is on but the user scrolled away
         // (is_following is false), check whether the current scroll
-        // position has returned to the bottom.
-        if self.follow_state.has_stopped_following() {
+        // position has returned to the bottom. A wheel motion still moving
+        // toward its target is checked once it lands.
+        if self.follow_state.has_stopped_following()
+            && !self.wheel.is_some_and(|ease| ease.is_moving())
+        {
             let padding = self.last_padding.unwrap_or_default();
             let total_height = self.items.summary().height + padding.top + padding.bottom;
             let scroll_offset = self.scroll_top(&scroll_top);
@@ -1435,7 +1496,7 @@ impl std::fmt::Debug for ListItem {
 
 /// An offset into the list's items, in terms of the item index and the number
 /// of pixels off the top left of the item.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ListOffset {
     /// The index of an item in the list
     pub item_ix: usize,
@@ -1566,6 +1627,23 @@ impl Element for List {
         let padding = style
             .padding
             .to_pixels(bounds.size.into(), window.rem_size());
+        let at = state.logical_scroll_top;
+        if let Some(step) = state.wheel.as_mut().and_then(|ease| ease.step(at, cx)) {
+            let scroll_max = state.scroll_max(bounds.size.height);
+            let current = state.scroll_top(&state.logical_scroll_top()).min(scroll_max);
+            let next = (current + step.y).max(px(0.)).min(scroll_max);
+            state.set_scroll_top(next, scroll_max);
+            let at = state.logical_scroll_top;
+            if let Some(ease) = state.wheel.as_mut() {
+                if next != current + step.y {
+                    ease.cancel();
+                }
+                ease.record(at);
+            }
+        }
+        if let Some(ease) = state.wheel.as_ref() {
+            ease.request_frame(bounds, window);
+        }
         let layout =
             match state.prepaint_items(bounds, padding, true, &mut self.render_item, window, cx) {
                 Ok(layout) => layout,
@@ -1606,12 +1684,19 @@ impl Element for List {
         let mut accumulated_scroll_delta = ScrollDelta::default();
         window.on_mouse_event(move |event: &ScrollWheelEvent, phase, window, cx| {
             if phase == DispatchPhase::Bubble && hitbox_id.should_handle_scroll(window) {
-                accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
-                let pixel_delta = accumulated_scroll_delta.pixel_delta(px(20.));
+                let eased = smooth_wheel::eases(&event.delta, cx)
+                    && list_state.0.borrow().wheel.is_some();
+                let pixel_delta = if eased {
+                    event.delta.pixel_delta(px(20.))
+                } else {
+                    accumulated_scroll_delta = accumulated_scroll_delta.coalesce(event.delta);
+                    accumulated_scroll_delta.pixel_delta(px(20.))
+                };
                 list_state.0.borrow_mut().scroll(
                     &scroll_top,
                     height,
                     pixel_delta,
+                    eased,
                     current_view,
                     window,
                     cx,
