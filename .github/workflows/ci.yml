@@ -17,29 +17,35 @@ jobs:
   linux:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # mesa-vulkan-drivers and libegl-mesa0: the software Vulkan and GL
+      # adapters the renderer tests draw on, since the runner has no GPU.
       - name: Install system packages
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            clang cmake libfontconfig-dev libvulkan1 libwayland-dev \
-            libx11-xcb-dev libxkbcommon-x11-dev
-      - uses: Swatinem/rust-cache@v2
+            clang cmake libegl-mesa0 libegl1 libfontconfig-dev libvulkan1 \
+            libwayland-dev libx11-xcb-dev libxkbcommon-x11-dev \
+            mesa-vulkan-drivers xvfb
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --workspace --all-targets
       - run: cargo test -p gpui --lib
+      - run: cargo test -p motion
+      - run: cargo test -p gpui_wgpu --lib
+      - run: xvfb-run -a cargo test -p gpui_linux --lib
 
   macos:
     runs-on: macos-15
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --workspace --all-targets
       - run: cargo test -p gpui_apple --lib
 
   windows:
     runs-on: windows-2025
     steps:
-      - uses: actions/checkout@v4
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - run: cargo clippy --workspace --all-targets
       - run: cargo test -p gpui_windows --lib
