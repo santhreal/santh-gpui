@@ -1,6 +1,8 @@
 #[cfg(any(feature = "wayland", feature = "x11"))]
 mod clipboard_file_list;
 mod dispatcher;
+#[cfg(any(feature = "wayland", feature = "x11"))]
+mod gpu_context;
 mod headless;
 mod keyboard;
 mod platform;

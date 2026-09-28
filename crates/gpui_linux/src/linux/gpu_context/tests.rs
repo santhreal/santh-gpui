@@ -1,16 +1,17 @@
-//! WHY: an X11 client creates its GPU context on a thread that reads the
-//! client's X connection, and its first window adopts that context, whose
-//! adapter was selected without a surface. The classes closed here are a
-//! thread that outlives the connection it reads (the client's setup fails,
-//! or the client ends before its first window, and the connection closes
-//! while the thread creates the instance on it), and a first window that
-//! keeps the unchecked context although creating its renderer reported an
-//! error. Not covered: the order of the X connection's setup and the
-//! driver's load, which iris's tests/startup.rs checks against a fresh
-//! Xvfb; the adapter selection; the error scope around the renderer's
-//! creation, which needs a GPU device; and the surface's configure, which
-//! the window does not wait for and whose failure the renderer's trial
-//! (gpui_wgpu `wgpu_renderer/trial`) turns into a new context.
+//! WHY: an X11 or Wayland client creates its GPU context on a thread that
+//! reads the client's display connection, and its first window adopts that
+//! context, whose adapter was selected without a surface. The classes closed
+//! here are a thread that outlives the connection it reads (the client's
+//! setup fails, or the client ends before its first window, and the
+//! connection closes while the thread creates the context on it), and a
+//! first window that keeps the unchecked context although creating its
+//! renderer reported an error. Not covered: the order of the X connection's
+//! setup and the driver's load, which iris's tests/startup.rs checks against
+//! a fresh Xvfb; the adapter selection; the error scope around the
+//! renderer's creation, which needs a GPU device; and the surface's
+//! configure, which the window does not wait for and whose failure the
+//! renderer's trial (gpui_wgpu `wgpu_renderer/trial`) turns into a new
+//! context.
 
 use std::{
     panic::{AssertUnwindSafe, catch_unwind},

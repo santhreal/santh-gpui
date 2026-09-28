@@ -84,9 +84,11 @@ use crate::linux::{
     DOUBLE_CLICK_INTERVAL, LinuxClient, LinuxCommon, LinuxKeyboardLayout, PIPE_READ_TIMEOUT,
     SCROLL_LINES, capslock_from_xkb,
     clipboard_file_list::FILE_LIST_MIME_TYPE,
-    cursor_style_to_icon_names, get_xkb_compose_state, is_within_click_distance,
-    keystroke_from_xkb, keystroke_underlying_dead_key, modifiers_from_xkb, new_xkb_context,
-    open_uri_internal, read_fd_with_timeout, reveal_path_internal,
+    cursor_style_to_icon_names, get_xkb_compose_state,
+    gpu_context::{self, PendingContext, WindowGpu},
+    is_within_click_distance, keystroke_from_xkb, keystroke_underlying_dead_key,
+    modifiers_from_xkb, new_xkb_context, open_uri_internal, read_fd_with_timeout,
+    reveal_path_internal,
     wayland::{
         clipboard::{Clipboard, DataOffer, TEXT_MIME_TYPES},
         cursor::Cursor,
@@ -317,6 +319,8 @@ pub(crate) struct WaylandClientState {
     globals: Globals,
     pub gpu_context: GpuContext,
     pub compositor_gpu: Option<CompositorGpuHint>,
+    /// The GPU context from the `gpu-context` thread, for the first window.
+    pending_gpu_context: Option<PendingContext<()>>,
     wl_seat: wl_seat::WlSeat, // TODO: Multi seat support
     wl_pointer: Option<wl_pointer::WlPointer>,
     pinch_gesture: Option<zwp_pointer_gesture_pinch_v1::ZwpPointerGesturePinchV1>,
@@ -789,9 +793,19 @@ impl WaylandClient {
 
         // LinuxCommon::new starts the dispatcher's threads, and the Vulkan
         // instance is created without DISPLAY in the environment only while
-        // the process has one thread.
-        let gpu_context =
-            GpuContext::with_instances(DisplayInstances::new(ConnectionDisplay(conn.clone())));
+        // the process has one thread. The GPU context thread starts once
+        // the instances exist, so the device is created while the client
+        // loads the system fonts and the application starts.
+        let compositor_gpu = detect_compositor_gpu();
+        let instances = DisplayInstances::new(ConnectionDisplay(conn.clone()));
+        let (gpu_context, pending_gpu_context) =
+            match gpu_context::spawn_on(instances, compositor_gpu) {
+                Ok(pending) => (GpuContext::new(), Some(pending)),
+                Err((instances, error)) => {
+                    log::warn!("{error:#}; the first window creates the GPU context");
+                    (GpuContext::with_instances(instances), None)
+                }
+            };
 
         let event_loop = EventLoop::<WaylandClientStatePtr>::try_new().unwrap();
 
@@ -825,8 +839,6 @@ impl WaylandClient {
                 },
             )
             .unwrap();
-
-        let compositor_gpu = detect_compositor_gpu();
 
         let (frame_ping, frame_ping_source) =
             calloop::ping::make_ping().expect("Failed to create the frame ping");
@@ -905,6 +917,7 @@ impl WaylandClient {
             globals,
             gpu_context,
             compositor_gpu,
+            pending_gpu_context,
             wl_seat: seat,
             wl_pointer: None,
             wl_keyboard: None,
@@ -1084,13 +1097,17 @@ impl LinuxClient for WaylandClient {
         });
 
         let appearance = state.common.appearance;
-        let compositor_gpu = state.compositor_gpu.take();
+        let gpu = WindowGpu {
+            context: state.gpu_context.clone(),
+            compositor_gpu: state.compositor_gpu.take(),
+            pending: state.pending_gpu_context.take(),
+            configured: state.globals.frame_ping.clone(),
+        };
 
         let (window, surface_id) = WaylandWindow::new(
             handle,
             state.globals.clone(),
-            state.gpu_context.clone(),
-            compositor_gpu,
+            gpu,
             WaylandClientStatePtr(Rc::downgrade(&self.0)),
             params,
             appearance,

@@ -32,7 +32,7 @@ use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
 use crate::linux::wayland::configure::{Configure, ConfigureThrottle, InProgressConfigure};
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
-use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
+use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window, gpu_context::WindowGpu};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalDragPayload, GpuSpecs,
     Modifiers, Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
@@ -43,7 +43,7 @@ use gpui::{
     popup::PopupOptions,
     px, size,
 };
-use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig, wgpu};
+use gpui_wgpu::{WgpuRenderer, WgpuSurfaceConfig, wgpu};
 
 #[derive(Default)]
 pub(crate) struct Callbacks {
@@ -545,8 +545,7 @@ impl WaylandWindowState {
         viewport: Option<wp_viewport::WpViewport>,
         client: WaylandClientStatePtr,
         globals: Globals,
-        gpu_context: gpui_wgpu::GpuContext,
-        compositor_gpu: Option<CompositorGpuHint>,
+        gpu: WindowGpu<()>,
         options: WindowParams,
         parent: Option<WaylandWindowStatePtr>,
     ) -> anyhow::Result<Self> {
@@ -569,10 +568,7 @@ impl WaylandWindowState {
                 // Prefer Mailbox to avoid blocking. Falls back to FIFO if Mailbox is unsupported.
                 preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
             };
-            let mut renderer = WgpuRenderer::new(gpu_context, &raw_window, config, compositor_gpu)?;
-            let frame_ping = globals.frame_ping.clone();
-            renderer.notify_configured(Arc::new(move || frame_ping.ping()));
-            renderer
+            gpu.renderer(&raw_window, config)?
         };
 
         if let WaylandSurfaceState::Xdg(ref xdg_state) = surface_state {
@@ -812,8 +808,7 @@ impl WaylandWindow {
     pub fn new(
         handle: AnyWindowHandle,
         globals: Globals,
-        gpu_context: gpui_wgpu::GpuContext,
-        compositor_gpu: Option<CompositorGpuHint>,
+        gpu: WindowGpu<()>,
         client: WaylandClientStatePtr,
         params: WindowParams,
         appearance: WindowAppearance,
@@ -850,8 +845,7 @@ impl WaylandWindow {
                 viewport,
                 client,
                 globals,
-                gpu_context,
-                compositor_gpu,
+                gpu,
                 params,
                 parent,
             )?)),
