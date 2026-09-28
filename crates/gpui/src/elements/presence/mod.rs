@@ -1,8 +1,11 @@
 //! Presence: keyed children that fade in when they appear and keep painting
 //! while they fade out after they disappear.
 
+mod crossfade;
 #[cfg(test)]
 mod tests;
+
+pub use crossfade::{Crossfade, crossfade};
 
 use std::{mem, rc::Rc};
 
@@ -76,6 +79,7 @@ pub fn presence(id: impl Into<ElementId>) -> Presence {
         children: Vec::new(),
         effect: PresenceEffect::RISE,
         model: MotionModel::Spring(PRESENCE_SPRING),
+        stacked: false,
     }
 }
 
@@ -124,6 +128,10 @@ pub struct Presence {
     children: Vec<(ElementId, ChildBuilder)>,
     effect: PresenceEffect,
     model: MotionModel,
+    /// Whether children that are not supplied are painted beneath the
+    /// supplied ones at the top left corner of the container, out of the
+    /// layout, instead of in their place. Set by [`crossfade()`].
+    stacked: bool,
 }
 
 impl Presence {
@@ -135,9 +143,8 @@ impl Presence {
         key: impl Into<ElementId>,
         build: impl Fn(&mut Window, &mut App) -> E + 'static,
     ) -> Self {
-        let build: ChildBuilder = Rc::new(move |window: &mut Window, cx: &mut App| {
-            build(window, cx).into_any_element()
-        });
+        let build: ChildBuilder =
+            Rc::new(move |window: &mut Window, cx: &mut App| build(window, cx).into_any_element());
         self.children.push((key.into(), build));
         self
     }
@@ -228,12 +235,14 @@ impl PresenceEntry {
 impl PresenceState {
     /// Brings the entries to the keys of `children`, in their order, and
     /// returns whether the set or order of entries changed. An entry whose
-    /// key is gone stays after the entry that preceded it. On the first
-    /// frame, entries start at rest.
+    /// key is gone stays after the entry that preceded it, or, when
+    /// `stacked`, before every present entry. On the first frame, entries
+    /// start at rest.
     fn reconcile(
         &mut self,
         children: Vec<(ElementId, ChildBuilder)>,
         first: bool,
+        stacked: bool,
         model: MotionModel,
         policy: MotionPolicy,
         now: FrameInstant,
@@ -271,7 +280,7 @@ impl PresenceState {
                         slot = position + 1;
                         kept[position] = Some((old_position, entry));
                     }
-                    _ => gone.push((slot, old_position, entry)),
+                    _ => gone.push((if stacked { 0 } else { slot }, old_position, entry)),
                 }
             }
         }
@@ -350,13 +359,13 @@ impl Element for Presence {
         let now = cx.frame_instant();
         let policy = cx.motion_policy();
         let children = mem::take(&mut self.children);
-        let (effect, model) = (self.effect, self.model);
+        let (effect, model, stacked) = (self.effect, self.model, self.stacked);
 
         let (items, moving, relayout) =
             window.with_element_state(global_id, |state: Option<PresenceState>, window| {
                 let first = state.is_none();
                 let mut state = state.unwrap_or_default();
-                let mut relayout = state.reconcile(children, first, model, policy, now);
+                let mut relayout = state.reconcile(children, first, stacked, model, policy, now);
                 let mut moving = false;
                 state.entries.retain_mut(|entry| {
                     let was_moving = entry.progress.is_moving();
@@ -371,14 +380,23 @@ impl Element for Presence {
                     .entries
                     .iter()
                     .map(|entry| {
-                        PresenceItem {
+                        let item = PresenceItem {
                             key: entry.key.clone(),
                             element: (entry.build)(window, cx),
                             progress: entry.progress.value(),
                             effect,
                             damage: entry.damage,
+                        };
+                        if stacked && !entry.present {
+                            div()
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .child(item)
+                                .into_any_element()
+                        } else {
+                            item.into_any_element()
                         }
-                        .into_any_element()
                     })
                     .collect();
                 ((items, moving, relayout), state)
@@ -476,10 +494,7 @@ impl Element for PresenceItem {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let absent = 1.0 - self.progress;
-        let offset = point(
-            self.effect.offset.x * absent,
-            self.effect.offset.y * absent,
-        );
+        let offset = point(self.effect.offset.x * absent, self.effect.offset.y * absent);
         let element = &mut self.element;
         window.with_element_offset(offset, |window| element.prepaint(window, cx));
         offset
