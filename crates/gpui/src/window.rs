@@ -1140,6 +1140,7 @@ pub(crate) struct PaintIndex {
     cursor_styles_index: usize,
     accessed_element_states_index: usize,
     tab_handle_index: usize,
+    text_runs_index: usize,
     line_layout_index: LineLayoutIndex,
 }
 
@@ -3830,6 +3831,7 @@ impl Window {
             cursor_styles_index: self.next_frame.cursor_styles.len(),
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
+            text_runs_index: self.next_frame.text_runs.len(),
             line_layout_index: self.text_system.layout_index(),
         }
     }
@@ -3862,6 +3864,9 @@ impl Window {
         self.next_frame.tab_stops.replay(
             &self.rendered_frame.tab_stops.insertion_history
                 [range.start.tab_handle_index..range.end.tab_handle_index],
+        );
+        self.next_frame.text_runs.extend_from_slice(
+            &self.rendered_frame.text_runs[range.start.text_runs_index..range.end.text_runs_index],
         );
 
         self.text_system
@@ -4867,6 +4872,23 @@ impl Window {
     /// Records a shaped text run's font size and bounds for the current frame.
     pub fn record_text_run(&mut self, text_run: crate::TextRunLayout) {
         self.next_frame.text_runs.push(text_run);
+    }
+
+    /// The text runs painted in the most recently drawn frame, in paint order,
+    /// including those of cached views whose paint was reused. Bounds are in
+    /// window logical pixels and are not clipped to any content mask.
+    pub fn rendered_text_runs(&self) -> &[crate::TextRunLayout] {
+        &self.rendered_frame.text_runs
+    }
+
+    /// Whether the window has work toward another frame: a dirty view, a
+    /// next-frame callback (an animation frame request), or a drawn frame
+    /// that has not been presented. `false` means the window is idle and
+    /// draws nothing until something invalidates it.
+    pub fn frame_pending(&self) -> bool {
+        self.invalidator.is_dirty()
+            || !self.next_frame_callbacks.borrow().is_empty()
+            || self.needs_present.get()
     }
 
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
@@ -8815,6 +8837,160 @@ mod tests {
                 assert_eq!(drawn, expected, "{name}");
                 assert_eq!(masks.len(), mask_count, "{name}: {masks:?}");
             }
+        }
+    }
+
+    /// What a driver reads back from a window between frames: the text the
+    /// last frame painted and whether another frame is owed. A regression
+    /// here shows up as a driver waiting on text that a cached view drew, or
+    /// declaring a window idle while it still owes a frame. Not covered:
+    /// text runs are not clipped to content masks, so text scrolled out of a
+    /// clipped region is still reported.
+    mod rendered_frame {
+        use crate::{
+            AppContext as _, Context, Entity, IntoElement, ParentElement, Render,
+            RequestFrameOptions, SharedString, StyleRefinement, Styled, TestAppContext, Window,
+            WindowHandle, div,
+        };
+
+        struct Label {
+            renders: usize,
+        }
+
+        impl Render for Label {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders += 1;
+                div().child("cached label")
+            }
+        }
+
+        struct Root {
+            label: Entity<Label>,
+            renders: usize,
+        }
+
+        impl Render for Root {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders += 1;
+                div()
+                    .size_full()
+                    .child(SharedString::from(format!("root {}", self.renders)))
+                    .child(
+                        self.label
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    )
+            }
+        }
+
+        /// An active window, so no inactive-window frame throttle defers a
+        /// frame request the tests serve.
+        fn open(cx: &mut TestAppContext) -> WindowHandle<Root> {
+            let window = cx.add_window(|_, cx| Root {
+                label: cx.new(|_| Label { renders: 0 }),
+                renders: 0,
+            });
+            cx.test_window(window.into())
+                .simulate_active_status_change(true);
+            window
+        }
+
+        fn serve(cx: &mut TestAppContext, window: WindowHandle<Root>) {
+            cx.test_window(window.into())
+                .simulate_frame_request(RequestFrameOptions::default());
+        }
+
+        fn texts(cx: &mut TestAppContext, window: WindowHandle<Root>) -> Vec<String> {
+            window
+                .update(cx, |_, window, _| {
+                    window
+                        .rendered_text_runs()
+                        .iter()
+                        .map(|run| run.text.to_string())
+                        .collect()
+                })
+                .unwrap()
+        }
+
+        fn pending(cx: &mut TestAppContext, window: WindowHandle<Root>) -> bool {
+            window
+                .update(cx, |_, window, _| window.frame_pending())
+                .unwrap()
+        }
+
+        /// What the last frame should hold: the root's text for its latest
+        /// render, then the label's.
+        fn expected(cx: &mut TestAppContext, window: WindowHandle<Root>) -> Vec<String> {
+            let renders = window.update(cx, |root, _, _| root.renders).unwrap();
+            vec![format!("root {renders}"), "cached label".to_owned()]
+        }
+
+        /// A frame that reuses a cached view's paint keeps that view's text
+        /// runs, once each and in paint order, however many frames in a row
+        /// reuse it; re-rendering the view records its text afresh.
+        #[gpui::test]
+        fn a_reused_view_keeps_its_text_runs(cx: &mut TestAppContext) {
+            let window = open(cx);
+            serve(cx, window);
+            assert_eq!(texts(cx, window), expected(cx, window));
+
+            let label_renders = |cx: &mut TestAppContext| {
+                window
+                    .update(cx, |root, _, cx| root.label.read(cx).renders)
+                    .unwrap()
+            };
+            let label_before = label_renders(cx);
+            for frame in 0..3 {
+                let before = window.update(cx, |root, _, _| root.renders).unwrap();
+                window.update(cx, |_, _, cx| cx.notify()).unwrap();
+                serve(cx, window);
+                let after = window.update(cx, |root, _, _| root.renders).unwrap();
+                assert_eq!(after, before + 1, "frame {frame} re-renders the root");
+                assert_eq!(
+                    label_renders(cx),
+                    label_before,
+                    "frame {frame} reuses the label"
+                );
+                assert_eq!(
+                    texts(cx, window),
+                    expected(cx, window),
+                    "frame {frame} keeps the reused label's text"
+                );
+            }
+
+            window
+                .update(cx, |root, _, cx| root.label.update(cx, |_, cx| cx.notify()))
+                .unwrap();
+            serve(cx, window);
+            assert_eq!(texts(cx, window), expected(cx, window));
+        }
+
+        /// `frame_pending` holds for every source of frame demand (a dirty
+        /// view, a next-frame callback, a drawn frame not yet presented) and
+        /// clears once a frame request serves it.
+        #[gpui::test]
+        fn frame_pending_reports_every_source_of_frame_demand(cx: &mut TestAppContext) {
+            let window = open(cx);
+            serve(cx, window);
+            assert!(!pending(cx, window), "a served window is idle");
+
+            window.update(cx, |_, _, cx| cx.notify()).unwrap();
+            assert!(pending(cx, window), "a notified view owes a frame");
+            serve(cx, window);
+            assert!(!pending(cx, window), "drawing the notified view clears it");
+
+            window
+                .update(cx, |_, window, _| window.on_next_frame(|_, _| {}))
+                .unwrap();
+            assert!(pending(cx, window), "a next-frame callback owes a frame");
+            serve(cx, window);
+            assert!(!pending(cx, window), "running the callback clears it");
+
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            assert!(pending(cx, window), "a drawn frame owes its presentation");
+            serve(cx, window);
+            assert!(!pending(cx, window), "presenting the frame clears it");
         }
     }
 }
