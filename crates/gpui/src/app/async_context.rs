@@ -31,6 +31,19 @@ impl AsyncApp {
             .upgrade()
             .expect("app was released before async operation completed")
     }
+
+    /// Whether `window` is gone for good: it closed, or the app was released.
+    /// Shutdown closes every window before the app starts quitting. A window
+    /// that an update further up the stack holds is open.
+    pub(crate) fn window_closed(&self, window: AnyWindowHandle) -> bool {
+        let Some(app) = self.app.upgrade() else {
+            return true;
+        };
+        let Ok(app) = app.try_borrow_mut() else {
+            return false;
+        };
+        !app.windows.contains_key(window.window_id())
+    }
 }
 
 impl AppContext for AsyncApp {

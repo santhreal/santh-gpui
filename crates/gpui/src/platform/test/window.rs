@@ -164,6 +164,36 @@ impl TestWindow {
         self.0.lock().active_status_change_callback = Some(callback);
     }
 
+    pub fn simulate_hover_status_change(&self, hovered: bool) {
+        let mut lock = self.0.lock();
+        let Some(mut callback) = lock.hover_status_change_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback(hovered);
+        self.0.lock().hover_status_change_callback = Some(callback);
+    }
+
+    pub fn simulate_moved(&self) {
+        let mut lock = self.0.lock();
+        let Some(mut callback) = lock.moved_callback.take() else {
+            return;
+        };
+        drop(lock);
+        callback();
+        self.0.lock().moved_callback = Some(callback);
+    }
+
+    pub fn simulate_hit_test_window_control(&self) -> Option<WindowControlArea> {
+        let mut lock = self.0.lock();
+        let callback = lock.hit_test_window_control_callback.take();
+        drop(lock);
+        let mut callback = callback?;
+        let area = callback();
+        self.0.lock().hit_test_window_control_callback = Some(callback);
+        area
+    }
+
     pub fn simulate_appearance_change(&self, appearance: WindowAppearance) {
         let mut lock = self.0.lock();
         lock.appearance = appearance;
