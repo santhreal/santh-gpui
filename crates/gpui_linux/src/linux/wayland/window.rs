@@ -1727,9 +1727,9 @@ impl PlatformWindow for WaylandWindow {
 
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>> {
         let state = self.borrow();
-        state.display.as_ref().map(|(id, display)| {
+        state.display.as_ref().map(|(_, display)| {
             Rc::new(WaylandDisplay {
-                id: id.clone(),
+                protocol_id: display.protocol_id,
                 name: display.name.clone(),
                 bounds: display.bounds.to_pixels(state.scale),
             }) as Rc<dyn PlatformDisplay>

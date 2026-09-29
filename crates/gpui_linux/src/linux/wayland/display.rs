@@ -5,27 +5,26 @@ use std::{
 
 use anyhow::Context as _;
 use uuid::Uuid;
-use wayland_backend::client::ObjectId;
 
 use gpui::{Bounds, DisplayId, Pixels, PlatformDisplay};
 
 #[derive(Debug, Clone)]
 pub(crate) struct WaylandDisplay {
-    /// The ID of the wl_output object
-    pub id: ObjectId,
+    /// The wl_output's protocol-level id
+    pub protocol_id: u32,
     pub name: Option<String>,
     pub bounds: Bounds<Pixels>,
 }
 
 impl Hash for WaylandDisplay {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        self.id.hash(state);
+        self.protocol_id.hash(state);
     }
 }
 
 impl PlatformDisplay for WaylandDisplay {
     fn id(&self) -> DisplayId {
-        DisplayId::new(self.id.protocol_id() as u64)
+        DisplayId::new(self.protocol_id as u64)
     }
 
     fn uuid(&self) -> anyhow::Result<Uuid> {

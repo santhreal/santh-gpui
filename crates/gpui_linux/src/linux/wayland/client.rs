@@ -291,10 +291,11 @@ pub struct InProgressOutput {
 }
 
 impl InProgressOutput {
-    fn complete(&self) -> Option<Output> {
+    fn complete(&self, protocol_id: u32) -> Option<Output> {
         if let Some((position, size)) = self.position.zip(self.size) {
             let scale = self.scale.unwrap_or(1);
             Some(Output {
+                protocol_id,
                 name: self.name.clone(),
                 scale,
                 bounds: Bounds::new(position, size),
@@ -308,11 +309,31 @@ impl InProgressOutput {
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Output {
+    /// The wl_output's protocol-level id: the displays' `DisplayId` and
+    /// `primary_display`'s order, compositor-assigned in bind order.
+    pub protocol_id: u32,
     pub name: Option<String>,
     pub scale: i32,
     pub bounds: Bounds<DevicePixels>,
     pub subpixel: Option<wl_output::Subpixel>,
 }
+
+/// One `Output` as a `PlatformDisplay`: the shape `displays`,
+/// `display`, and `primary_display` share so they cannot drift.
+fn wayland_display(output: &Output) -> Rc<dyn PlatformDisplay> {
+    Rc::new(WaylandDisplay {
+        protocol_id: output.protocol_id,
+        name: output.name.clone(),
+        bounds: output.bounds.to_pixels(output.scale as f32),
+    })
+}
+
+/// `primary_display`'s stand-in for a Wayland primary output: the
+/// output the compositor advertised first, the lowest protocol id.
+fn first_output<'a>(outputs: impl Iterator<Item = &'a Output>) -> Option<&'a Output> {
+    outputs.min_by_key(|output| output.protocol_id)
+}
+
 
 pub(crate) struct WaylandClientState {
     serial_tracker: SerialTracker,
@@ -1006,14 +1027,8 @@ impl LinuxClient for WaylandClient {
         self.0
             .borrow()
             .outputs
-            .iter()
-            .map(|(id, output)| {
-                Rc::new(WaylandDisplay {
-                    id: id.clone(),
-                    name: output.name.clone(),
-                    bounds: output.bounds.to_pixels(output.scale as f32),
-                }) as Rc<dyn PlatformDisplay>
-            })
+            .values()
+            .map(wayland_display)
             .collect()
     }
 
@@ -1021,20 +1036,20 @@ impl LinuxClient for WaylandClient {
         self.0
             .borrow()
             .outputs
-            .iter()
-            .find_map(|(object_id, output)| {
-                (object_id.protocol_id() as u64 == u64::from(id)).then(|| {
-                    Rc::new(WaylandDisplay {
-                        id: object_id.clone(),
-                        name: output.name.clone(),
-                        bounds: output.bounds.to_pixels(output.scale as f32),
-                    }) as Rc<dyn PlatformDisplay>
-                })
+            .values()
+            .find_map(|output| {
+                (output.protocol_id as u64 == u64::from(id)).then(|| wayland_display(output))
             })
     }
 
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
-        None
+        // Wayland exports no primary-output notion; the convention this
+        // client settles on is the lowest protocol id, the first output
+        // the compositor advertised. Stable per session and, on a
+        // single-display session, always that display.
+        let state = self.0.borrow();
+        let output = first_output(state.outputs.values())?;
+        Some(wayland_display(output))
     }
 
     #[cfg(feature = "screen-capture")]
@@ -1545,7 +1560,7 @@ impl Dispatch<wl_output::WlOutput, ()> for WaylandClientStatePtr {
                 in_progress_output.size = Some(size(DevicePixels(width), DevicePixels(height)))
             }
             wl_output::Event::Done => {
-                if let Some(complete) = in_progress_output.complete() {
+                if let Some(complete) = in_progress_output.complete(output.id().protocol_id()) {
                     state.outputs.insert(output.id(), complete);
                 }
                 state.in_progress_outputs.remove(&output.id());
@@ -2958,6 +2973,67 @@ mod tests {
         fn commit_ime_state(&self) {
             self.commit_count.set(self.commit_count.get() + 1);
         }
+    }
+
+    fn output(protocol_id: u32, name: &str, scale: i32, size_px: (i32, i32)) -> Output {
+        Output {
+            protocol_id,
+            name: Some(name.to_string()),
+            scale,
+            bounds: Bounds::new(
+                point(DevicePixels(0), DevicePixels(0)),
+                size(DevicePixels(size_px.0), DevicePixels(size_px.1)),
+            ),
+            subpixel: None,
+        }
+    }
+
+    // primary_display's stand-in: the lowest protocol id, not the map's
+    // hash order and not None while any output exists.
+    #[test]
+    fn first_output_is_the_lowest_protocol_id() {
+        let outputs = [
+            output(42, "DP-1", 1, (1920, 1080)),
+            output(7, "HEADLESS-1", 1, (1280, 800)),
+            output(31, "HDMI-1", 1, (1920, 1080)),
+        ];
+        let first = first_output(outputs.iter()).expect("an output exists");
+        assert_eq!(first.name.as_deref(), Some("HEADLESS-1"));
+        assert_eq!(first.protocol_id, 7);
+    }
+
+    #[test]
+    fn first_output_of_none_is_none() {
+        let outputs: [Output; 0] = [];
+        assert!(first_output(outputs.iter()).is_none());
+    }
+
+    // An output completing its event burst keeps the bind-order
+    // protocol id the primary-output order and DisplayId use.
+    #[test]
+    fn complete_carries_the_protocol_id() {
+        let in_progress = InProgressOutput {
+            position: Some(point(DevicePixels(0), DevicePixels(0))),
+            size: Some(size(DevicePixels(1280), DevicePixels(800))),
+            scale: Some(1),
+            ..Default::default()
+        };
+        let complete = in_progress.complete(7).expect("geometry and mode done");
+        assert_eq!(complete.protocol_id, 7);
+        assert_eq!(complete.scale, 1);
+    }
+
+    // The display maps its output bounds to logical pixels at its
+    // scale: a 2x output of 1600x900 device px is 800x450 logical px,
+    // and its DisplayId is the wl_output's protocol id.
+    #[test]
+    fn display_bounds_are_scaled_to_logical_pixels() {
+        let display = wayland_display(&output(7, "HEADLESS-1", 2, (1600, 900)));
+        assert_eq!(display.id(), DisplayId::new(7));
+        assert_eq!(
+            display.bounds(),
+            Bounds::new(point(px(0.0), px(0.0)), size(px(800.0), px(450.0)))
+        );
     }
 
     #[test]
