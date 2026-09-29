@@ -21,13 +21,17 @@ fn etagere_point_to_device(point: etagere::Point) -> Point<DevicePixels> {
     }
 }
 
-pub struct WgpuAtlas(Mutex<WgpuAtlasState>);
+/// Sampled by the sprite shaders and written by the queue; the tests also
+/// copy tiles back out to check what the queue wrote.
+const ATLAS_TEXTURE_USAGES: wgpu::TextureUsages = if cfg!(test) {
+    wgpu::TextureUsages::TEXTURE_BINDING
+        .union(wgpu::TextureUsages::COPY_DST)
+        .union(wgpu::TextureUsages::COPY_SRC)
+} else {
+    wgpu::TextureUsages::TEXTURE_BINDING.union(wgpu::TextureUsages::COPY_DST)
+};
 
-struct PendingUpload {
-    id: AtlasTextureId,
-    bounds: Bounds<DevicePixels>,
-    data: Vec<u8>,
-}
+pub struct WgpuAtlas(Mutex<WgpuAtlasState>);
 
 struct WgpuAtlasState {
     device: Arc<wgpu::Device>,
@@ -36,7 +40,6 @@ struct WgpuAtlasState {
     color_texture_format: wgpu::TextureFormat,
     storage: WgpuAtlasStorage,
     tiles_by_key: FxHashMap<AtlasKey, AtlasTile>,
-    pending_uploads: Vec<PendingUpload>,
 }
 
 pub struct WgpuTextureInfo {
@@ -57,7 +60,6 @@ impl WgpuAtlas {
             color_texture_format,
             storage: WgpuAtlasStorage::default(),
             tiles_by_key: Default::default(),
-            pending_uploads: Vec::new(),
         }))
     }
 
@@ -67,11 +69,6 @@ impl WgpuAtlas {
             context.queue.clone(),
             context.color_texture_format(),
         )
-    }
-
-    pub fn before_frame(&self) {
-        let mut lock = self.0.lock();
-        lock.flush_uploads();
     }
 
     pub fn get_texture_info(&self, id: AtlasTextureId) -> WgpuTextureInfo {
@@ -88,7 +85,6 @@ impl WgpuAtlas {
         let mut lock = self.0.lock();
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
-        lock.pending_uploads.clear();
     }
 
     /// Handles device lost by clearing all textures and cached tiles.
@@ -100,7 +96,6 @@ impl WgpuAtlas {
         lock.color_texture_format = context.color_texture_format();
         lock.storage = WgpuAtlasStorage::default();
         lock.tiles_by_key.clear();
-        lock.pending_uploads.clear();
     }
 }
 
@@ -143,8 +138,6 @@ impl PlatformAtlas for WgpuAtlas {
             texture.allocator.deallocate(tile.tile_id.into());
             texture.decrement_ref_count();
             if texture.is_unreferenced() {
-                lock.pending_uploads
-                    .retain(|upload| upload.id != texture.id);
                 lock.storage[id.kind]
                     .free_list
                     .push(texture.id.index as usize);
@@ -209,7 +202,7 @@ impl WgpuAtlasState {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: ATLAS_TEXTURE_USAGES,
             view_formats: &[],
         });
 
@@ -247,48 +240,38 @@ impl WgpuAtlasState {
         }
     }
 
-    fn upload_texture(&mut self, id: AtlasTextureId, bounds: Bounds<DevicePixels>, bytes: &[u8]) {
-        let data = self
-            .storage
-            .get(id)
-            .map(|texture| swizzle_upload_data(bytes, texture.format))
-            .unwrap_or_else(|| bytes.to_vec());
-
-        self.pending_uploads
-            .push(PendingUpload { id, bounds, data });
-    }
-
-    fn flush_uploads(&mut self) {
-        for upload in self.pending_uploads.drain(..) {
-            let Some(texture) = self.storage.get(upload.id) else {
-                continue;
-            };
-            let bytes_per_pixel = texture.bytes_per_pixel();
-
-            self.queue.write_texture(
-                wgpu::TexelCopyTextureInfo {
-                    texture: &texture.texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d {
-                        x: upload.bounds.origin.x.0 as u32,
-                        y: upload.bounds.origin.y.0 as u32,
-                        z: 0,
-                    },
-                    aspect: wgpu::TextureAspect::All,
+    /// Writes a new tile's pixels through the queue, which copies them into
+    /// its staging memory: a BGRA tile reaches the GPU in that one copy.
+    /// The write lands before the next submission, the first that can
+    /// sample the tile.
+    fn upload_texture(&self, id: AtlasTextureId, bounds: Bounds<DevicePixels>, bytes: &[u8]) {
+        let Some(texture) = self.storage.get(id) else {
+            return;
+        };
+        let bytes_per_pixel = texture.bytes_per_pixel();
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture.texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: bounds.origin.x.0 as u32,
+                    y: bounds.origin.y.0 as u32,
+                    z: 0,
                 },
-                &upload.data,
-                wgpu::TexelCopyBufferLayout {
-                    offset: 0,
-                    bytes_per_row: Some(upload.bounds.size.width.0 as u32 * bytes_per_pixel as u32),
-                    rows_per_image: None,
-                },
-                wgpu::Extent3d {
-                    width: upload.bounds.size.width.0 as u32,
-                    height: upload.bounds.size.height.0 as u32,
-                    depth_or_array_layers: 1,
-                },
-            );
-        }
+                aspect: wgpu::TextureAspect::All,
+            },
+            &swizzle_upload_data(bytes, texture.format),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bounds.size.width.0 as u32 * bytes_per_pixel as u32),
+                rows_per_image: None,
+            },
+            wgpu::Extent3d {
+                width: bounds.size.width.0 as u32,
+                height: bounds.size.height.0 as u32,
+                depth_or_array_layers: 1,
+            },
+        );
     }
 }
 
@@ -385,114 +368,18 @@ impl WgpuAtlasTexture {
     }
 }
 
-fn swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Vec<u8> {
+fn swizzle_upload_data(bytes: &[u8], format: wgpu::TextureFormat) -> Cow<'_, [u8]> {
     match format {
         wgpu::TextureFormat::Rgba8Unorm => {
             let mut data = bytes.to_vec();
             for pixel in data.chunks_exact_mut(4) {
                 pixel.swap(0, 2);
             }
-            data
+            Cow::Owned(data)
         }
-        _ => bytes.to_vec(),
+        _ => Cow::Borrowed(bytes),
     }
 }
 
 #[cfg(all(test, not(target_family = "wasm")))]
-mod tests {
-    use super::*;
-    use gpui::{ImageId, RenderImageParams};
-    use std::sync::Arc;
-
-    fn test_device_and_queue() -> anyhow::Result<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
-        let context =
-            crate::WgpuContext::new_surfaceless(crate::WgpuContext::surfaceless_instance(), None)?;
-        Ok((Arc::clone(&context.device), Arc::clone(&context.queue)))
-    }
-
-    #[test]
-    fn before_frame_skips_uploads_for_removed_texture() -> anyhow::Result<()> {
-        let (device, queue) = test_device_and_queue()?;
-
-        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
-        let key = AtlasKey::Image(RenderImageParams {
-            image_id: ImageId(1),
-            frame_index: 0,
-        });
-        let size = Size {
-            width: DevicePixels(1),
-            height: DevicePixels(1),
-        };
-        let mut build = || Ok(Some((size, Cow::Owned(vec![0, 0, 0, 255]))));
-
-        // Regression test: before the fix, this panicked in flush_uploads
-        atlas
-            .get_or_insert_with(&key, &mut build)?
-            .expect("tile should be created");
-        atlas.remove(&key);
-        atlas.before_frame();
-        Ok(())
-    }
-
-    #[test]
-    fn remove_deallocates_tile_space_for_reuse() -> anyhow::Result<()> {
-        let (device, queue) = test_device_and_queue()?;
-        let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
-
-        let small = Size {
-            width: DevicePixels(64),
-            height: DevicePixels(64),
-        };
-        let big = Size {
-            width: DevicePixels(700),
-            height: DevicePixels(700),
-        };
-
-        let make_key = |image_id: usize| {
-            AtlasKey::Image(RenderImageParams {
-                image_id: ImageId(image_id),
-                frame_index: 0,
-            })
-        };
-        let insert = |key: &AtlasKey, size: Size<DevicePixels>| {
-            let byte_count = (size.width.0 as usize) * (size.height.0 as usize) * 4;
-            atlas
-                .get_or_insert_with(key, &mut || {
-                    Ok(Some((size, Cow::Owned(vec![0u8; byte_count]))))
-                })
-                .expect("allocation should succeed")
-                .expect("callback returns Some")
-        };
-
-        let keeper_key = make_key(1);
-        let big_key_a = make_key(2);
-        let big_key_b = make_key(3);
-
-        let keeper_tile = insert(&keeper_key, small);
-        let tile_a = insert(&big_key_a, big);
-        assert_eq!(keeper_tile.texture_id, tile_a.texture_id);
-
-        atlas.remove(&big_key_a);
-        let tile_b = insert(&big_key_b, big);
-        assert_eq!(tile_b.texture_id, keeper_tile.texture_id);
-        Ok(())
-    }
-
-    #[test]
-    fn swizzle_upload_data_preserves_bgra_uploads() {
-        let input = vec![0x10, 0x20, 0x30, 0x40];
-        assert_eq!(
-            swizzle_upload_data(&input, wgpu::TextureFormat::Bgra8Unorm),
-            input
-        );
-    }
-
-    #[test]
-    fn swizzle_upload_data_converts_bgra_to_rgba() {
-        let input = vec![0x10, 0x20, 0x30, 0x40, 0xAA, 0xBB, 0xCC, 0xDD];
-        assert_eq!(
-            swizzle_upload_data(&input, wgpu::TextureFormat::Rgba8Unorm),
-            vec![0x30, 0x20, 0x10, 0x40, 0xCC, 0xBB, 0xAA, 0xDD]
-        );
-    }
-}
+mod tests;

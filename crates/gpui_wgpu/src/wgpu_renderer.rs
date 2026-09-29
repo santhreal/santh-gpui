@@ -1325,8 +1325,6 @@ impl WgpuRenderer {
             self.failed_frame_count = 0;
         }
 
-        self.atlas.before_frame();
-
         enum AcquiredFrame {
             Surface(wgpu::SurfaceTexture),
             Offscreen,
