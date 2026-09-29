@@ -2,7 +2,9 @@
 
 use std::time::Duration;
 
-use crate::{Bounds, Pixels, Render, TestAppContext, WindowHandle, motion::SpringConfig, point, px};
+use crate::{
+    Bounds, Pixels, Render, TestAppContext, WindowHandle, motion::SpringConfig, point, px,
+};
 
 /// Clock time between simulated frames.
 pub(crate) const FRAME: Duration = Duration::from_millis(16);
@@ -91,7 +93,19 @@ pub(crate) fn spring_at(
     target: f32,
     frames: u32,
 ) -> (f32, f32) {
-    let state = spring.evaluate(start, velocity, target, (FRAME * frames).as_secs_f32());
+    spring_after(spring, start, velocity, target, FRAME * frames)
+}
+
+/// The value and velocity of `spring` released from `start` at `velocity`
+/// toward `target`, `elapsed` later.
+pub(crate) fn spring_after(
+    spring: SpringConfig,
+    start: f32,
+    velocity: f32,
+    target: f32,
+    elapsed: Duration,
+) -> (f32, f32) {
+    let state = spring.evaluate(start, velocity, target, elapsed.as_secs_f32());
     (state.position, state.velocity)
 }
 

@@ -4437,8 +4437,10 @@ impl ScrollHandle {
     /// `smooth` is set. A line wheel tick, as from a mouse wheel, moves the
     /// target offset, clamped to the content, and the offset follows the
     /// target on [`WHEEL_SPRING`](crate::WHEEL_SPRING), one frame per display
-    /// frame; a tick during the motion moves the target again and keeps the
-    /// motion's velocity. A pixel wheel event, as from a touchpad, applies at
+    /// frame. The first frame of a motion from rest shows the spring one 60 Hz
+    /// frame into the motion, however soon after the tick it draws. A tick
+    /// during the motion moves the target again and keeps the motion's
+    /// velocity. A pixel wheel event, as from a touchpad, applies at
     /// once and ends the motion, and so does [`Self::set_offset`] or any other
     /// write to the offset. Under reduced motion every wheel event applies at
     /// once. Off by default. Turning it off ends a motion where it is.

@@ -1,5 +1,7 @@
 //! The clock motion values sample.
 
+use std::time::Duration;
+
 use scheduler::Instant;
 
 use super::Timestamp;
@@ -17,6 +19,14 @@ impl Timestamp for FrameInstant {
     #[inline]
     fn seconds_since(self, earlier: Self) -> f32 {
         self.0.saturating_duration_since(earlier.0).as_secs_f32()
+    }
+}
+
+impl FrameInstant {
+    /// The instant `duration` before this one, or this one where the clock
+    /// does not reach that far back.
+    pub(crate) fn before(self, duration: Duration) -> Self {
+        Self(self.0.checked_sub(duration).unwrap_or(self.0))
     }
 }
 

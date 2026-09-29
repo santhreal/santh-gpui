@@ -678,9 +678,11 @@ impl ListState {
     /// Eases line wheel scrolling when `smooth` is set. A line wheel tick, as
     /// from a mouse wheel, moves the target scroll position, clamped to the
     /// content, and the list follows the target on
-    /// [`WHEEL_SPRING`](crate::WHEEL_SPRING), one frame per display frame; a
-    /// tick during the motion moves the target again and keeps the motion's
-    /// velocity. A pixel wheel event, as from a touchpad, applies at once and
+    /// [`WHEEL_SPRING`](crate::WHEEL_SPRING), one frame per display frame.
+    /// The first frame of a motion from rest shows the spring one 60 Hz frame
+    /// into the motion, however soon after the tick it draws. A tick during
+    /// the motion moves the target again and keeps the motion's velocity. A
+    /// pixel wheel event, as from a touchpad, applies at once and
     /// ends the motion, and so does any other change of the scroll position,
     /// such as [`Self::scroll_to`]. A tick up stops following the tail at
     /// once, and a motion that lands at the end resumes it, as a pixel scroll

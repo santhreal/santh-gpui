@@ -1,25 +1,30 @@
 //! Smooth wheel scrolling sampled frame by frame on the test clock.
 //!
-//! WHY: closes the classes "a line wheel tick jumps instead of easing", "a
-//! tick during a motion restarts it from rest or drops the earlier ticks", "a
-//! touchpad event is delayed or offset by a pending motion", "a motion runs
-//! past the end of the content", "a scroll state that did not opt in changes
-//! behavior", "reduced motion still eases", "a resting scroll state keeps
-//! requesting frames", and "a tick up leaves a list following its tail, or a
-//! motion to the end leaves it detached". Offsets are compared with the
+//! WHY: closes the classes "a line wheel tick jumps instead of easing", "the
+//! frame a tick from rest draws repeats the frame before it, so the motion
+//! shows a frame late", "ticks from rest before the motion's first frame drop
+//! all but one", "a write before a motion's first frame lets the motion
+//! resume", "a tick during a motion restarts it from rest or drops the earlier
+//! ticks", "a touchpad event is delayed or offset by a pending motion", "a
+//! motion runs past the end of the content", "a scroll state that did not opt
+//! in changes behavior", "reduced motion still eases", "a resting scroll state
+//! keeps requesting frames", and "a tick up leaves a list following its tail,
+//! or a motion to the end leaves it detached". Offsets are compared with the
 //! closed-form spring at each frame instant for a scrollable div, a uniform
 //! list and a list. Not caught: a scrollbar painted outside the scroll
 //! container from the offset lies outside the declared damage.
 
+use std::cell::Cell;
+
 use super::*;
 use crate::{
     Context, FollowMode, InputEvent as _, InteractiveElement as _, IntoElement, ListAlignment,
-    ListState, ParentElement as _, Render, ScrollHandle, ScrollWheelEvent,
+    ListState, ParentElement as _, PlatformInput, Render, ScrollHandle, ScrollWheelEvent,
     StatefulInteractiveElement as _, Styled as _, TestAppContext, UniformListScrollHandle,
     WindowHandle, div,
     elements::motion_harness::{
-        MAX_FRAMES, contains, dilated, idle_requests, last_damage, next_frame, painted_bounds,
-        spring_at, update_view,
+        FRAME, MAX_FRAMES, contains, dilated, idle_requests, last_damage, next_frame,
+        painted_bounds, spring_after, spring_at, update_view,
     },
     list,
     motion::MotionPolicy,
@@ -70,9 +75,11 @@ struct Rows(ListState);
 
 impl Render for Rows {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        list(self.0.clone(), |_, _, _| div().h(px(ROW)).w_full().into_any_element())
-            .w(px(VIEWPORT))
-            .h(px(VIEWPORT))
+        list(self.0.clone(), |_, _, _| {
+            div().h(px(ROW)).w_full().into_any_element()
+        })
+        .w(px(VIEWPORT))
+        .h(px(VIEWPORT))
     }
 }
 
@@ -115,15 +122,38 @@ fn line_height<V: 'static>(window: &WindowHandle<V>, cx: &mut TestAppContext) ->
         .unwrap()
 }
 
-/// Dispatches a wheel event over the scroll state and draws.
-fn wheel<V: 'static>(window: &WindowHandle<V>, cx: &mut TestAppContext, delta: ScrollDelta) {
-    let event = ScrollWheelEvent {
+fn wheel_event(delta: ScrollDelta) -> PlatformInput {
+    ScrollWheelEvent {
         position: point(px(50.0), px(50.0)),
         delta,
         ..Default::default()
-    };
-    cx.test_window(**window)
-        .simulate_input(event.to_platform_input());
+    }
+    .to_platform_input()
+}
+
+/// Dispatches a wheel event over the scroll state and draws.
+fn wheel<V: 'static>(window: &WindowHandle<V>, cx: &mut TestAppContext, delta: ScrollDelta) {
+    cx.test_window(**window).simulate_input(wheel_event(delta));
+    cx.run_until_parked();
+}
+
+/// Dispatches wheel events with `deltas` over the scroll state and runs
+/// `then`, all in one update, and draws once after it, as a platform that
+/// delivers several events between two frames does.
+fn wheel_then<V: 'static>(
+    window: &WindowHandle<V>,
+    cx: &mut TestAppContext,
+    deltas: &[ScrollDelta],
+    then: impl FnOnce(),
+) {
+    window
+        .update(cx, |_, window, cx| {
+            for delta in deltas {
+                window.dispatch_event(wheel_event(*delta), cx);
+            }
+            then();
+        })
+        .unwrap();
     cx.run_until_parked();
 }
 
@@ -146,21 +176,27 @@ fn run_to_rest<V: 'static>(
     }
 }
 
-/// Asserts that `frames`, one per display frame after a tick from rest at
-/// `from`, follow [`WHEEL_SPRING`] to `to` and end on `to`.
-fn assert_eases(frames: &[(f32, Option<Bounds<Pixels>>)], from: f32, to: f32) {
+/// Asserts that `first`, the value in the frame a tick from rest at `from`
+/// draws at once, and `frames`, one per display frame after it, follow
+/// [`WHEEL_SPRING`] toward `to` from [`WHEEL_LEAD`] into the motion, and end on
+/// `to`.
+fn assert_eases(first: f32, frames: &[(f32, Option<Bounds<Pixels>>)], from: f32, to: f32) {
     assert!(frames.len() > 5, "the motion took {} frames", frames.len());
-    for (ix, (value, _)) in frames.iter().enumerate() {
-        let (remaining, _) = spring_at(WHEEL_SPRING, to - from, 0.0, 0.0, ix as u32 + 1);
+    let values = std::iter::once(first).chain(frames.iter().map(|(value, _)| *value));
+    for (ix, value) in values.enumerate() {
+        let elapsed = WHEEL_LEAD + FRAME * ix as u32;
+        let (remaining, _) = spring_after(WHEEL_SPRING, to - from, 0.0, 0.0, elapsed);
         let expected = to - remaining;
         assert!(
             (value - expected).abs() <= TOLERANCE,
-            "frame {}: at {value}, the spring at {expected}",
-            ix + 1
+            "frame {ix} after the tick: at {value}, the spring at {expected}"
         );
     }
     let (last, _) = frames.last().unwrap();
-    assert!((last - to).abs() <= 1e-3, "the motion ends on {to}, not {last}");
+    assert!(
+        (last - to).abs() <= 1e-3,
+        "the motion ends on {to}, not {last}"
+    );
 }
 
 #[gpui::test]
@@ -168,11 +204,15 @@ fn a_line_tick_eases_a_scroll_handle_along_the_spring_to_its_target(cx: &mut Tes
     let (handle, window) = scroller(cx, true);
     let target = -3.0 * line_height(&window, cx);
     wheel(&window, cx, lines(-3.0));
-    assert_eq!(handle.offset().y, px(0.0), "the tick moves nothing at once");
+    let first = handle.offset().y.0;
+    assert!(
+        first < 0.0,
+        "the frame the tick draws takes the motion's first step"
+    );
 
     let viewport = painted_bounds(&window, cx, SCROLLER).unwrap();
     let frames = run_to_rest(&window, cx, || handle.offset().y.0);
-    assert_eases(&frames, 0.0, target);
+    assert_eases(first, &frames, 0.0, target);
     for (ix, (_, damage)) in frames.iter().enumerate() {
         let damage = damage.expect("a frame of the motion repaints a region");
         assert!(
@@ -181,7 +221,11 @@ fn a_line_tick_eases_a_scroll_handle_along_the_spring_to_its_target(cx: &mut Tes
             ix + 1
         );
     }
-    assert_eq!(idle_requests(&window, cx), 0, "at rest, no frame is requested");
+    assert_eq!(
+        idle_requests(&window, cx),
+        0,
+        "at rest, no frame is requested"
+    );
 }
 
 #[gpui::test]
@@ -191,20 +235,24 @@ fn consecutive_ticks_accumulate_the_target_and_keep_the_velocity(cx: &mut TestAp
     let mut offsets = vec![handle.offset().y.0];
 
     wheel(&window, cx, lines(-1.0));
+    offsets.push(handle.offset().y.0);
     for _ in 0..2 {
         next_frame(&window, cx);
         offsets.push(handle.offset().y.0);
     }
-    let (remaining, velocity) = spring_at(WHEEL_SPRING, -line, 0.0, 0.0, 2);
+    let (remaining, velocity) = spring_after(WHEEL_SPRING, -line, 0.0, 0.0, WHEEL_LEAD + FRAME * 2);
+    // A tick during a motion moves the springs at the tick: the frame it
+    // draws at once samples them there and moves nothing.
     wheel(&window, cx, lines(-1.0));
+    assert_eq!(handle.offset().y.0, offsets[3]);
     next_frame(&window, cx);
     offsets.push(handle.offset().y.0);
     let (continued, _) = spring_at(WHEEL_SPRING, remaining - line, velocity, 0.0, 1);
     let expected = -2.0 * line - continued;
     assert!(
-        (offsets[3] - expected).abs() <= TOLERANCE,
+        (offsets[4] - expected).abs() <= TOLERANCE,
         "the second tick continues at the spring's velocity: at {}, expected {expected}",
-        offsets[3]
+        offsets[4]
     );
 
     // The test draws a tick at once, between display frames, so its frame
@@ -229,6 +277,45 @@ fn consecutive_ticks_accumulate_the_target_and_keep_the_velocity(cx: &mut TestAp
 }
 
 #[gpui::test]
+fn ticks_before_the_first_frame_of_a_motion_start_it_together(cx: &mut TestAppContext) {
+    let (handle, window) = scroller(cx, true);
+    let target = -4.0 * line_height(&window, cx);
+    let before_draw = Cell::new((px(1.0), 0.0));
+    wheel_then(&window, cx, &[lines(-1.0), lines(-3.0)], || {
+        before_draw.set((handle.offset().y, handle.target_offset().y.0));
+    });
+    let (offset, moved_to) = before_draw.get();
+    assert_eq!(offset, px(0.0), "no frame drew between the ticks");
+    assert!(
+        (moved_to - target).abs() <= 1e-3,
+        "both ticks move the target: to {moved_to}, expected {target}"
+    );
+    let first = handle.offset().y.0;
+
+    let frames = run_to_rest(&window, cx, || handle.offset().y.0);
+    assert_eases(first, &frames, 0.0, target);
+}
+
+#[gpui::test]
+fn a_write_before_the_first_frame_of_a_motion_ends_it(cx: &mut TestAppContext) {
+    let (handle, window) = scroller(cx, true);
+    wheel_then(&window, cx, &[lines(-3.0)], || {
+        handle.set_offset(point(px(0.0), px(-10.0)))
+    });
+    assert_eq!(handle.offset().y, px(-10.0), "the write ends the motion");
+    assert_eq!(handle.target_offset().y, px(-10.0));
+    for _ in 0..3 {
+        next_frame(&window, cx);
+        assert_eq!(handle.offset().y, px(-10.0), "no motion resumes");
+    }
+    assert_eq!(
+        idle_requests(&window, cx),
+        0,
+        "at rest, no frame is requested"
+    );
+}
+
+#[gpui::test]
 fn a_pixel_event_mid_motion_applies_exactly_and_ends_the_motion(cx: &mut TestAppContext) {
     let (handle, window) = scroller(cx, true);
     let target = -3.0 * line_height(&window, cx);
@@ -237,18 +324,33 @@ fn a_pixel_event_mid_motion_applies_exactly_and_ends_the_motion(cx: &mut TestApp
         next_frame(&window, cx);
     }
     let painted = handle.offset().y;
-    assert!(painted.0 < 0.0 && painted.0 > target, "mid-motion at {painted:?}");
+    assert!(
+        painted.0 < 0.0 && painted.0 > target,
+        "mid-motion at {painted:?}"
+    );
 
     // A touchpad touch arrives as a pixel event with no distance.
     wheel(&window, cx, ScrollDelta::Pixels(point(px(0.0), px(0.0))));
     next_frame(&window, cx);
-    assert_eq!(handle.offset().y, painted, "a touch ends the motion where it is");
+    assert_eq!(
+        handle.offset().y,
+        painted,
+        "a touch ends the motion where it is"
+    );
 
     wheel(&window, cx, ScrollDelta::Pixels(point(px(0.0), px(-7.0))));
-    assert_eq!(handle.offset().y, painted - px(7.0), "the pixel event applies at once");
+    assert_eq!(
+        handle.offset().y,
+        painted - px(7.0),
+        "the pixel event applies at once"
+    );
     next_frame(&window, cx);
     assert_eq!(handle.offset().y, painted - px(7.0), "no motion resumes");
-    assert_eq!(idle_requests(&window, cx), 0, "at rest, no frame is requested");
+    assert_eq!(
+        idle_requests(&window, cx),
+        0,
+        "at rest, no frame is requested"
+    );
 }
 
 #[gpui::test]
@@ -257,9 +359,10 @@ fn a_tick_past_the_end_clamps_the_target_to_the_content(cx: &mut TestAppContext)
     handle.set_offset(point(px(0.0), px(30.0 - MAX)));
     update_view(&window, cx, |_| {});
     wheel(&window, cx, lines(-10.0));
+    let first = handle.offset().y.0;
 
     let frames = run_to_rest(&window, cx, || handle.offset().y.0);
-    assert_eases(&frames, 30.0 - MAX, -MAX);
+    assert_eases(first, &frames, 30.0 - MAX, -MAX);
     assert!(
         frames.iter().all(|(y, _)| *y >= -MAX),
         "the motion stays within the content: {frames:?}"
@@ -292,8 +395,16 @@ fn the_target_offset_holds_where_a_motion_lands_for_every_frame_of_it(cx: &mut T
     assert_eq!(handle.target_offset(), handle.offset(), "at rest");
 
     wheel(&window, cx, lines(-3.0));
-    assert_eq!(handle.offset().y, px(0.0));
-    assert_eq!(handle.target_offset().y.0, -3.0 * line, "a tick moves the target at once");
+    let first = handle.offset().y.0;
+    assert!(
+        first < 0.0 && first > -3.0 * line,
+        "the frame the tick draws takes the motion's first step: at {first}"
+    );
+    assert_eq!(
+        handle.target_offset().y.0,
+        -3.0 * line,
+        "a tick moves the target at once"
+    );
     next_frame(&window, cx);
     wheel(&window, cx, lines(-2.0));
     let target = -5.0 * line;
@@ -327,7 +438,11 @@ fn the_target_offset_holds_where_a_motion_lands_for_every_frame_of_it(cx: &mut T
 
     let (handle, window) = scroller(cx, false);
     wheel(&window, cx, lines(-3.0));
-    assert_eq!(handle.target_offset(), handle.offset(), "without smooth wheel");
+    assert_eq!(
+        handle.target_offset(),
+        handle.offset(),
+        "without smooth wheel"
+    );
 }
 
 #[gpui::test]
@@ -338,22 +453,30 @@ fn a_line_tick_eases_a_uniform_list(cx: &mut TestAppContext) {
     let target = -3.0 * line_height(&window, cx);
     let offset = || handle.0.borrow().base_handle.offset().y.0;
     wheel(&window, cx, lines(-3.0));
-    assert_eq!(offset(), 0.0, "the tick moves nothing at once");
+    let first = offset();
 
     let frames = run_to_rest(&window, cx, offset);
-    assert_eases(&frames, 0.0, target);
-    assert_eq!(idle_requests(&window, cx), 0, "at rest, no frame is requested");
+    assert_eases(first, &frames, 0.0, target);
+    assert_eq!(
+        idle_requests(&window, cx),
+        0,
+        "at rest, no frame is requested"
+    );
 }
 
 #[gpui::test]
 fn a_line_tick_eases_a_list(cx: &mut TestAppContext) {
     let (state, window) = rows(cx, false);
     wheel(&window, cx, lines(-3.0));
-    assert_eq!(list_top(&state), 0.0, "the tick moves nothing at once");
+    let first = list_top(&state);
 
     let frames = run_to_rest(&window, cx, || list_top(&state));
-    assert_eases(&frames, 0.0, 60.0);
-    assert_eq!(idle_requests(&window, cx), 0, "at rest, no frame is requested");
+    assert_eases(first, &frames, 0.0, 60.0);
+    assert_eq!(
+        idle_requests(&window, cx),
+        0,
+        "at rest, no frame is requested"
+    );
 }
 
 #[gpui::test]
@@ -366,12 +489,17 @@ fn a_tick_up_detaches_a_following_list_and_a_motion_to_the_end_reattaches_it(
 
     wheel(&window, cx, lines(2.0));
     assert!(!state.is_following_tail(), "a tick up detaches at once");
+    let first = list_top(&state);
     let frames = run_to_rest(&window, cx, || list_top(&state));
-    assert_eases(&frames, MAX, MAX - 40.0);
-    assert!(!state.is_following_tail(), "the list stays detached above the end");
+    assert_eases(first, &frames, MAX, MAX - 40.0);
+    assert!(
+        !state.is_following_tail(),
+        "the list stays detached above the end"
+    );
 
     wheel(&window, cx, lines(-5.0));
+    let first = list_top(&state);
     let frames = run_to_rest(&window, cx, || list_top(&state));
-    assert_eases(&frames, MAX - 40.0, MAX);
+    assert_eases(first, &frames, MAX - 40.0, MAX);
     assert!(state.is_following_tail(), "landing on the end reattaches");
 }
