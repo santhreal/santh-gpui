@@ -1340,6 +1340,11 @@ pub struct Window {
     default_prevented: bool,
     mouse_position: Point<Pixels>,
     mouse_hit_test: HitTest,
+    /// The pointer has left the window since its last in-window event.
+    /// `mouse_position` still holds the last in-window position (a Wayland
+    /// leave reports none), so the hit test is empty until the pointer
+    /// returns rather than re-hovering what it left.
+    pointer_left: bool,
     modifiers: Modifiers,
     capslock: Capslock,
     scale_factor: f32,
@@ -2038,6 +2043,7 @@ impl Window {
             default_prevented: true,
             mouse_position,
             mouse_hit_test: HitTest::default(),
+            pointer_left: false,
             modifiers,
             capslock,
             scale_factor,
@@ -3561,7 +3567,7 @@ impl Window {
             tooltip_element = self.prepaint_tooltip(cx);
         }
 
-        self.mouse_hit_test = self.next_frame.hit_test(self.mouse_position);
+        self.mouse_hit_test = self.pointer_hit_test(&self.next_frame);
 
         // Now actually paint the elements.
         self.invalidator.set_phase(DrawPhase::Paint);
@@ -5653,17 +5659,17 @@ impl Window {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
             PlatformInput::MouseMove(mouse_move) => {
-                self.mouse_position = mouse_move.position;
+                self.pointer_at(mouse_move.position);
                 self.modifiers = mouse_move.modifiers;
                 PlatformInput::MouseMove(mouse_move)
             }
             PlatformInput::MouseDown(mouse_down) => {
-                self.mouse_position = mouse_down.position;
+                self.pointer_at(mouse_down.position);
                 self.modifiers = mouse_down.modifiers;
                 PlatformInput::MouseDown(mouse_down)
             }
             PlatformInput::MouseUp(mouse_up) => {
-                self.mouse_position = mouse_up.position;
+                self.pointer_at(mouse_up.position);
                 self.modifiers = mouse_up.modifiers;
                 PlatformInput::MouseUp(mouse_up)
             }
@@ -5671,6 +5677,7 @@ impl Window {
                 PlatformInput::MousePressure(mouse_pressure)
             }
             PlatformInput::MouseExited(mouse_exited) => {
+                self.pointer_left = true;
                 self.modifiers = mouse_exited.modifiers;
                 PlatformInput::MouseExited(mouse_exited)
             }
@@ -5680,12 +5687,12 @@ impl Window {
                 PlatformInput::ModifiersChanged(modifiers_changed)
             }
             PlatformInput::ScrollWheel(scroll_wheel) => {
-                self.mouse_position = scroll_wheel.position;
+                self.pointer_at(scroll_wheel.position);
                 self.modifiers = scroll_wheel.modifiers;
                 PlatformInput::ScrollWheel(scroll_wheel)
             }
             PlatformInput::Pinch(pinch) => {
-                self.mouse_position = pinch.position;
+                self.pointer_at(pinch.position);
                 self.modifiers = pinch.modifiers;
                 PlatformInput::Pinch(pinch)
             }
@@ -5693,7 +5700,7 @@ impl Window {
             // to internal drag and drop events.
             PlatformInput::FileDrop(file_drop) => match file_drop {
                 FileDropEvent::Entered { position, paths } => {
-                    self.mouse_position = position;
+                    self.pointer_at(position);
                     let source_window = self.handle.window_id();
                     if !cx.restore_platform_drag(source_window) && cx.active_drag.is_none() {
                         cx.active_drag = Some(AnyDrag {
@@ -5711,7 +5718,7 @@ impl Window {
                     })
                 }
                 FileDropEvent::Pending { position } => {
-                    self.mouse_position = position;
+                    self.pointer_at(position);
                     PlatformInput::MouseMove(MouseMoveEvent {
                         position,
                         pressed_button: Some(MouseButton::Left),
@@ -5720,7 +5727,7 @@ impl Window {
                 }
                 FileDropEvent::Submit { position } => {
                     cx.activate(true);
-                    self.mouse_position = position;
+                    self.pointer_at(position);
                     PlatformInput::MouseUp(MouseUpEvent {
                         button: MouseButton::Left,
                         position,
@@ -5826,12 +5833,12 @@ impl Window {
     fn dispatch_recognized_touch_gesture(&mut self, gesture: RecognizedTouchGesture, cx: &mut App) {
         match gesture {
             RecognizedTouchGesture::Scroll(scroll_wheel) => {
-                self.mouse_position = scroll_wheel.position;
+                self.pointer_at(scroll_wheel.position);
                 cx.propagate_event = true;
                 self.dispatch_mouse_event(&scroll_wheel, cx);
             }
             RecognizedTouchGesture::Tap { down, up } => {
-                self.mouse_position = up.position;
+                self.pointer_at(up.position);
                 cx.propagate_event = true;
                 self.dispatch_mouse_event(&down, cx);
                 cx.propagate_event = true;
@@ -5851,8 +5858,26 @@ impl Window {
         });
     }
 
+    /// Record an input event's in-window pointer position. Every input that
+    /// carries one comes through here, so the pointer counts as back in the
+    /// window after a `MouseExited`.
+    fn pointer_at(&mut self, position: Point<Pixels>) {
+        self.mouse_position = position;
+        self.pointer_left = false;
+    }
+
+    /// The hitboxes under the pointer in `frame`; none once the pointer has
+    /// left the window.
+    fn pointer_hit_test(&self, frame: &Frame) -> HitTest {
+        if self.pointer_left {
+            HitTest::default()
+        } else {
+            frame.hit_test(self.mouse_position)
+        }
+    }
+
     fn dispatch_mouse_event(&mut self, event: &dyn Any, cx: &mut App) {
-        let hit_test = self.rendered_frame.hit_test(self.mouse_position());
+        let hit_test = self.pointer_hit_test(&self.rendered_frame);
         if hit_test != self.mouse_hit_test {
             self.mouse_hit_test = hit_test;
             self.reset_cursor_style(cx);
@@ -7588,9 +7613,10 @@ mod tests {
         AnyWindowHandle, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
         InputEvent as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-        MouseMoveEvent, ParentElement, Pixels, Point, Render, RequestFrameOptions,
-        StatefulInteractiveElement as _, Styled, TestAppContext, Window, WindowAppearance,
-        WindowOptions, canvas, div, point, px, size,
+        MouseExitEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PinchEvent, Pixels,
+        PlatformInput, Point, Render, RequestFrameOptions, ScrollWheelEvent,
+        StatefulInteractiveElement as _, Styled, TestAppContext, TouchEvent, TouchPhase, Window,
+        WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
     use crate::{
         Background, BorderStyle, ContentMask, Corners, Edges, Hsla, Quad, ScaledPixels,
@@ -7865,6 +7891,156 @@ mod tests {
                 ));
             })
             .unwrap();
+    }
+
+    struct HitboxView;
+
+    impl Render for HitboxView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div().id("target").size_full().on_click(|_, _, _| {})
+        }
+    }
+
+    /// From a `MouseExited` until the next input that carries an in-window
+    /// position, the hit test at the pointer is empty at every draw, whatever
+    /// position the exit reported: a Wayland leave reports the last in-window
+    /// point, so hit-testing `mouse_position` re-hovered what the pointer
+    /// left and an element's hover never cleared. Each positioned input then
+    /// puts the pointer back. Does not cover a platform that never reports
+    /// the exit, or an X11 window that moves under a still pointer: the enter
+    /// carries no motion, so nothing shows hovered until the pointer moves.
+    #[gpui::test]
+    fn pointer_hit_test_is_empty_from_exit_until_positioned_input(cx: &mut TestAppContext) {
+        let inside = point(px(10.), px(10.));
+        let move_in = MouseMoveEvent {
+            position: inside,
+            ..Default::default()
+        }
+        .to_platform_input();
+        let paths = || ExternalPaths([PathBuf::from("/a.png")].into_iter().collect());
+        let touch = |phase, y| TouchEvent {
+            phase,
+            position: point(px(10.), px(y)),
+            ..Default::default()
+        };
+        let reentries: [(&str, Vec<PlatformInput>); 10] = [
+            ("mouse move", vec![move_in.clone()]),
+            (
+                "mouse down",
+                vec![
+                    MouseDownEvent {
+                        position: inside,
+                        button: MouseButton::Left,
+                        click_count: 1,
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                ],
+            ),
+            (
+                "mouse up",
+                vec![
+                    MouseUpEvent {
+                        position: inside,
+                        button: MouseButton::Left,
+                        click_count: 1,
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                ],
+            ),
+            (
+                "scroll wheel",
+                vec![
+                    ScrollWheelEvent {
+                        position: inside,
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                ],
+            ),
+            (
+                "pinch",
+                vec![
+                    PinchEvent {
+                        position: inside,
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                ],
+            ),
+            (
+                "touch tap",
+                vec![
+                    touch(TouchPhase::Started, 10.).to_platform_input(),
+                    touch(TouchPhase::Ended, 10.).to_platform_input(),
+                ],
+            ),
+            (
+                "touch pan",
+                vec![
+                    touch(TouchPhase::Started, 10.).to_platform_input(),
+                    touch(TouchPhase::Moved, 40.).to_platform_input(),
+                    touch(TouchPhase::Ended, 40.).to_platform_input(),
+                ],
+            ),
+            (
+                "file drop pending",
+                vec![FileDropEvent::Pending { position: inside }.to_platform_input()],
+            ),
+            (
+                "file drop submit",
+                vec![FileDropEvent::Submit { position: inside }.to_platform_input()],
+            ),
+            (
+                "file drop entered",
+                vec![
+                    FileDropEvent::Entered {
+                        position: inside,
+                        paths: paths(),
+                    }
+                    .to_platform_input(),
+                ],
+            ),
+        ];
+        let exits = [inside, point(px(-5.), px(10.)), point(px(10.), px(5000.))];
+        for (name, reentry) in reentries {
+            for exit_at in exits {
+                let window: AnyWindowHandle = cx.add_window(|_, _| HitboxView).into();
+                let hovered = |cx: &mut TestAppContext| {
+                    cx.update_window(window, |_, window, cx| {
+                        window.draw(cx).clear(cx);
+                        !window.mouse_hit_test.ids.is_empty()
+                    })
+                    .unwrap()
+                };
+                let dispatch = |cx: &mut TestAppContext, input: PlatformInput| {
+                    cx.update_window(window, |_, window, cx| {
+                        window.dispatch_event(input, cx);
+                    })
+                    .unwrap();
+                };
+
+                dispatch(cx, move_in.clone());
+                assert!(hovered(cx), "{name}, exit at {exit_at:?}: before the exit");
+                dispatch(
+                    cx,
+                    MouseExitEvent {
+                        position: exit_at,
+                        ..Default::default()
+                    }
+                    .to_platform_input(),
+                );
+                for _ in 0..2 {
+                    assert!(!hovered(cx), "{name}, exit at {exit_at:?}: after the exit");
+                }
+                for input in reentry.iter().cloned() {
+                    dispatch(cx, input);
+                }
+                assert!(hovered(cx), "{name}, exit at {exit_at:?}: after re-entry");
+                cx.update(|cx| cx.active_drag = None);
+            }
+        }
     }
 
     #[gpui::test]

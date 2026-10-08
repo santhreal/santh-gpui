@@ -4732,6 +4732,84 @@ mod tests {
         assert_eq!(*hover_transitions.borrow(), [true]);
     }
 
+    /// A pointer that leaves the window with no final move inside it (an
+    /// X11 leave after a fast exit or a warp, a Wayland leave, which
+    /// reports no position) stays unhovered across later redraws until it
+    /// returns. `mouse_position` keeps the last in-window point, and hit
+    /// testing it at draw time re-hovered the element the pointer left.
+    /// Covers every exit position a platform reports; does not cover a
+    /// platform that never reports the exit.
+    #[gpui::test]
+    fn hover_listeners_stay_cleared_after_pointer_leaves_window(cx: &mut TestAppContext) {
+        let inside = point(px(10.), px(10.));
+        // The last in-window point (Wayland), and points past each edge
+        // (X11, Windows).
+        let exits = [
+            inside,
+            point(px(-5.), px(10.)),
+            point(px(10.), px(-5.)),
+            point(px(5000.), px(10.)),
+            point(px(10.), px(5000.)),
+        ];
+        for exit_at in exits {
+            let hover_transitions = Rc::new(RefCell::new(Vec::new()));
+            let window = cx.add_window({
+                let hover_transitions = hover_transitions.clone();
+                move |_, _| HoverListenerLayoutTestView {
+                    target_left: px(0.),
+                    hover_transitions,
+                }
+            });
+            let any_window = AnyWindowHandle::from(window);
+
+            cx.update_window(any_window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.simulate_mouse_move(inside, cx);
+            })
+            .unwrap();
+            assert_eq!(*hover_transitions.borrow(), [true], "exit at {exit_at:?}");
+
+            cx.update_window(any_window, |_, window, cx| {
+                window.dispatch_event(
+                    MouseExitEvent {
+                        position: exit_at,
+                        pressed_button: None,
+                        modifiers: Default::default(),
+                    }
+                    .to_platform_input(),
+                    cx,
+                );
+            })
+            .unwrap();
+            assert_eq!(
+                *hover_transitions.borrow(),
+                [true, false],
+                "exit at {exit_at:?}"
+            );
+
+            for _ in 0..2 {
+                window.update(cx, |_, _, cx| cx.notify()).unwrap();
+                cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+                    .unwrap();
+            }
+            assert_eq!(
+                *hover_transitions.borrow(),
+                [true, false],
+                "exit at {exit_at:?}"
+            );
+
+            cx.update_window(any_window, |_, window, cx| {
+                window.simulate_mouse_move(inside, cx);
+            })
+            .unwrap();
+            assert_eq!(
+                *hover_transitions.borrow(),
+                [true, false, true],
+                "exit at {exit_at:?}"
+            );
+        }
+    }
+
     struct TestTooltipView;
 
     impl Render for TestTooltipView {
