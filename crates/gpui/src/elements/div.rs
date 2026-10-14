@@ -15,6 +15,7 @@
 //! and Tailwind-like styling that you can use to build your own custom elements. Div is
 //! constructed by combining these two systems into an all-in-one element.
 
+use super::smooth_wheel::{self, WheelEase};
 use crate::{
     Action, AnyDrag, AnyElement, AnyTooltip, AnyView, App, Bounds, ClickEvent, DispatchPhase,
     Display, Element, ElementId, Entity, EntityId, ExternalDragPayload, ExternalDragPayloadSource,
@@ -26,7 +27,6 @@ use crate::{
     StyleRefinement, StyleTransition, Styled, Task, TooltipId, Visibility, Window,
     WindowControlArea, point, px, size,
 };
-use super::smooth_wheel::{self, WheelEase};
 use collections::HashMap;
 use gpui_util::ResultExt;
 use refineable::Refineable;

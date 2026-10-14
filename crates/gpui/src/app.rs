@@ -899,7 +899,8 @@ impl App {
             }
         }));
 
-        app.borrow_mut().report_system_reduce_motion(platform.reduce_motion());
+        app.borrow_mut()
+            .report_system_reduce_motion(platform.reduce_motion());
         platform.on_reduce_motion_change(Box::new({
             let app = Rc::downgrade(&app);
             move || {

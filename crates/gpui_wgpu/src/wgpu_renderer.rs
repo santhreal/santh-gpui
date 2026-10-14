@@ -15,8 +15,9 @@ use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
 use configure::{Configuring, Notify};
 use gpui::{
-    AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, EdgeFadeMask, GpuSpecs,
-    LayerMask, Path, Point, PrimitiveBatch, ScaledPixels, Scene, Size, TransformationMatrix,
+    AtlasTextureId, AtlasTextureKind, AtlasTile, Background, Bounds, ContentMask, DevicePixels,
+    EdgeFadeMask, GpuDevice, GpuSpecs, GpuTexture, LayerMask, PaintSurface, Path, Point,
+    PolychromeSprite, PrimitiveBatch, ScaledPixels, Scene, Size, TileId, TransformationMatrix,
     get_gamma_correction_ratios,
 };
 use layers::{LayerTextures, OpenLayer};
@@ -178,6 +179,7 @@ struct InstanceBindings {
     monochrome_sprites: InstanceBinding,
     subpixel_sprites: InstanceBinding,
     polychrome_sprites: InstanceBinding,
+    surfaces: Option<InstanceBinding>,
     backdrop_blurs: InstanceBinding,
 }
 
@@ -215,6 +217,7 @@ enum WgpuRenderTarget {
 struct WgpuResources {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
+    gpu_device: GpuDevice,
     target: WgpuRenderTarget,
     /// The pipelines of the target's key, shared with the renderers of the
     /// same key on `device`.
@@ -768,9 +771,16 @@ impl WgpuRenderer {
             context.surface_tested(),
         );
 
+        let gpu_device = GpuDevice::new((
+            context.instance.clone(),
+            context.adapter.clone(),
+            (*device).clone(),
+            (*queue).clone(),
+        ));
         let resources = WgpuResources {
             device,
             queue,
+            gpu_device,
             target,
             pipelines,
             pipeline_cache,
@@ -1271,6 +1281,10 @@ impl WgpuRenderer {
         }
     }
 
+    pub fn gpu_device(&self) -> Option<GpuDevice> {
+        Some(self.resources.as_ref()?.gpu_device.clone())
+    }
+
     pub fn max_texture_size(&self) -> u32 {
         self.max_texture_size
     }
@@ -1586,9 +1600,11 @@ impl WgpuRenderer {
                         instance_range(range),
                         &mut pass,
                     ),
-                    // Surfaces are macOS-only for video playback and are not
-                    // implemented by the WGPU renderer.
-                    PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::Surfaces(range) => {
+                        if let Some(instances) = &instance_bindings.surfaces {
+                            self.draw_surfaces(instances, &scene.surfaces, range, &mut pass);
+                        }
+                    }
                     PrimitiveBatch::StartLayerMask(mask) => {
                         drop(pass);
                         let view = self.layer_view(open_layers.len());
@@ -1817,6 +1833,40 @@ impl WgpuRenderer {
                 instance_offset,
                 &scene.polychrome_sprites,
             )?,
+            surfaces: (!scene.surfaces.is_empty())
+                .then(|| {
+                    let sprites: Vec<PolychromeSprite> = scene
+                        .surfaces
+                        .iter()
+                        .map(|surface| PolychromeSprite {
+                            order: surface.order,
+                            pad: 0,
+                            grayscale: false.into(),
+                            opacity: surface.opacity,
+                            bounds: surface.bounds,
+                            content_mask: surface.content_mask.clone(),
+                            corner_radii: surface.corner_radii,
+                            tile: AtlasTile {
+                                texture_id: AtlasTextureId {
+                                    index: 0,
+                                    kind: AtlasTextureKind::Polychrome,
+                                },
+                                tile_id: TileId(0),
+                                padding: 0,
+                                bounds: Bounds {
+                                    origin: Point::default(),
+                                    size: surface
+                                        .texture
+                                        .as_ref()
+                                        .map_or_else(Size::default, GpuTexture::size),
+                                },
+                            },
+                            transformation: TransformationMatrix::unit(),
+                        })
+                        .collect();
+                    self.write_instance_binding("surfaces_bind_group", instance_offset, &sprites)
+                })
+                .transpose()?,
             backdrop_blurs: self.write_instance_binding(
                 "backdrop_blurs_bind_group",
                 instance_offset,
@@ -1891,6 +1941,44 @@ impl WgpuRenderer {
             sprite_instances.first_instance + range.start
                 ..sprite_instances.first_instance + range.end,
         );
+    }
+
+    fn draw_surfaces(
+        &self,
+        surface_instances: &InstanceBinding,
+        surfaces: &[PaintSurface],
+        range: Range<usize>,
+        pass: &mut wgpu::RenderPass<'_>,
+    ) {
+        if range.is_empty() {
+            return;
+        }
+        let resources = self.resources();
+        pass.set_pipeline(&resources.pipelines.poly_sprites);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        pass.set_bind_group(1, &surface_instances.bind_group, &[]);
+        for index in range {
+            let Some(texture) = &surfaces[index].texture else {
+                continue;
+            };
+            let owned_view;
+            let view = if let Some(view) = texture.downcast_ref::<wgpu::TextureView>() {
+                view
+            } else if let Some((_, view)) =
+                texture.downcast_ref::<(wgpu::Texture, wgpu::TextureView)>()
+            {
+                view
+            } else if let Some(wgpu_texture) = texture.downcast_ref::<wgpu::Texture>() {
+                owned_view = wgpu_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                &owned_view
+            } else {
+                continue;
+            };
+            let bind_group = self.create_texture_bind_group("surface_texture_bind_group", view);
+            pass.set_bind_group(2, &bind_group, &[]);
+            let instance = surface_instances.first_instance + index as u32;
+            pass.draw(0..4, instance..instance + 1);
+        }
     }
 
     unsafe fn instance_bytes<T>(instances: &[T]) -> &[u8] {
@@ -2748,6 +2836,10 @@ impl gpui::PlatformHeadlessRenderer for WgpuHeadlessRenderer {
 
     fn sprite_atlas(&self) -> Arc<dyn gpui::PlatformAtlas> {
         self.renderer.sprite_atlas().clone()
+    }
+
+    fn gpu_device(&self) -> Option<GpuDevice> {
+        self.renderer.gpu_device()
     }
 }
 
@@ -4840,5 +4932,130 @@ mod tests {
                 "outside path clip pixel at (75,75) must be black at scale {scale}, got {outside:?}"
             );
         }
+    }
+
+    #[test]
+    fn test_draw_gpu_texture_surface_pixels() {
+        use crate::cosmic_text_system::CosmicTextSystem;
+        use gpui::{
+            AppContext, Context, GpuTexture, HeadlessAppContext, IntoElement, ObjectFit,
+            ParentElement, PlatformHeadlessRenderer, Render, Styled, Window, div, px, rgb, size,
+            surface,
+        };
+
+        struct SurfaceView;
+        impl Render for SurfaceView {
+            fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+                let gpu_device = window
+                    .gpu_device()
+                    .expect("offscreen wgpu window exposes gpu_device");
+                assert_eq!(
+                    Some(&gpu_device),
+                    window.gpu_device().as_ref(),
+                    "repeated gpu_device() calls on the same renderer share identity until recovery"
+                );
+                let (instance, adapter, device, queue) = gpu_device
+                    .downcast_ref::<(wgpu::Instance, wgpu::Adapter, wgpu::Device, wgpu::Queue)>()
+                    .expect("wgpu renderer exposes (Instance, Adapter, Device, Queue)");
+                let replacement = GpuDevice::new((
+                    instance.clone(),
+                    adapter.clone(),
+                    device.clone(),
+                    queue.clone(),
+                ));
+                assert_ne!(
+                    gpu_device, replacement,
+                    "a recovered renderer creates a distinct GpuDevice handle"
+                );
+
+                let width = 40u32;
+                let height = 40u32;
+                let texture = device.create_texture(&wgpu::TextureDescriptor {
+                    label: Some("test_external_gpu_texture"),
+                    size: wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                    view_formats: &[],
+                });
+                let mut pixels = Vec::with_capacity((width * height * 4) as usize);
+                for _ in 0..(width * height) {
+                    pixels.extend_from_slice(&[20u8, 220u8, 140u8, 255u8]);
+                }
+                queue.write_texture(
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &pixels,
+                    wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(width * 4),
+                        rows_per_image: Some(height),
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                let gpu_texture = GpuTexture::new(
+                    texture,
+                    size(DevicePixels(width as i32), DevicePixels(height as i32)),
+                );
+                div()
+                    .w(px(100.0))
+                    .h(px(100.0))
+                    .relative()
+                    .bg(rgb(0x000000))
+                    .child(
+                        surface(gpu_texture)
+                            .absolute()
+                            .top(px(10.0))
+                            .left(px(15.0))
+                            .w(px(40.0))
+                            .h(px(40.0))
+                            .object_fit(ObjectFit::Fill),
+                    )
+            }
+        }
+
+        let text_system = Arc::new(CosmicTextSystem::new("sans-serif"));
+        let mut cx = HeadlessAppContext::with_platform(text_system, Arc::new(()), move || {
+            WgpuHeadlessRenderer::new(size(DevicePixels(100), DevicePixels(100)))
+                .ok()
+                .map(|r| Box::new(r) as Box<dyn PlatformHeadlessRenderer>)
+        });
+        let window = cx
+            .open_window(size(px(100.0), px(100.0)), |_window, cx| {
+                cx.new(|_| SurfaceView)
+            })
+            .expect("open headless window");
+        cx.update_window(window.into(), |_, window, _| {
+            window.set_scale_factor(1.0);
+            window.refresh();
+        })
+        .expect("set scale factor 1.0");
+        cx.request_frame(window.into()).expect("draw frame");
+        cx.run_until_parked();
+        let Ok(frame) = cx.capture_frame(window.into(), 1.0) else {
+            return;
+        };
+        let bytes = frame.as_bytes();
+        let pixel = |x: usize, y: usize| -> [u8; 4] {
+            let idx = (y * 100 + x) * 4;
+            [bytes[idx], bytes[idx + 1], bytes[idx + 2], bytes[idx + 3]]
+        };
+        assert_eq!(pixel(30, 25), [20, 220, 140, 255]);
+        assert_eq!(pixel(5, 5), [0, 0, 0, 255]);
+        assert_eq!(pixel(80, 80), [0, 0, 0, 255]);
     }
 }

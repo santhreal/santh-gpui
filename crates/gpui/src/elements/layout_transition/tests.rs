@@ -121,8 +121,16 @@ fn a_moved_element_travels_on_the_spring_from_where_it_was_painted(cx: &mut Test
         previous = bounds;
     }
     assert!(frames > 10, "the motion took {frames} frames");
-    assert_eq!(previous.origin.y, px(100.0), "the motion ends on the layout");
-    assert_eq!(idle_requests(&window, cx), 0, "at rest, no frame is requested");
+    assert_eq!(
+        previous.origin.y,
+        px(100.0),
+        "the motion ends on the layout"
+    );
+    assert_eq!(
+        idle_requests(&window, cx),
+        0,
+        "at rest, no frame is requested"
+    );
 }
 
 #[gpui::test]
@@ -135,7 +143,10 @@ fn an_interrupted_move_continues_from_its_position_and_velocity(cx: &mut TestApp
         next_frame(&window, cx);
     }
     let (offset, velocity) = spring_at(LAYOUT_SPRING, -80.0, 0.0, 0.0, FIRST_LEG);
-    assert!(velocity > 100.0, "the first leg is mid-flight at {velocity} px/s");
+    assert!(
+        velocity > 100.0,
+        "the first leg is mid-flight at {velocity} px/s"
+    );
     let before = top(&window, cx, MOVING);
 
     update_view(&window, cx, |column| column.above = 40.0);

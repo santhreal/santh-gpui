@@ -2059,6 +2059,10 @@ impl PlatformWindow for X11Window {
         self.0.state.borrow().renderer.gpu_specs().into()
     }
 
+    fn gpu_device(&self) -> Option<gpui::GpuDevice> {
+        self.0.state.borrow().renderer.gpu_device()
+    }
+
     fn play_system_bell(&self) {
         // Volume 0% means don't increase or decrease from system volume
         let _ = self.0.xcb.bell(0);

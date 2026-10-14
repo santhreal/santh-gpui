@@ -516,6 +516,14 @@ impl PlatformWindow for TestWindow {
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         None
     }
+
+    fn gpu_device(&self) -> Option<crate::GpuDevice> {
+        self.0
+            .lock()
+            .renderer
+            .as_ref()
+            .and_then(|renderer| renderer.gpu_device())
+    }
 }
 
 pub(crate) struct TestAtlasState {

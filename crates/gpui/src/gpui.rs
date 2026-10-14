@@ -352,3 +352,79 @@ pub struct GpuSpecs {
     /// Further information about the driver, as reported by Vulkan.
     pub driver_info: String,
 }
+/// Type-erased handle to a GPU device and queue shared by a window renderer.
+#[derive(Clone)]
+pub struct GpuDevice {
+    handle: std::sync::Arc<dyn Any + Send + Sync>,
+}
+
+impl std::fmt::Debug for GpuDevice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuDevice").finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for GpuDevice {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.handle, &other.handle)
+    }
+}
+
+impl Eq for GpuDevice {}
+
+impl GpuDevice {
+    /// Wrap a backend device handle (such as `(wgpu::Device, wgpu::Queue)`).
+    pub fn new<T: Any + Send + Sync>(device: T) -> Self {
+        Self {
+            handle: std::sync::Arc::new(device),
+        }
+    }
+
+    /// Borrow the underlying backend device handle if it matches `T`.
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.handle.downcast_ref::<T>()
+    }
+}
+
+/// Type-erased handle to a GPU texture or texture view created on a window's [`GpuDevice`].
+#[derive(Clone)]
+pub struct GpuTexture {
+    handle: std::sync::Arc<dyn Any + Send + Sync>,
+    size: Size<DevicePixels>,
+}
+
+impl std::fmt::Debug for GpuTexture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GpuTexture")
+            .field("size", &self.size)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PartialEq for GpuTexture {
+    fn eq(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.handle, &other.handle) && self.size == other.size
+    }
+}
+
+impl Eq for GpuTexture {}
+
+impl GpuTexture {
+    /// Wrap a backend texture or texture view with its pixel dimensions.
+    pub fn new<T: Any + Send + Sync>(texture: T, size: Size<DevicePixels>) -> Self {
+        Self {
+            handle: std::sync::Arc::new(texture),
+            size,
+        }
+    }
+
+    /// Pixel dimensions of the texture.
+    pub fn size(&self) -> Size<DevicePixels> {
+        self.size
+    }
+
+    /// Borrow the underlying backend texture handle if it matches `T`.
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.handle.downcast_ref::<T>()
+    }
+}

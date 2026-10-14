@@ -140,8 +140,11 @@ fn sample(kind: PrimitiveKind, bounds: Bounds<ScaledPixels>, tile_id: u32) -> Op
             order: 0,
             bounds,
             content_mask: mask(),
+            corner_radii: Corners::default(),
+            opacity: 1.0,
+            texture: None,
             #[cfg(target_os = "macos")]
-            image_buffer: test_image_buffer(),
+            image_buffer: Some(test_image_buffer()),
         }),
         PrimitiveKind::BackdropBlur => Primitive::BackdropBlur(BackdropBlur {
             order: 0,

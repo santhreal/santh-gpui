@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point, px, radians, size,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, GpuTexture, Hsla,
+    Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point, px, radians, size,
 };
 use smallvec::SmallVec;
 use std::{
@@ -1584,14 +1584,17 @@ impl From<PolychromeSprite> for Primitive {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default, PartialEq)]
 #[allow(missing_docs)]
 pub struct PaintSurface {
     pub order: DrawOrder,
     pub bounds: Bounds<ScaledPixels>,
     pub content_mask: ContentMask<ScaledPixels>,
+    pub corner_radii: Corners<ScaledPixels>,
+    pub opacity: f32,
+    pub texture: Option<GpuTexture>,
     #[cfg(target_os = "macos")]
-    pub image_buffer: core_video::pixel_buffer::CVPixelBuffer,
+    pub image_buffer: Option<core_video::pixel_buffer::CVPixelBuffer>,
 }
 
 impl From<PaintSurface> for Primitive {
@@ -1828,8 +1831,11 @@ mod tests {
             order: 0,
             bounds,
             content_mask: mask(),
+            corner_radii: Corners::default(),
+            opacity: 1.0,
+            texture: None,
             #[cfg(target_os = "macos")]
-            image_buffer: test_image_buffer(),
+            image_buffer: Some(test_image_buffer()),
         }
     }
 

@@ -1,6 +1,6 @@
 use crate::{
-    App, Bounds, Element, ElementId, GlobalElementId, InspectorElementId, IntoElement, LayoutId,
-    ObjectFit, Pixels, Style, StyleRefinement, Styled, Window,
+    App, Bounds, Element, ElementId, GlobalElementId, GpuTexture, InspectorElementId, IntoElement,
+    LayoutId, ObjectFit, Pixels, Style, StyleRefinement, Styled, Window,
 };
 #[cfg(target_os = "macos")]
 use core_video::pixel_buffer::CVPixelBuffer;
@@ -12,6 +12,14 @@ pub enum SurfaceSource {
     /// A macOS image buffer from CoreVideo
     #[cfg(target_os = "macos")]
     Surface(CVPixelBuffer),
+    /// A GPU texture created on the window's rendering device.
+    Texture(GpuTexture),
+}
+
+impl From<GpuTexture> for SurfaceSource {
+    fn from(value: GpuTexture) -> Self {
+        SurfaceSource::Texture(value)
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -29,7 +37,6 @@ pub struct Surface {
 }
 
 /// Create a new surface element.
-#[cfg(target_os = "macos")]
 pub fn surface(source: impl Into<SurfaceSource>) -> Surface {
     Surface {
         source: source.into(),
@@ -86,10 +93,10 @@ impl Element for Surface {
         &mut self,
         _global_id: Option<&GlobalElementId>,
         _inspector_id: Option<&InspectorElementId>,
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] bounds: Bounds<Pixels>,
+        bounds: Bounds<Pixels>,
         _: &mut Self::RequestLayoutState,
         _: &mut Self::PrepaintState,
-        #[cfg_attr(not(target_os = "macos"), allow(unused_variables))] window: &mut Window,
+        window: &mut Window,
         _: &mut App,
     ) {
         match &self.source {
@@ -100,8 +107,17 @@ impl Element for Surface {
                 // TODO: Add support for corner_radii
                 window.paint_surface(new_bounds, surface.clone());
             }
-            #[allow(unreachable_patterns)]
-            _ => {}
+            SurfaceSource::Texture(texture) => {
+                let size = texture.size();
+                if size.width.0 <= 0 || size.height.0 <= 0 {
+                    return;
+                }
+                let new_bounds = self.object_fit.get_bounds(bounds, size);
+                let mut style = Style::default();
+                style.refine(&self.style);
+                let corner_radii = style.corner_radii.to_pixels(window.rem_size());
+                window.paint_gpu_texture(new_bounds, corner_radii, texture.clone());
+            }
         }
     }
 }

@@ -186,8 +186,11 @@ fn a_primitive_transformed_over_an_earlier_one_draws_above_it() {
             order: 0,
             bounds: rect(500.0, 500.0, 100.0, 100.0),
             content_mask: mask(),
+            corner_radii: Corners::default(),
+            opacity: 1.0,
+            texture: None,
             #[cfg(target_os = "macos")]
-            image_buffer: test_image_buffer(),
+            image_buffer: Some(test_image_buffer()),
         });
         scene.insert_primitive(primitive);
         scene.finish();
