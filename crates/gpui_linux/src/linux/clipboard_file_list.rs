@@ -1,4 +1,4 @@
-use gpui::{ClipboardEntry, ClipboardItem, ExternalPaths};
+use gpui::{ClipboardEntry, ClipboardItem, ExternalPaths, SharedString};
 use smallvec::SmallVec;
 use std::os::unix::ffi::OsStrExt;
 use url::Url;
@@ -28,8 +28,36 @@ pub(crate) fn read_file_list(bytes: &[u8]) -> Result<ClipboardItem, &'static str
         return Err("file list contains no files");
     }
     Ok(ClipboardItem {
-        entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(paths))],
+        entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths::from_paths(
+            paths,
+        ))],
     })
+}
+
+pub(crate) fn parse_uri_list_for_drop(text: &str) -> ExternalPaths {
+    let mut paths = SmallVec::new();
+    let mut urls = SmallVec::new();
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        let Ok(url) = Url::parse(line) else {
+            log::error!("Invalid URI in drop list: {line:?}");
+            continue;
+        };
+        if url.scheme() == "file" {
+            match url.to_file_path() {
+                Ok(path) => paths.push(path),
+                Err(()) => {
+                    log::error!("Failed turn {url:?} into a file path");
+                }
+            }
+        } else {
+            urls.push(SharedString::from(line.to_owned()));
+        }
+    }
+    ExternalPaths::new(paths, urls)
 }
 
 /// URI-list clipboard payloads must remain local file entries, not pasted text or
@@ -54,11 +82,11 @@ mod tests {
             assert_eq!(
                 read_file_list(input.as_bytes())?,
                 ClipboardItem {
-                    entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+                    entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths::from_paths(
                         smallvec::smallvec![
                             PathBuf::from("/workspace/a b.txt"),
                             PathBuf::from("/workspace/#notes"),
-                        ]
+                        ],
                     ))],
                 }
             );
@@ -73,8 +101,8 @@ mod tests {
         assert_eq!(
             read_file_list(url.as_str().as_bytes())?,
             ClipboardItem {
-                entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
-                    smallvec::smallvec![path]
+                entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths::from_paths(
+                    smallvec::smallvec![path],
                 ))],
             }
         );
@@ -111,5 +139,32 @@ mod tests {
         ] {
             assert_eq!(read_file_list(bytes), Err(error), "input: {bytes:?}");
         }
+    }
+
+    #[test]
+    fn drop_uri_list_collects_non_file_urls_and_local_paths() {
+        let url_only = parse_uri_list_for_drop(
+            "# browser drag\r\nhttps://example.com/clip.mp4\r\nhttps://example.com/sub.vtt\r\n",
+        );
+        assert!(url_only.paths().is_empty());
+        assert_eq!(
+            url_only.urls(),
+            &[
+                SharedString::from("https://example.com/clip.mp4"),
+                SharedString::from("https://example.com/sub.vtt"),
+            ]
+        );
+
+        let mixed = parse_uri_list_for_drop(
+            "file:///workspace/a%20b.mp4\r\nhttps://example.com/stream.m3u8\r\n",
+        );
+        assert_eq!(mixed.paths(), &[PathBuf::from("/workspace/a b.mp4")]);
+        assert_eq!(
+            mixed.urls(),
+            &[SharedString::from("https://example.com/stream.m3u8")]
+        );
+
+        let invalid = parse_uri_list_for_drop("not a uri\r\n# comment\r\n");
+        assert!(invalid.is_empty());
     }
 }

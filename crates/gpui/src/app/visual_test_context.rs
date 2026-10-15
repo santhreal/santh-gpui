@@ -325,6 +325,34 @@ impl VisualTestAppContext {
         self.simulate_mouse_up(window, position, MouseButton::Left, modifiers);
     }
 
+    /// Simulates an external drop of local paths and non-file URLs on `window`.
+    pub fn simulate_external_drop(
+        &mut self,
+        window: AnyWindowHandle,
+        position: Point<Pixels>,
+        paths: impl IntoIterator<Item = std::path::PathBuf>,
+        urls: impl IntoIterator<Item = impl Into<crate::SharedString>>,
+    ) {
+        let paths = crate::ExternalPaths::new(
+            paths.into_iter().collect(),
+            urls.into_iter().map(Into::into).collect(),
+        );
+        self.simulate_event(window, crate::FileDropEvent::Entered { position, paths });
+        self.simulate_event(window, crate::FileDropEvent::Pending { position });
+        self.simulate_event(window, crate::FileDropEvent::Submit { position });
+        self.simulate_event(window, crate::FileDropEvent::Ended);
+    }
+
+    /// Simulates an external drop of non-file URLs on `window`.
+    pub fn simulate_url_drop(
+        &mut self,
+        window: AnyWindowHandle,
+        position: Point<Pixels>,
+        urls: impl IntoIterator<Item = impl Into<crate::SharedString>>,
+    ) {
+        self.simulate_external_drop(window, position, std::iter::empty(), urls);
+    }
+
     /// Simulates an input event on the given window.
     pub fn simulate_event<E: InputEvent>(&mut self, window: AnyWindowHandle, event: E) {
         self.update_window(window, |_, window, cx| {

@@ -28,8 +28,8 @@ use crate::{
     AnyWindowHandle, App, AppCell, AppContext, AsyncApp, BackgroundExecutor, BorrowAppContext,
     Bounds, ClipboardItem, Context, Entity, ForegroundExecutor, Global, InputEvent, Keystroke,
     MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Platform,
-    PlatformTextSystem, Point, Render, Size, Task, TestDispatcher, TestPlatform, TextSystem,
-    Window, WindowBounds, WindowHandle, WindowOptions, app::GpuiMode,
+    PlatformTextSystem, Point, Render, SharedString, Size, Task, TestDispatcher, TestPlatform,
+    TextSystem, Window, WindowBounds, WindowHandle, WindowOptions, app::GpuiMode,
 };
 use std::{future::Future, rc::Rc, sync::Arc, time::Duration};
 
@@ -461,6 +461,32 @@ impl<V: 'static + Render> TestAppWindow<V> {
             modifiers: Default::default(),
             touch_phase: crate::TouchPhase::Moved,
         });
+    }
+
+    /// Simulate an external drop of local paths and non-file URLs at `position`.
+    pub fn simulate_external_drop(
+        &mut self,
+        position: Point<Pixels>,
+        paths: impl IntoIterator<Item = std::path::PathBuf>,
+        urls: impl IntoIterator<Item = impl Into<SharedString>>,
+    ) {
+        let paths = crate::ExternalPaths::new(
+            paths.into_iter().collect(),
+            urls.into_iter().map(Into::into).collect(),
+        );
+        self.simulate_event(crate::FileDropEvent::Entered { position, paths });
+        self.simulate_event(crate::FileDropEvent::Pending { position });
+        self.simulate_event(crate::FileDropEvent::Submit { position });
+        self.simulate_event(crate::FileDropEvent::Ended);
+    }
+
+    /// Simulate an external drop of non-file URLs at `position`.
+    pub fn simulate_url_drop(
+        &mut self,
+        position: Point<Pixels>,
+        urls: impl IntoIterator<Item = impl Into<SharedString>>,
+    ) {
+        self.simulate_external_drop(position, std::iter::empty(), urls);
     }
 
     /// Simulate an input event.

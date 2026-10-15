@@ -1,6 +1,6 @@
 use crate::{
     Bounds, Capslock, Context, Empty, IntoElement, Keystroke, Modifiers, Pixels, Point, Render,
-    Window, point, seal::Sealed,
+    SharedString, Window, point, seal::Sealed,
 };
 use smallvec::SmallVec;
 use std::{any::Any, fmt::Debug, ops::Deref, path::PathBuf};
@@ -683,14 +683,50 @@ impl Deref for MouseExitEvent {
     }
 }
 
-/// A collection of paths from the platform, such as from a file drop.
+/// Paths and non-file URLs from the platform, such as from an external drop or clipboard item.
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
-pub struct ExternalPaths(pub SmallVec<[PathBuf; 2]>);
+pub struct ExternalPaths {
+    /// Local filesystem paths.
+    pub paths: SmallVec<[PathBuf; 2]>,
+    /// Non-file URLs.
+    pub urls: SmallVec<[SharedString; 2]>,
+}
 
 impl ExternalPaths {
-    /// Convert this collection of paths into a slice.
+    /// Creates an [`ExternalPaths`] collection with the given file paths and non-file URLs.
+    pub fn new(paths: SmallVec<[PathBuf; 2]>, urls: SmallVec<[SharedString; 2]>) -> Self {
+        Self { paths, urls }
+    }
+
+    /// Creates an [`ExternalPaths`] collection containing only local file paths.
+    pub fn from_paths(paths: SmallVec<[PathBuf; 2]>) -> Self {
+        Self {
+            paths,
+            urls: SmallVec::new(),
+        }
+    }
+
+    /// Creates an [`ExternalPaths`] collection containing only non-file URLs.
+    pub fn from_urls(urls: SmallVec<[SharedString; 2]>) -> Self {
+        Self {
+            paths: SmallVec::new(),
+            urls,
+        }
+    }
+
+    /// Returns the local filesystem paths in this collection.
     pub fn paths(&self) -> &[PathBuf] {
-        &self.0
+        &self.paths
+    }
+
+    /// Returns the non-file URLs in this collection.
+    pub fn urls(&self) -> &[SharedString] {
+        &self.urls
+    }
+
+    /// Returns `true` when there are neither local paths nor non-file URLs.
+    pub fn is_empty(&self) -> bool {
+        self.paths.is_empty() && self.urls.is_empty()
     }
 }
 

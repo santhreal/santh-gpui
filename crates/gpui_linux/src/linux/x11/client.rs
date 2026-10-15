@@ -10,9 +10,7 @@ use collections::HashMap;
 use core::str;
 use gpui::{Capslock, profiler};
 use gpui_util::ResultExt as _;
-use http_client::Url;
 use log::Level;
-use smallvec::SmallVec;
 use std::{
     cell::RefCell,
     collections::{BTreeMap, HashSet},
@@ -55,10 +53,11 @@ use super::{
 };
 
 use crate::linux::{
-    DEFAULT_CURSOR_ICON_NAME, LinuxClient, capslock_from_xkb, cursor_style_to_icon_names,
-    get_xkb_compose_state, is_within_click_distance, keystroke_from_xkb,
-    keystroke_underlying_dead_key, log_cursor_icon_warning, modifiers_from_xkb, new_xkb_context,
-    open_uri_internal,
+    DEFAULT_CURSOR_ICON_NAME, LinuxClient, capslock_from_xkb,
+    clipboard_file_list::parse_uri_list_for_drop,
+    cursor_style_to_icon_names, get_xkb_compose_state, is_within_click_distance,
+    keystroke_from_xkb, keystroke_underlying_dead_key, log_cursor_icon_warning, modifiers_from_xkb,
+    new_xkb_context, open_uri_internal,
     platform::{DOUBLE_CLICK_INTERVAL, SCROLL_LINES},
     reveal_path_internal,
     xdg_desktop_portal::{Event as XDPEvent, XDPEventSource},
@@ -927,7 +926,10 @@ impl X11Client {
                             state.xdnd_state.other_window,
                         );
                     } else {
-                        if let Some(atom) = [arg2, arg3, arg4]
+                        let offered = [arg2, arg3, arg4];
+                        if offered.contains(&state.atoms.TextUriList) {
+                            state.xdnd_state.drag_type = state.atoms.TextUriList;
+                        } else if let Some(atom) = offered
                             .into_iter()
                             .find(|atom| xdnd_is_atom_supported(*atom, &state.atoms))
                         {
@@ -1006,24 +1008,16 @@ impl X11Client {
                     return Some(());
                 };
                 if let Ok(file_list) = str::from_utf8(&reply.value) {
-                    let paths: SmallVec<[_; 2]> = file_list
-                        .lines()
-                        .filter_map(|path| Url::parse(path).log_err())
-                        .filter_map(|url| match url.to_file_path() {
-                            Ok(url) => Some(url),
-                            Err(()) => {
-                                log::error!("Failed turn {url:?} into a file path");
-                                None
-                            }
-                        })
-                        .collect();
-                    let input = PlatformInput::FileDrop(FileDropEvent::Entered {
-                        position: state.xdnd_state.position,
-                        paths: gpui::ExternalPaths(paths),
-                    });
-                    drop(state);
-                    window.handle_input(input);
-                    self.0.borrow_mut().xdnd_state.retrieved = true;
+                    let external_paths = parse_uri_list_for_drop(file_list);
+                    if !external_paths.is_empty() {
+                        let input = PlatformInput::FileDrop(FileDropEvent::Entered {
+                            position: state.xdnd_state.position,
+                            paths: external_paths,
+                        });
+                        drop(state);
+                        window.handle_input(input);
+                        self.0.borrow_mut().xdnd_state.retrieved = true;
+                    }
                 }
             }
             Event::ConfigureNotify(event) => {
@@ -2322,6 +2316,10 @@ fn xdnd_get_supported_atom(
     .log_with_level(Level::Warn)
         && let Some(atoms) = reply.value32()
     {
+        let atoms: Vec<u32> = atoms.collect();
+        if atoms.contains(&supported_atoms.TextUriList) {
+            return supported_atoms.TextUriList;
+        }
         for atom in atoms {
             if xdnd_is_atom_supported(atom, supported_atoms) {
                 return atom;

@@ -61,7 +61,9 @@ impl Pasteboard {
                     paths.push(PathBuf::from(path));
                 }
                 if !paths.is_empty() {
-                    let mut entries = vec![ClipboardEntry::ExternalPaths(ExternalPaths(paths))];
+                    let mut entries = vec![ClipboardEntry::ExternalPaths(
+                        ExternalPaths::from_paths(paths),
+                    )];
 
                     // Also include the string representation so text editors can
                     // paste the path as text.

@@ -837,6 +837,27 @@ impl VisualTestContext {
         self.background_executor.run_until_parked();
     }
 
+    /// Simulates an external drop of local paths and non-file URLs at `position`.
+    pub fn simulate_external_drop(
+        &mut self,
+        position: Point<Pixels>,
+        paths: impl IntoIterator<Item = std::path::PathBuf>,
+        urls: impl IntoIterator<Item = impl Into<SharedString>>,
+    ) {
+        self.test_window(self.window)
+            .simulate_external_drop(position, paths, urls);
+        self.background_executor.run_until_parked();
+    }
+
+    /// Simulates an external drop of non-file URLs at `position`.
+    pub fn simulate_url_drop(
+        &mut self,
+        position: Point<Pixels>,
+        urls: impl IntoIterator<Item = impl Into<SharedString>>,
+    ) {
+        self.simulate_external_drop(position, std::iter::empty(), urls);
+    }
+
     /// Simulate a mouse down event to the given point
     pub fn simulate_mouse_down(
         &mut self,

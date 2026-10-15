@@ -7741,7 +7741,7 @@ mod tests {
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
         InputEvent as _, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
         MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PinchEvent,
-        Pixels, PlatformInput, Point, Render, RequestFrameOptions, ScrollWheelEvent,
+        Pixels, PlatformInput, Point, Render, RequestFrameOptions, ScrollWheelEvent, SharedString,
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchEvent, TouchPhase, Window,
         WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
@@ -8044,7 +8044,7 @@ mod tests {
             ..Default::default()
         }
         .to_platform_input();
-        let paths = || ExternalPaths([PathBuf::from("/a.png")].into_iter().collect());
+        let paths = || ExternalPaths::from_paths([PathBuf::from("/a.png")].into_iter().collect());
         let touch = |phase, y| TouchEvent {
             phase,
             position: point(px(10.), px(y)),
@@ -8461,7 +8461,8 @@ mod tests {
 
         let destination: AnyWindowHandle = cx.add_window(|_, _| EmptyView).into();
         let reentry_position = point(px(30.), px(30.));
-        let external_paths = || ExternalPaths([successful_path.clone()].into_iter().collect());
+        let external_paths =
+            || ExternalPaths::from_paths([successful_path.clone()].into_iter().collect());
         let update_result = cx.update_window(destination, |_, window, cx| {
             window.dispatch_event(
                 FileDropEvent::Entered {
@@ -8576,7 +8577,7 @@ mod tests {
             window.dispatch_event(
                 FileDropEvent::Entered {
                     position: reentry_position,
-                    paths: ExternalPaths([cancelled_path].into_iter().collect()),
+                    paths: ExternalPaths::from_paths([cancelled_path].into_iter().collect()),
                 }
                 .to_platform_input(),
                 cx,
@@ -9490,5 +9491,68 @@ mod tests {
             assert!(!window.is_pointer_locked());
         });
         assert!(!test_window.is_pointer_locked());
+    }
+
+    #[gpui::test]
+    fn external_url_drop_delivers_non_file_urls_with_empty_paths(cx: &mut TestAppContext) {
+        let dropped: Rc<RefCell<Vec<ExternalPaths>>> = Rc::new(RefCell::new(Vec::new()));
+
+        struct DropTargetView {
+            dropped: Rc<RefCell<Vec<ExternalPaths>>>,
+        }
+
+        impl Render for DropTargetView {
+            fn render(
+                &mut self,
+                _window: &mut Window,
+                _cx: &mut Context<Self>,
+            ) -> impl IntoElement {
+                let dropped = self.dropped.clone();
+                div().id("drop-target").size(px(200.)).on_drop(
+                    move |paths: &ExternalPaths, _window, _cx| {
+                        dropped.borrow_mut().push(paths.clone());
+                    },
+                )
+            }
+        }
+
+        let (_, cx) = cx.add_window_view(|_, _| DropTargetView {
+            dropped: dropped.clone(),
+        });
+        let drop_pos = point(px(50.), px(50.));
+
+        cx.simulate_url_drop(
+            drop_pos,
+            [
+                "https://example.com/clip.mp4",
+                "https://example.com/audio.wav",
+            ],
+        );
+
+        let recorded = dropped.borrow();
+        assert_eq!(recorded.len(), 1);
+        assert!(recorded[0].paths().is_empty());
+        assert_eq!(
+            recorded[0].urls(),
+            &[
+                SharedString::from("https://example.com/clip.mp4"),
+                SharedString::from("https://example.com/audio.wav"),
+            ]
+        );
+        drop(recorded);
+
+        cx.simulate_external_drop(
+            drop_pos,
+            [PathBuf::from("/workspace/clip.mp4")],
+            ["https://example.com/extra.mp4"],
+        );
+
+        let recorded = dropped.borrow();
+        assert_eq!(recorded.len(), 2);
+        assert_eq!(recorded[1].paths(), &[PathBuf::from("/workspace/clip.mp4")]);
+        assert_eq!(
+            recorded[1].urls(),
+            &[SharedString::from("https://example.com/extra.mp4")]
+        );
     }
 }

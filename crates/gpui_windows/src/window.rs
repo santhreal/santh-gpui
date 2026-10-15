@@ -1235,30 +1235,56 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
     ) -> windows::core::Result<()> {
         unsafe {
             let idata_obj = pdataobj.ok()?;
-            let config = FORMATETC {
+            let cursor_position = POINT { x: pt.x, y: pt.y };
+            let mut paths = SmallVec::<[PathBuf; 2]>::new();
+            let mut urls = SmallVec::<[SharedString; 2]>::new();
+
+            let hdrop_config = FORMATETC {
                 cfFormat: CF_HDROP.0,
                 ptd: std::ptr::null_mut() as _,
                 dwAspect: DVASPECT_CONTENT.0,
                 lindex: -1,
                 tymed: TYMED_HGLOBAL.0 as _,
             };
-            let cursor_position = POINT { x: pt.x, y: pt.y };
-            if idata_obj.QueryGetData(&config as _) == S_OK {
-                *pdweffect = DROPEFFECT_COPY;
-                let Some(mut idata) = idata_obj.GetData(&config as _).log_err() else {
-                    return Ok(());
-                };
-                if idata.u.hGlobal.is_invalid() {
-                    return Ok(());
+            if idata_obj.QueryGetData(&hdrop_config as _) == S_OK
+                && let Some(mut idata) = idata_obj.GetData(&hdrop_config as _).log_err()
+            {
+                if !idata.u.hGlobal.is_invalid() {
+                    let hdrop = HDROP(idata.u.hGlobal.0);
+                    with_file_names(hdrop, |file_name| {
+                        if let Some(path) = PathBuf::from_str(&file_name).log_err() {
+                            paths.push(path);
+                        }
+                    });
                 }
-                let hdrop = HDROP(idata.u.hGlobal.0);
-                let mut paths = SmallVec::<[PathBuf; 2]>::new();
-                with_file_names(hdrop, |file_name| {
-                    if let Some(path) = PathBuf::from_str(&file_name).log_err() {
-                        paths.push(path);
-                    }
-                });
                 ReleaseStgMedium(&mut idata);
+            }
+
+            for format in [uniform_resource_locator_w_format(), CF_UNICODETEXT.0] {
+                if !urls.is_empty() {
+                    break;
+                }
+                let url_config = FORMATETC {
+                    cfFormat: format,
+                    ptd: std::ptr::null_mut() as _,
+                    dwAspect: DVASPECT_CONTENT.0,
+                    lindex: -1,
+                    tymed: TYMED_HGLOBAL.0 as _,
+                };
+                if idata_obj.QueryGetData(&url_config as _) == S_OK
+                    && let Some(mut idata) = idata_obj.GetData(&url_config as _).log_err()
+                {
+                    if !idata.u.hGlobal.is_invalid()
+                        && let Some(text) = string_from_hglobal(idata.u.hGlobal)
+                    {
+                        urls = extract_non_file_urls(&text);
+                    }
+                    ReleaseStgMedium(&mut idata);
+                }
+            }
+
+            if !paths.is_empty() || !urls.is_empty() {
+                *pdweffect = DROPEFFECT_COPY;
                 let mut cursor_position = cursor_position;
                 ScreenToClient(self.0.hwnd, &mut cursor_position)
                     .ok()
@@ -1270,7 +1296,7 @@ impl IDropTarget_Impl for WindowsDragDropHandler_Impl {
                         cursor_position.y as f32,
                         scale_factor,
                     ),
-                    paths: ExternalPaths(paths),
+                    paths: ExternalPaths::new(paths, urls),
                 });
                 self.handle_drag_drop(input);
             } else {

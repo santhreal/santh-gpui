@@ -36,6 +36,8 @@ static CLIPBOARD_PNG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("PNG")));
 static CLIPBOARD_JPG_FORMAT: LazyLock<u32> =
     LazyLock::new(|| register_clipboard_format(windows::core::w!("JFIF")));
+static UNIFORM_RESOURCE_LOCATOR_W_FORMAT: LazyLock<u32> =
+    LazyLock::new(|| register_clipboard_format(windows::core::w!("UniformResourceLocatorW")));
 
 static IMAGE_FORMATS_MAP: LazyLock<FxHashMap<u32, ImageFormat>> = LazyLock::new(|| {
     let mut map = FxHashMap::default();
@@ -161,8 +163,12 @@ fn set_clipboard_bytes<T>(data: &[T], format: u32) -> Result<()> {
     Ok(())
 }
 
-fn get_clipboard_string(format: u32) -> Option<String> {
-    let locked = get_clipboard_data(format)?;
+pub(crate) fn uniform_resource_locator_w_format() -> u16 {
+    *UNIFORM_RESOURCE_LOCATOR_W_FORMAT as u16
+}
+
+pub(crate) fn string_from_hglobal(global: HGLOBAL) -> Option<String> {
+    let locked = LockedGlobal::lock(global)?;
     let bytes = locked.as_bytes();
     let words_len = bytes.len() / std::mem::size_of::<u16>();
     if words_len == 0 {
@@ -171,6 +177,44 @@ fn get_clipboard_string(format: u32) -> Option<String> {
     let slice = unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, words_len) };
     let actual_len = slice.iter().position(|&c| c == 0).unwrap_or(words_len);
     Some(String::from_utf16_lossy(&slice[..actual_len]))
+}
+
+pub(crate) fn extract_non_file_urls(text: &str) -> smallvec::SmallVec<[gpui::SharedString; 2]> {
+    let mut urls = smallvec::SmallVec::new();
+    for line in text
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+    {
+        if !is_non_file_url(line) {
+            return smallvec::SmallVec::new();
+        }
+        urls.push(gpui::SharedString::from(line.to_owned()));
+    }
+    urls
+}
+
+fn is_non_file_url(candidate: &str) -> bool {
+    if candidate
+        .chars()
+        .any(|c| c.is_whitespace() || c.is_control())
+    {
+        return false;
+    }
+    let Some((scheme, rest)) = candidate.split_once("://") else {
+        return false;
+    };
+    if rest.is_empty() || scheme.eq_ignore_ascii_case("file") {
+        return false;
+    }
+    let mut chars = scheme.chars();
+    chars.next().is_some_and(|c| c.is_ascii_alphabetic())
+        && chars.all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+}
+
+fn get_clipboard_string(format: u32) -> Option<String> {
+    let global = HGLOBAL(unsafe { GetClipboardData(format).ok() }?.0);
+    string_from_hglobal(global)
 }
 
 fn is_image_format(format: u32) -> bool {
@@ -263,7 +307,7 @@ fn read_files() -> Option<ClipboardEntry> {
     let hdrop = HDROP(locked.ptr as *mut _);
     let mut filenames = Vec::new();
     with_file_names(hdrop, |name| filenames.push(std::path::PathBuf::from(name)));
-    Some(ClipboardEntry::ExternalPaths(ExternalPaths(
+    Some(ClipboardEntry::ExternalPaths(ExternalPaths::from_paths(
         filenames.into(),
     )))
 }

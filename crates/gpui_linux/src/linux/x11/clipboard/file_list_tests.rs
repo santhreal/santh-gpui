@@ -20,7 +20,7 @@ fn uri_lists_remain_file_entries_on_every_selection() -> anyhow::Result<()> {
     let clipboard = Clipboard::new()?;
     for selection in ClipboardKind::iter() {
         let expected = ClipboardItem {
-            entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+            entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths::from_paths(
                 smallvec::smallvec![
                     PathBuf::from("/workspace/project notes.txt"),
                     PathBuf::from("/workspace/#second.txt"),

@@ -18,7 +18,6 @@ use collections::HashMap;
 use filedescriptor::Pipe;
 use gpui_util::ResultExt as _;
 use http_client::Url;
-use smallvec::SmallVec;
 use wayland_backend::client::ObjectId;
 use wayland_backend::protocol::WEnum;
 use wayland_client::event_created_child;
@@ -89,7 +88,7 @@ use super::{
 use crate::linux::{
     DOUBLE_CLICK_INTERVAL, LinuxClient, LinuxCommon, LinuxKeyboardLayout, PIPE_READ_TIMEOUT,
     SCROLL_LINES, capslock_from_xkb,
-    clipboard_file_list::FILE_LIST_MIME_TYPE,
+    clipboard_file_list::{FILE_LIST_MIME_TYPE, parse_uri_list_for_drop},
     cursor_style_to_icon_names, get_xkb_compose_state,
     gpu_context::{self, PendingContext, WindowGpu},
     is_within_click_distance, keystroke_from_xkb, keystroke_underlying_dead_key,
@@ -2836,28 +2835,18 @@ impl Dispatch<wl_data_device::WlDataDevice, ()> for WaylandClientStatePtr {
                                 }
                             };
 
-                            let paths: SmallVec<[_; 2]> = file_list
-                                .lines()
-                                .filter_map(|path| Url::parse(path).log_err())
-                                .filter_map(|url| match url.to_file_path() {
-                                    Ok(url) => Some(url),
-                                    Err(()) => {
-                                        log::error!("Failed turn {url:?} into a file path");
-                                        None
-                                    }
-                                })
-                                .collect();
+                            let external_paths = parse_uri_list_for_drop(&file_list);
                             let position = Point::new(x.into(), y.into());
 
                             // Prevent dropping text from other programs.
-                            if paths.is_empty() {
+                            if external_paths.is_empty() {
                                 data_offer.destroy();
                                 return;
                             }
 
                             let input = PlatformInput::FileDrop(FileDropEvent::Entered {
                                 position,
-                                paths: gpui::ExternalPaths(paths),
+                                paths: external_paths,
                             });
 
                             let client = this.get_client();

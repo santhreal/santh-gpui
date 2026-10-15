@@ -43,7 +43,7 @@ fn file_offers_precede_text_and_invalid_files_do_not_fall_back() -> anyhow::Resu
                 offer.add_mime_type(format.into());
             }
             let expected = accepted.then(|| ClipboardItem {
-                entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths(
+                entries: vec![ClipboardEntry::ExternalPaths(ExternalPaths::from_paths(
                     smallvec::smallvec![PathBuf::from("/workspace/notes one.txt")],
                 ))],
             });

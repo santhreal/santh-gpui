@@ -2,8 +2,9 @@ use crate::{
     AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
     DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
-    PromptButton, RequestFrameOptions, Scene, Size, TestPlatform, TextInputConfiguration, TileId,
-    WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowParams,
+    PromptButton, RequestFrameOptions, Scene, SharedString, Size, TestPlatform,
+    TextInputConfiguration, TileId, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
+    WindowControlArea, WindowParams,
 };
 use collections::HashMap;
 use gpui_util::ResultExt as _;
@@ -283,6 +284,38 @@ impl TestWindow {
             pressed_button,
             modifiers,
         }))
+    }
+
+    pub fn simulate_external_drop(
+        &mut self,
+        position: Point<Pixels>,
+        paths: impl IntoIterator<Item = PathBuf>,
+        urls: impl IntoIterator<Item = impl Into<SharedString>>,
+    ) -> bool {
+        let paths = crate::ExternalPaths::new(
+            paths.into_iter().collect(),
+            urls.into_iter().map(Into::into).collect(),
+        );
+        self.simulate_input(PlatformInput::FileDrop(crate::FileDropEvent::Entered {
+            position,
+            paths,
+        }));
+        self.simulate_input(PlatformInput::FileDrop(crate::FileDropEvent::Pending {
+            position,
+        }));
+        let handled = self.simulate_input(PlatformInput::FileDrop(crate::FileDropEvent::Submit {
+            position,
+        }));
+        self.simulate_input(PlatformInput::FileDrop(crate::FileDropEvent::Ended));
+        handled
+    }
+
+    pub fn simulate_url_drop(
+        &mut self,
+        position: Point<Pixels>,
+        urls: impl IntoIterator<Item = impl Into<SharedString>>,
+    ) -> bool {
+        self.simulate_external_drop(position, std::iter::empty(), urls)
     }
 
     pub fn external_drag_files(&self) -> Vec<(PathBuf, bool)> {

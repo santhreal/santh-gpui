@@ -125,6 +125,8 @@ unsafe extern "C" {
     // AppKit constant naming the icon component of an NSDraggingImageComponent.
     #[allow(non_upper_case_globals)]
     static NSDraggingImageComponentIconKey: id;
+    #[allow(non_upper_case_globals)]
+    static NSPasteboardTypeURL: id;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]
@@ -1035,10 +1037,11 @@ impl MacWindow {
                 target_screen,
             );
             assert!(!native_window.is_null());
+            let dragged_types =
+                NSArray::arrayWithObjects(nil, &[NSFilenamesPboardType, NSPasteboardTypeURL]);
             let () = msg_send![
                 native_window,
-                registerForDraggedTypes:
-                    NSArray::arrayWithObject(nil, NSFilenamesPboardType)
+                registerForDraggedTypes: dragged_types
             ];
             let () = msg_send![
                 native_window,
@@ -3363,19 +3366,62 @@ extern "C" fn perform_drag_operation(this: &Object, _: Sel, dragging_info: id) -
 
 fn external_paths_from_event(dragging_info: *mut Object) -> Option<ExternalPaths> {
     let mut paths = SmallVec::new();
+    let mut urls = SmallVec::new();
     let pasteboard: id = unsafe { msg_send![dragging_info, draggingPasteboard] };
     let filenames = unsafe { NSPasteboard::propertyListForType(pasteboard, NSFilenamesPboardType) };
-    if filenames == nil {
-        return None;
+    if filenames != nil {
+        for file in unsafe { filenames.iter() } {
+            let path = unsafe {
+                let f = NSString::UTF8String(file);
+                CStr::from_ptr(f).to_string_lossy().into_owned()
+            };
+            paths.push(PathBuf::from(path));
+        }
     }
-    for file in unsafe { filenames.iter() } {
-        let path = unsafe {
-            let f = NSString::UTF8String(file);
-            CStr::from_ptr(f).to_string_lossy().into_owned()
-        };
-        paths.push(PathBuf::from(path))
+    unsafe {
+        let items: id = msg_send![pasteboard, pasteboardItems];
+        if items != nil {
+            for item in items.iter() {
+                let url_nsstring: id = msg_send![item, stringForType: NSPasteboardTypeURL];
+                if url_nsstring != nil {
+                    let ptr = NSString::UTF8String(url_nsstring);
+                    if !ptr.is_null() {
+                        let text = CStr::from_ptr(ptr).to_string_lossy();
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty()
+                            && !trimmed
+                                .get(..5)
+                                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+                        {
+                            urls.push(SharedString::from(trimmed.to_owned()));
+                        }
+                    }
+                }
+            }
+        }
+        if urls.is_empty() {
+            let url_nsstring: id = msg_send![pasteboard, stringForType: NSPasteboardTypeURL];
+            if url_nsstring != nil {
+                let ptr = NSString::UTF8String(url_nsstring);
+                if !ptr.is_null() {
+                    let text = CStr::from_ptr(ptr).to_string_lossy();
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty()
+                        && !trimmed
+                            .get(..5)
+                            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("file:"))
+                    {
+                        urls.push(SharedString::from(trimmed.to_owned()));
+                    }
+                }
+            }
+        }
     }
-    Some(ExternalPaths(paths))
+    if paths.is_empty() && urls.is_empty() {
+        None
+    } else {
+        Some(ExternalPaths::new(paths, urls))
+    }
 }
 
 extern "C" fn conclude_drag_operation(this: &Object, _: Sel, _: id) {
