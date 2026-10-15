@@ -126,6 +126,13 @@ impl PlatformWindow for HeadlessWindow {
         Point::default()
     }
 
+    fn lock_pointer(&self) -> bool {
+        // Headless windows have no pointer device or display server cursor.
+        false
+    }
+
+    fn unlock_pointer(&self) {}
+
     fn modifiers(&self) -> Modifiers {
         Modifiers::default()
     }

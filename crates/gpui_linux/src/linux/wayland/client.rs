@@ -37,6 +37,9 @@ use wayland_client::{
         wl_shm_pool, wl_surface,
     },
 };
+use wayland_protocols::wp::pointer_constraints::zv1::client::{
+    zwp_locked_pointer_v1, zwp_pointer_constraints_v1,
+};
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
@@ -46,6 +49,9 @@ use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection
 use wayland_protocols::wp::primary_selection::zv1::client::{
     zwp_primary_selection_device_manager_v1, zwp_primary_selection_device_v1,
     zwp_primary_selection_source_v1,
+};
+use wayland_protocols::wp::relative_pointer::zv1::client::{
+    zwp_relative_pointer_manager_v1, zwp_relative_pointer_v1,
 };
 use wayland_protocols::wp::text_input::zv3::client::zwp_text_input_v3::{
     ContentHint, ContentPurpose,
@@ -228,6 +234,9 @@ pub struct Globals {
     pub blur_manager: Option<org_kde_kwin_blur_manager::OrgKdeKwinBlurManager>,
     pub text_input_manager: Option<zwp_text_input_manager_v3::ZwpTextInputManagerV3>,
     pub gesture_manager: Option<zwp_pointer_gestures_v1::ZwpPointerGesturesV1>,
+    pub pointer_constraints: Option<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1>,
+    pub relative_pointer_manager:
+        Option<zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1>,
     pub dialog: Option<xdg_wm_dialog_v1::XdgWmDialogV1>,
     pub system_bell: Option<xdg_system_bell_v1::XdgSystemBellV1>,
     pub executor: ForegroundExecutor,
@@ -272,6 +281,8 @@ impl Globals {
             blur_manager: globals.bind(&qh, 1..=1, ()).ok(),
             text_input_manager: globals.bind(&qh, 1..=1, ()).ok(),
             gesture_manager: globals.bind(&qh, 1..=3, ()).ok(),
+            pointer_constraints: globals.bind(&qh, 1..=1, ()).ok(),
+            relative_pointer_manager: globals.bind(&qh, 1..=1, ()).ok(),
             dialog: globals.bind(&qh, dialog_v..=dialog_v, ()).ok(),
             system_bell: globals.bind(&qh, 1..=1, ()).ok(),
             executor,
@@ -334,7 +345,6 @@ fn first_output<'a>(outputs: impl Iterator<Item = &'a Output>) -> Option<&'a Out
     outputs.min_by_key(|output| output.protocol_id)
 }
 
-
 pub(crate) struct WaylandClientState {
     serial_tracker: SerialTracker,
     globals: Globals,
@@ -384,6 +394,7 @@ pub(crate) struct WaylandClientState {
     loop_handle: LoopHandle<'static, WaylandClientStatePtr>,
     cursor_style: Option<CursorStyle>,
     cursor_hidden_window: Option<WaylandWindowStatePtr>,
+    pub(crate) pointer_lock: Option<WaylandPointerLock>,
     clipboard: Clipboard,
     data_offers: Vec<DataOffer<WlDataOffer>>,
     primary_data_offer: Option<DataOffer<ZwpPrimarySelectionOfferV1>>,
@@ -393,6 +404,13 @@ pub(crate) struct WaylandClientState {
     event_loop: Option<EventLoop<'static, WaylandClientStatePtr>>,
     pub common: LinuxCommon,
     ime_enabled: Option<bool>,
+}
+
+pub(crate) struct WaylandPointerLock {
+    pub(crate) window: WaylandWindowStatePtr,
+    pub(crate) position: Point<Pixels>,
+    pub(crate) locked_pointer: zwp_locked_pointer_v1::ZwpLockedPointerV1,
+    pub(crate) relative_pointer: zwp_relative_pointer_v1::ZwpRelativePointerV1,
 }
 
 pub struct DragState {
@@ -662,6 +680,13 @@ impl WaylandClientStatePtr {
         {
             state.cursor_hidden_window = Some(window);
         }
+        if state
+            .pointer_lock
+            .as_ref()
+            .is_some_and(|lock| lock.window.ptr_eq(&closed_window))
+        {
+            state.unlock_pointer();
+        }
     }
 }
 
@@ -684,7 +709,7 @@ impl WaylandClientState {
     }
 
     fn restore_cursor_after_hide(&mut self) {
-        if self.cursor_hidden_window.take().is_none() {
+        if self.cursor_hidden_window.take().is_none() || self.pointer_lock.is_some() {
             return;
         }
         let Some(style) = self.cursor_style else {
@@ -717,6 +742,80 @@ impl WaylandClientState {
             scale,
         );
     }
+
+    pub(crate) fn lock_pointer(&mut self, window: &WaylandWindowStatePtr) -> bool {
+        if self
+            .pointer_lock
+            .as_ref()
+            .is_some_and(|lock| lock.window.ptr_eq(window))
+        {
+            return true;
+        }
+        if self.pointer_lock.is_some() {
+            self.unlock_pointer();
+        }
+        let (Some(pointer_constraints), Some(relative_pointer_manager), Some(wl_pointer)) = (
+            self.globals.pointer_constraints.as_ref(),
+            self.globals.relative_pointer_manager.as_ref(),
+            self.wl_pointer.as_ref(),
+        ) else {
+            return false;
+        };
+        let position = self.mouse_location.unwrap_or_default();
+        let surface = window.surface();
+        let locked_pointer = pointer_constraints.lock_pointer(
+            &surface,
+            wl_pointer,
+            None,
+            zwp_pointer_constraints_v1::Lifetime::Persistent,
+            &self.globals.qh,
+            (),
+        );
+        let relative_pointer =
+            relative_pointer_manager.get_relative_pointer(wl_pointer, &self.globals.qh, ());
+        let serial = self.serial_tracker.get(SerialKind::MouseEnter);
+        wl_pointer.set_cursor(serial.as_raw(), None, 0, 0);
+        self.pointer_lock = Some(WaylandPointerLock {
+            window: window.clone(),
+            position,
+            locked_pointer,
+            relative_pointer,
+        });
+        true
+    }
+
+    pub(crate) fn unlock_pointer(&mut self) {
+        let Some(lock) = self.pointer_lock.take() else {
+            return;
+        };
+        lock.locked_pointer.set_cursor_position_hint(
+            lock.position.x.as_f32() as f64,
+            lock.position.y.as_f32() as f64,
+        );
+        lock.window.surface().commit();
+        lock.relative_pointer.destroy();
+        lock.locked_pointer.destroy();
+        self.mouse_location = Some(lock.position);
+
+        if self.cursor_hidden_window.is_none()
+            && let Some(style) = self.cursor_style
+        {
+            let serial = self.serial_tracker.get(SerialKind::MouseEnter);
+            if let Some(cursor_shape_device) = &self.cursor_shape_device {
+                cursor_shape_device.set_shape(serial.as_raw(), to_shape(style));
+            } else if let (Some(focused_window), Some(wl_pointer)) =
+                (&self.mouse_focused_window, &self.wl_pointer)
+            {
+                let scale = focused_window.primary_output_scale();
+                self.cursor.set_icon(
+                    wl_pointer,
+                    serial.as_raw(),
+                    cursor_style_to_icon_names(style),
+                    scale,
+                );
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -725,6 +824,7 @@ pub struct WaylandClient(Rc<RefCell<WaylandClientState>>);
 impl Drop for WaylandClient {
     fn drop(&mut self) {
         let mut state = self.0.borrow_mut();
+        state.unlock_pointer();
         state.windows.clear();
 
         if let Some(wl_pointer) = &state.wl_pointer {
@@ -1000,6 +1100,7 @@ impl WaylandClient {
             enter_token: None,
             cursor_style: None,
             cursor_hidden_window: None,
+            pointer_lock: None,
             clipboard: Clipboard::new(conn.clone(), handle.clone()),
             data_offers: Vec::new(),
             primary_data_offer: None,
@@ -1033,13 +1134,9 @@ impl LinuxClient for WaylandClient {
     }
 
     fn display(&self, id: DisplayId) -> Option<Rc<dyn PlatformDisplay>> {
-        self.0
-            .borrow()
-            .outputs
-            .values()
-            .find_map(|output| {
-                (output.protocol_id as u64 == u64::from(id)).then(|| wayland_display(output))
-            })
+        self.0.borrow().outputs.values().find_map(|output| {
+            (output.protocol_id as u64 == u64::from(id)).then(|| wayland_display(output))
+        })
     }
 
     fn primary_display(&self) -> Option<Rc<dyn PlatformDisplay>> {
@@ -1156,7 +1253,7 @@ impl LinuxClient for WaylandClient {
         state.cursor_style = Some(style);
 
         // Don't clobber the invisible cursor; restore reads back from `cursor_style`.
-        if state.cursor_hidden_window.is_some() {
+        if state.cursor_hidden_window.is_some() || state.pointer_lock.is_some() {
             return;
         }
 
@@ -1444,6 +1541,25 @@ impl Dispatch<wl_registry::WlRegistry, GlobalListContents> for WaylandClientStat
                         .insert(output.id(), InProgressOutput::default());
                     state.wl_outputs.insert(output.id(), output);
                 }
+                "zwp_pointer_constraints_v1" => {
+                    state.globals.pointer_constraints = Some(
+                        registry.bind::<zwp_pointer_constraints_v1::ZwpPointerConstraintsV1, _, _>(
+                            name,
+                            1,
+                            qh,
+                            (),
+                        ),
+                    );
+                }
+                "zwp_relative_pointer_manager_v1" => {
+                    state.globals.relative_pointer_manager = Some(
+                        registry.bind::<
+                            zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1,
+                            _,
+                            _,
+                        >(name, 1, qh, ()),
+                    );
+                }
                 _ => {}
             },
             wl_registry::Event::GlobalRemove { name: _ } => {
@@ -1474,6 +1590,40 @@ delegate_noop!(WaylandClientStatePtr: ignore zwp_text_input_manager_v3::ZwpTextI
 delegate_noop!(WaylandClientStatePtr: ignore org_kde_kwin_blur::OrgKdeKwinBlur);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewporter::WpViewporter);
 delegate_noop!(WaylandClientStatePtr: ignore wp_viewport::WpViewport);
+delegate_noop!(WaylandClientStatePtr: ignore zwp_pointer_constraints_v1::ZwpPointerConstraintsV1);
+delegate_noop!(WaylandClientStatePtr: ignore zwp_locked_pointer_v1::ZwpLockedPointerV1);
+delegate_noop!(WaylandClientStatePtr: ignore zwp_relative_pointer_manager_v1::ZwpRelativePointerManagerV1);
+
+impl Dispatch<zwp_relative_pointer_v1::ZwpRelativePointerV1, ()> for WaylandClientStatePtr {
+    fn event(
+        this: &mut Self,
+        _: &zwp_relative_pointer_v1::ZwpRelativePointerV1,
+        event: zwp_relative_pointer_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let zwp_relative_pointer_v1::Event::RelativeMotion { dx, dy, .. } = event else {
+            return;
+        };
+        let client = this.get_client();
+        let state = client.borrow();
+        let Some(lock) = &state.pointer_lock else {
+            return;
+        };
+        let window = lock.window.clone();
+        let position = lock.position;
+        let pressed_button = state.button_pressed;
+        let modifiers = state.modifiers;
+        drop(state);
+        window.handle_input(PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            delta: point(px(dx as f32), px(dy as f32)),
+            pressed_button,
+            modifiers,
+        }));
+    }
+}
 
 impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
     fn event(
@@ -2161,7 +2311,9 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         state.enter_token = None;
                     }
                     state.restore_cursor_after_hide();
-                    if let Some(style) = state.cursor_style {
+                    if state.pointer_lock.is_some() {
+                        wl_pointer.set_cursor(serial, None, 0, 0);
+                    } else if let Some(style) = state.cursor_style {
                         if let Some(cursor_shape_device) = &state.cursor_shape_device {
                             cursor_shape_device.set_shape(serial, to_shape(style));
                         } else {
@@ -2181,6 +2333,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     // a MouseMove to establish hover at the entry position.
                     window.handle_input(PlatformInput::MouseMove(MouseMoveEvent {
                         position,
+                        delta: Point::default(),
                         pressed_button: None,
                         modifiers,
                     }));
@@ -2208,10 +2361,14 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                 surface_y,
                 ..
             } => {
-                if state.mouse_focused_window.is_none() {
+                if state.mouse_focused_window.is_none() || state.pointer_lock.is_some() {
                     return;
                 }
-                state.mouse_location = Some(point(px(surface_x as f32), px(surface_y as f32)));
+                let new_location = point(px(surface_x as f32), px(surface_y as f32));
+                let delta = state
+                    .mouse_location
+                    .map_or(Point::default(), |prev| new_location - prev);
+                state.mouse_location = Some(new_location);
                 state.restore_cursor_after_hide();
 
                 if let Some(window) = state.mouse_focused_window.clone() {
@@ -2248,7 +2405,8 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         state.enter_token = None;
                     }
                     let input = PlatformInput::MouseMove(MouseMoveEvent {
-                        position: state.mouse_location.unwrap(),
+                        position: new_location,
+                        delta,
                         pressed_button: state.button_pressed,
                         modifiers: state.modifiers,
                     });

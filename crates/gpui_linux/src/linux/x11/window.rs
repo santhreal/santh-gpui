@@ -21,6 +21,7 @@ use x11rb::{
     properties::WmHints,
     protocol::{
         sync,
+        xfixes::ConnectionExt as _,
         xinput::{self, ConnectionExt as _},
         xproto::{self, ClientMessageEvent, ConnectionExt, TranslateCoordinatesReply},
     },
@@ -308,6 +309,16 @@ pub struct X11WindowState {
     /// Root position of the button press the pointer is held from, the
     /// anchor a window manager measures a `_NET_WM_MOVERESIZE` drag from.
     press_root: Option<(i32, i32)>,
+    pub(crate) last_mouse_position: Option<Point<Pixels>>,
+    pub(crate) pointer_lock: Option<X11PointerLock>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct X11PointerLock {
+    pub(crate) position: Point<Pixels>,
+    pub(crate) lock_device_point: (i16, i16),
+    pub(crate) warp_target: (i16, i16),
+    pub(crate) ignore_warp: bool,
 }
 
 impl X11WindowState {
@@ -863,6 +874,8 @@ impl X11WindowState {
                 edge_constraints: None,
                 accesskit_adapter: None,
                 press_root: None,
+                last_mouse_position: None,
+                pointer_lock: None,
                 counter_id: sync_request_counter,
                 last_sync_counter: None,
             })
@@ -888,6 +901,7 @@ pub(crate) struct X11Window(pub X11WindowStatePtr);
 
 impl Drop for X11Window {
     fn drop(&mut self) {
+        self.unlock_pointer();
         let mut state = self.0.state.borrow_mut();
         // The client forgets the window in a deferred task; a frame that
         // fired before it runs would draw a destroyed window.
@@ -1523,6 +1537,9 @@ impl PlatformWindow for X11Window {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
+        if let Some(lock) = self.0.state.borrow().pointer_lock {
+            return lock.position;
+        }
         get_reply(
             || "X11 QueryPointer failed.",
             self.0.xcb.query_pointer(self.0.x_window),
@@ -1535,6 +1552,88 @@ impl PlatformWindow for X11Window {
                 px(reply.win_y as f32 / scale_factor),
             )
         })
+    }
+
+    fn lock_pointer(&self) -> bool {
+        if self.0.state.borrow().pointer_lock.is_some() {
+            return true;
+        }
+        let (scale_factor, bounds, cached_position) = {
+            let state = self.0.state.borrow();
+            (state.scale_factor, state.bounds, state.last_mouse_position)
+        };
+        let position = cached_position.unwrap_or_else(|| self.mouse_position());
+        let device_size = bounds.size.to_device_pixels(scale_factor);
+        let max_x = (device_size.width.0 - 1).max(0) as i16;
+        let max_y = (device_size.height.0 - 1).max(0) as i16;
+        let lock_x = ((f32::from(position.x) * scale_factor).round() as i16).clamp(0, max_x);
+        let lock_y = ((f32::from(position.y) * scale_factor).round() as i16).clamp(0, max_y);
+        let warp_x = ((device_size.width.0 / 2) as i16).clamp(0, max_x);
+        let warp_y = ((device_size.height.0 / 2) as i16).clamp(0, max_y);
+        if check_reply(
+            || "X11 XFixesHideCursor failed.",
+            self.0.xcb.xfixes_hide_cursor(self.0.x_window),
+        )
+        .log_err()
+        .is_none()
+        {
+            return false;
+        }
+
+        let grab_ok = get_reply(
+            || "X11 GrabPointer failed.",
+            self.0.xcb.grab_pointer(
+                true,
+                self.0.x_window,
+                xproto::EventMask::NO_EVENT,
+                xproto::GrabMode::ASYNC,
+                xproto::GrabMode::ASYNC,
+                self.0.x_window,
+                x11rb::NONE,
+                x11rb::CURRENT_TIME,
+            ),
+        )
+        .log_err()
+        .is_some_and(|reply| reply.status == xproto::GrabStatus::SUCCESS);
+
+        if !grab_ok {
+            let _ = self.0.xcb.xfixes_show_cursor(self.0.x_window);
+            xcb_flush(&self.0.xcb);
+            return false;
+        }
+
+        let _ = self
+            .0
+            .xcb
+            .warp_pointer(x11rb::NONE, self.0.x_window, 0, 0, 0, 0, warp_x, warp_y);
+        xcb_flush(&self.0.xcb);
+        self.0.state.borrow_mut().pointer_lock = Some(X11PointerLock {
+            position,
+            lock_device_point: (lock_x, lock_y),
+            warp_target: (warp_x, warp_y),
+            ignore_warp: true,
+        });
+        true
+    }
+
+    fn unlock_pointer(&self) {
+        let Some(lock) = self.0.state.borrow_mut().pointer_lock.take() else {
+            return;
+        };
+        self.0.state.borrow_mut().last_mouse_position = Some(lock.position);
+        let _ = self.0.xcb.ungrab_pointer(x11rb::CURRENT_TIME);
+        let _ = self.0.xcb.warp_pointer(
+            x11rb::NONE,
+            self.0.x_window,
+            0,
+            0,
+            0,
+            0,
+            lock.lock_device_point.0,
+            lock.lock_device_point.1,
+        );
+        let _ = self.0.xcb.xfixes_show_cursor(self.0.x_window);
+        xcb_flush(&self.0.xcb);
     }
 
     fn modifiers(&self) -> Modifiers {

@@ -40,6 +40,7 @@ pub(crate) struct WebWindowMutableState {
     pub(crate) is_active: bool,
     pub(crate) is_hovered: bool,
     pub(crate) mouse_position: Point<Pixels>,
+    pub(crate) pointer_locked: Option<Point<Pixels>>,
     pub(crate) modifiers: Modifiers,
     pub(crate) capslock: Capslock,
 }
@@ -181,6 +182,7 @@ impl WebWindow {
             is_active: true,
             is_hovered: false,
             mouse_position: Point::default(),
+            pointer_locked: None,
             modifiers: Modifiers::default(),
             capslock: Capslock::default(),
         };
@@ -517,6 +519,7 @@ impl WebWindowInner {
 
 impl Drop for WebWindow {
     fn drop(&mut self) {
+        self.unlock_pointer();
         // Cancel the pending requestAnimationFrame callback before
         // `_raf_closure` is freed, and disconnect the resize observer before
         // `_resize_observer_closure` is freed; a late invocation of either
@@ -650,7 +653,31 @@ impl PlatformWindow for WebWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
-        self.inner.state.borrow().mouse_position
+        let state = self.inner.state.borrow();
+        state.pointer_locked.unwrap_or(state.mouse_position)
+    }
+
+    fn lock_pointer(&self) -> bool {
+        self.inner.canvas.request_pointer_lock();
+        let mut state = self.inner.state.borrow_mut();
+        if state.pointer_locked.is_none() {
+            state.pointer_locked = Some(state.mouse_position);
+        }
+        true
+    }
+
+    fn unlock_pointer(&self) {
+        let mut state = self.inner.state.borrow_mut();
+        if let Some(lock_position) = state.pointer_locked.take() {
+            state.mouse_position = lock_position;
+        }
+        drop(state);
+        if let Some(document) = self.inner.browser_window.document() {
+            let canvas: &web_sys::Element = self.inner.canvas.as_ref();
+            if document.pointer_lock_element().as_ref() == Some(canvas) {
+                document.exit_pointer_lock();
+            }
+        }
     }
 
     fn modifiers(&self) -> Modifiers {

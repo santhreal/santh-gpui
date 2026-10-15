@@ -144,6 +144,7 @@ fn platform_events_that_reach_a_closed_window_are_dropped_without_an_error(
         ("input", |window, _| {
             window.simulate_input(PlatformInput::MouseMove(MouseMoveEvent {
                 position: point(px(10.), px(10.)),
+                delta: point(px(0.), px(0.)),
                 modifiers: Modifiers::default(),
                 pressed_button: None,
             }));

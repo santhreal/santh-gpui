@@ -235,11 +235,16 @@ impl WebWindowInner {
             this.pressed_button.set(Some(button));
             let click_count = this.click_state.borrow_mut().register_click(position, time);
 
-            {
+            let position = {
                 let mut current_state = this.state.borrow_mut();
-                current_state.mouse_position = position;
                 current_state.modifiers = modifiers;
-            }
+                if let Some(locked_position) = current_state.pointer_locked {
+                    locked_position
+                } else {
+                    current_state.mouse_position = position;
+                    position
+                }
+            };
 
             this.dispatch_input(PlatformInput::MouseDown(MouseDownEvent {
                 button,
@@ -312,11 +317,16 @@ impl WebWindowInner {
             this.pressed_button.set(None);
             let click_count = this.click_state.borrow().current_count;
 
-            {
+            let position = {
                 let mut current_state = this.state.borrow_mut();
-                current_state.mouse_position = position;
                 current_state.modifiers = modifiers;
-            }
+                if let Some(locked_position) = current_state.pointer_locked {
+                    locked_position
+                } else {
+                    current_state.mouse_position = position;
+                    position
+                }
+            };
 
             this.dispatch_input(PlatformInput::MouseUp(MouseUpEvent {
                 button,
@@ -531,14 +541,23 @@ impl WebWindowInner {
             let modifiers = modifiers_from_mouse_event(&event, this.is_mac);
             let current_pressed = this.pressed_button.get();
 
-            {
+            let (position, delta) = {
                 let mut current_state = this.state.borrow_mut();
-                current_state.mouse_position = position;
                 current_state.modifiers = modifiers;
-            }
+                if let Some(locked_position) = current_state.pointer_locked {
+                    let delta =
+                        Point::new(px(event.movement_x() as f32), px(event.movement_y() as f32));
+                    (locked_position, delta)
+                } else {
+                    let delta = position - current_state.mouse_position;
+                    current_state.mouse_position = position;
+                    (position, delta)
+                }
+            };
 
             this.dispatch_input(PlatformInput::MouseMove(MouseMoveEvent {
                 position,
+                delta,
                 pressed_button: current_pressed,
                 modifiers,
             }));
@@ -548,6 +567,9 @@ impl WebWindowInner {
     fn register_pointer_leave(self: &Rc<Self>) -> EventListenerHandle {
         let this = Rc::clone(self);
         self.listen("pointerleave", move |event: JsValue| {
+            if this.state.borrow().pointer_locked.is_some() {
+                return;
+            }
             let event: web_sys::PointerEvent = event.unchecked_into();
 
             let position = pointer_position_in_element(&event);

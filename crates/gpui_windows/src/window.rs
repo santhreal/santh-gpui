@@ -78,6 +78,8 @@ pub struct WindowsWindowState {
     pub cursor_visible: Arc<AtomicBool>,
     pub nc_button_pressed: Cell<Option<u32>>,
 
+    pub(crate) last_mouse_position: Cell<Option<Point<Pixels>>>,
+    pub(crate) pointer_lock: Cell<Option<WindowsPointerLock>>,
     pub display: Cell<WindowsDisplay>,
     /// Flag to instruct the `VSyncProvider` thread to invalidate the directx devices
     /// as resizing them has failed, causing us to have lost at least the render target.
@@ -88,6 +90,15 @@ pub struct WindowsWindowState {
     initial_placement: Cell<Option<WindowOpenStatus>>,
     hwnd: HWND,
     pub(crate) a11y: RefCell<Option<A11yState>>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct WindowsPointerLock {
+    pub(crate) position: Point<Pixels>,
+    pub(crate) lock_screen_point: POINT,
+    pub(crate) warp_screen_point: POINT,
+    pub(crate) warp_client_point: POINT,
+    pub(crate) ignore_warp: bool,
 }
 
 pub(crate) struct WindowsWindowInner {
@@ -178,6 +189,8 @@ impl WindowsWindowState {
             current_cursor: Cell::new(current_cursor),
             cursor_visible,
             nc_button_pressed: Cell::new(nc_button_pressed),
+            last_mouse_position: Cell::new(None),
+            pointer_lock: Cell::new(None),
             display: Cell::new(display),
             fullscreen: Cell::new(fullscreen),
             initial_placement: Cell::new(initial_placement),
@@ -245,6 +258,102 @@ impl WindowsWindowState {
     /// whether the mouse collides with other elements of GPUI).
     fn content_size(&self) -> Size<Pixels> {
         self.logical_size.get()
+    }
+
+    pub(crate) fn lock_pointer(&self) -> bool {
+        if self.pointer_lock.get().is_some() {
+            return true;
+        }
+        let mut client_rect = RECT::default();
+        if unsafe { GetClientRect(self.hwnd, &mut client_rect) }.is_err() {
+            return false;
+        }
+        let mut top_left = POINT {
+            x: client_rect.left,
+            y: client_rect.top,
+        };
+        let mut bottom_right = POINT {
+            x: client_rect.right,
+            y: client_rect.bottom,
+        };
+        if unsafe { !ClientToScreen(self.hwnd, &mut top_left).as_bool() }
+            || unsafe { !ClientToScreen(self.hwnd, &mut bottom_right).as_bool() }
+        {
+            return false;
+        }
+        let clip_rect = RECT {
+            left: top_left.x,
+            top: top_left.y,
+            right: bottom_right.x,
+            bottom: bottom_right.y,
+        };
+        if unsafe { ClipCursor(Some(&clip_rect)) }.is_err() {
+            return false;
+        }
+
+        let scale_factor = self.scale_factor.get();
+        let (position, lock_screen_point) = if let Some(pos) = self.last_mouse_position.get() {
+            let mut screen_pt = POINT {
+                x: (pos.x.as_f32() * scale_factor).round() as i32,
+                y: (pos.y.as_f32() * scale_factor).round() as i32,
+            };
+            unsafe {
+                let _ = ClientToScreen(self.hwnd, &mut screen_pt);
+            }
+            (pos, screen_pt)
+        } else {
+            let mut screen_pt = POINT::default();
+            unsafe {
+                let _ = GetCursorPos(&mut screen_pt);
+            }
+            let mut client_pt = screen_pt;
+            unsafe {
+                let _ = ScreenToClient(self.hwnd, &mut client_pt);
+            }
+            (
+                logical_point(client_pt.x as f32, client_pt.y as f32, scale_factor),
+                screen_pt,
+            )
+        };
+
+        let warp_client_point = POINT {
+            x: ((client_rect.right - client_rect.left) / 2).max(0),
+            y: ((client_rect.bottom - client_rect.top) / 2).max(0),
+        };
+        let mut warp_screen_point = warp_client_point;
+        unsafe {
+            let _ = ClientToScreen(self.hwnd, &mut warp_screen_point);
+            ShowCursor(false);
+            SetCursor(None);
+            let _ = SetCursorPos(warp_screen_point.x, warp_screen_point.y);
+        }
+
+        self.pointer_lock.set(Some(WindowsPointerLock {
+            position,
+            lock_screen_point,
+            warp_screen_point,
+            warp_client_point,
+            ignore_warp: true,
+        }));
+        true
+    }
+
+    pub(crate) fn unlock_pointer(&self) {
+        let Some(lock) = self.pointer_lock.take() else {
+            return;
+        };
+        self.last_mouse_position.set(Some(lock.position));
+        unsafe {
+            let _ = ClipCursor(None);
+            let _ = SetCursorPos(lock.lock_screen_point.x, lock.lock_screen_point.y);
+            ShowCursor(true);
+            if self
+                .cursor_visible
+                .load(std::sync::atomic::Ordering::Relaxed)
+            {
+                SetCursor(self.current_cursor.get());
+            }
+        }
     }
 }
 
@@ -589,6 +698,7 @@ impl rwh::HasDisplayHandle for WindowsWindow {
 
 impl Drop for WindowsWindow {
     fn drop(&mut self) {
+        self.state.unlock_pointer();
         // clone this `Rc` to prevent early release of the pointer
         let this = self.0.clone();
         self.0
@@ -663,6 +773,9 @@ impl PlatformWindow for WindowsWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
+        if let Some(lock) = self.state.pointer_lock.get() {
+            return lock.position;
+        }
         let scale_factor = self.scale_factor();
         let point = unsafe {
             let mut point: POINT = std::mem::zeroed();
@@ -673,6 +786,14 @@ impl PlatformWindow for WindowsWindow {
             point
         };
         logical_point(point.x as f32, point.y as f32, scale_factor)
+    }
+
+    fn lock_pointer(&self) -> bool {
+        self.state.lock_pointer()
+    }
+
+    fn unlock_pointer(&self) {
+        self.state.unlock_pointer();
     }
 
     fn modifiers(&self) -> Modifiers {

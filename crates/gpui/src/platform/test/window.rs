@@ -47,6 +47,8 @@ pub(crate) struct TestWindowState {
     appearance: WindowAppearance,
     external_drag_files: Vec<(PathBuf, bool)>,
     start_external_drag_result: bool,
+    pub(crate) mouse_position: Point<Pixels>,
+    pub(crate) locked_mouse_position: Option<Point<Pixels>>,
 }
 
 #[derive(Clone)]
@@ -111,6 +113,8 @@ impl TestWindow {
             appearance: WindowAppearance::Light,
             external_drag_files: Vec::new(),
             start_external_drag_result: false,
+            mouse_position: Point::default(),
+            locked_mouse_position: None,
         })))
     }
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -222,8 +226,28 @@ impl TestWindow {
         self.0.lock().request_frame_callback = Some(callback);
     }
 
-    pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
+    pub fn simulate_input(&mut self, mut event: PlatformInput) -> bool {
         let mut lock = self.0.lock();
+        match &mut event {
+            PlatformInput::MouseMove(mouse_move) => {
+                if let Some(locked_position) = lock.locked_mouse_position {
+                    mouse_move.position = locked_position;
+                } else {
+                    lock.mouse_position = mouse_move.position;
+                }
+            }
+            PlatformInput::MouseDown(mouse_down) => {
+                if lock.locked_mouse_position.is_none() {
+                    lock.mouse_position = mouse_down.position;
+                }
+            }
+            PlatformInput::MouseUp(mouse_up) => {
+                if lock.locked_mouse_position.is_none() {
+                    lock.mouse_position = mouse_up.position;
+                }
+            }
+            _ => {}
+        }
         let Some(mut callback) = lock.input_callback.take() else {
             return false;
         };
@@ -231,6 +255,34 @@ impl TestWindow {
         let result = callback(event);
         self.0.lock().input_callback = Some(callback);
         !result.propagate
+    }
+
+    pub fn is_pointer_locked(&self) -> bool {
+        self.0.lock().locked_mouse_position.is_some()
+    }
+
+    pub fn simulate_locked_mouse_move(
+        &mut self,
+        delta: Point<Pixels>,
+        pressed_button: Option<crate::MouseButton>,
+        modifiers: crate::Modifiers,
+    ) -> bool {
+        let position = {
+            let mut state = self.0.lock();
+            match state.locked_mouse_position {
+                Some(locked_position) => locked_position,
+                None => {
+                    state.mouse_position += delta;
+                    state.mouse_position
+                }
+            }
+        };
+        self.simulate_input(PlatformInput::MouseMove(crate::MouseMoveEvent {
+            position,
+            delta,
+            pressed_button,
+            modifiers,
+        }))
     }
 
     pub fn external_drag_files(&self) -> Vec<(PathBuf, bool)> {
@@ -281,7 +333,23 @@ impl PlatformWindow for TestWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
-        Point::default()
+        let state = self.0.lock();
+        state.locked_mouse_position.unwrap_or(state.mouse_position)
+    }
+
+    fn lock_pointer(&self) -> bool {
+        let mut state = self.0.lock();
+        if state.locked_mouse_position.is_none() {
+            state.locked_mouse_position = Some(state.mouse_position);
+        }
+        true
+    }
+
+    fn unlock_pointer(&self) {
+        let mut state = self.0.lock();
+        if let Some(locked_position) = state.locked_mouse_position.take() {
+            state.mouse_position = locked_position;
+        }
     }
 
     fn modifiers(&self) -> crate::Modifiers {

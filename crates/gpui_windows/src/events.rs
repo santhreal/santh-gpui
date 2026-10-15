@@ -338,6 +338,7 @@ impl WindowsWindowInner {
     }
 
     fn handle_destroy_msg(&self, handle: HWND) -> Option<isize> {
+        self.state.unlock_pointer();
         let callback = { self.state.callbacks.close.take() };
         // Re-enable parent window if this was a modal dialog
         if let Some(parent_hwnd) = self.parent_hwnd {
@@ -383,10 +384,40 @@ impl WindowsWindowInner {
             }
             _ => None,
         };
-        let x = lparam.signed_loword() as f32;
-        let y = lparam.signed_hiword() as f32;
+        let client_x = lparam.signed_loword() as i32;
+        let client_y = lparam.signed_hiword() as i32;
+        let (position, delta) = if let Some(mut lock) = self.state.pointer_lock.get() {
+            if lock.ignore_warp
+                && client_x == lock.warp_client_point.x
+                && client_y == lock.warp_client_point.y
+            {
+                lock.ignore_warp = false;
+                self.state.pointer_lock.set(Some(lock));
+                self.state.callbacks.input.set(Some(func));
+                return Some(0);
+            }
+            let dx = (client_x - lock.warp_client_point.x) as f32;
+            let dy = (client_y - lock.warp_client_point.y) as f32;
+            if dx == 0.0 && dy == 0.0 {
+                self.state.callbacks.input.set(Some(func));
+                return Some(0);
+            }
+            let delta = logical_point(dx, dy, scale_factor);
+            lock.ignore_warp = true;
+            self.state.pointer_lock.set(Some(lock));
+            unsafe {
+                let _ = SetCursorPos(lock.warp_screen_point.x, lock.warp_screen_point.y);
+            }
+            (lock.position, delta)
+        } else {
+            let position = logical_point(client_x as f32, client_y as f32, scale_factor);
+            let prev = self.state.last_mouse_position.replace(Some(position));
+            let delta = prev.map_or(Point::default(), |prev| position - prev);
+            (position, delta)
+        };
         let input = PlatformInput::MouseMove(MouseMoveEvent {
-            position: logical_point(x, y, scale_factor),
+            position,
+            delta,
             pressed_button,
             modifiers: current_modifiers(),
         });
@@ -833,6 +864,7 @@ impl WindowsWindowInner {
 
         if !activated {
             this.state.cursor_visible.store(true, Ordering::Relaxed);
+            this.state.unlock_pointer();
         }
 
         // When the window is activated (gains focus), reset the modifier tracking state.
@@ -1045,6 +1077,9 @@ impl WindowsWindowInner {
     }
 
     fn handle_nc_mouse_move_msg(&self, handle: HWND, lparam: LPARAM) -> Option<isize> {
+        if self.state.pointer_lock.get().is_some() {
+            return Some(0);
+        }
         self.start_tracking_mouse(handle, TME_LEAVE | TME_NONCLIENT);
         self.restore_cursor_after_hide();
 
@@ -1056,8 +1091,12 @@ impl WindowsWindowInner {
             y: lparam.signed_hiword().into(),
         };
         unsafe { ScreenToClient(handle, &mut cursor_point).ok().log_err() };
+        let position = logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor);
+        let prev = self.state.last_mouse_position.replace(Some(position));
+        let delta = prev.map_or(Point::default(), |prev| position - prev);
         let input = PlatformInput::MouseMove(MouseMoveEvent {
-            position: logical_point(cursor_point.x as f32, cursor_point.y as f32, scale_factor),
+            position,
+            delta,
             pressed_button: None,
             modifiers: current_modifiers(),
         });
@@ -1212,7 +1251,9 @@ impl WindowsWindowInner {
         {
             return None;
         }
-        let cursor = if self.state.cursor_visible.load(Ordering::Relaxed) {
+        let cursor = if self.state.cursor_visible.load(Ordering::Relaxed)
+            && self.state.pointer_lock.get().is_none()
+        {
             self.state.current_cursor.get()
         } else {
             None
@@ -1405,7 +1446,9 @@ impl WindowsWindowInner {
 
     /// Clear the hidden flag and restore the cursor immediately
     fn restore_cursor_after_hide(&self) {
-        if !self.state.cursor_visible.swap(true, Ordering::Relaxed) {
+        if !self.state.cursor_visible.swap(true, Ordering::Relaxed)
+            && self.state.pointer_lock.get().is_none()
+        {
             unsafe {
                 SetCursor(self.state.current_cursor.get());
             }

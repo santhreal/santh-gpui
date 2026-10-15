@@ -816,11 +816,25 @@ impl VisualTestContext {
         button: impl Into<Option<MouseButton>>,
         modifiers: Modifiers,
     ) {
+        let delta = self.update(|window, _| position - window.mouse_position());
         self.simulate_event(MouseMoveEvent {
             position,
+            delta,
             modifiers,
             pressed_button: button.into(),
         })
+    }
+
+    /// Simulate a relative mouse move event while the pointer is locked.
+    pub fn simulate_locked_mouse_move(
+        &mut self,
+        delta: Point<Pixels>,
+        button: impl Into<Option<MouseButton>>,
+        modifiers: Modifiers,
+    ) {
+        self.test_window(self.window)
+            .simulate_locked_mouse_move(delta, button.into(), modifiers);
+        self.background_executor.run_until_parked();
     }
 
     /// Simulate a mouse down event to the given point

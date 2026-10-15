@@ -4985,6 +4985,7 @@ mod tests {
                 window.dispatch_event(
                     MouseMoveEvent {
                         position: point(px(10.), px(10.)),
+                        delta: Point::default(),
                         modifiers: Default::default(),
                         pressed_button: None,
                     }
@@ -5104,6 +5105,7 @@ mod tests {
                 window.dispatch_event(
                     MouseMoveEvent {
                         position: point(px(75.), px(75.)),
+                        delta: Point::default(),
                         modifiers: Default::default(),
                         pressed_button: None,
                     }

@@ -261,10 +261,14 @@ impl VisualTestAppContext {
         button: impl Into<Option<MouseButton>>,
         modifiers: Modifiers,
     ) {
+        let delta = self
+            .update_window(window, |_, window, _| position - window.mouse_position())
+            .unwrap_or_default();
         self.simulate_event(
             window,
             MouseMoveEvent {
                 position,
+                delta,
                 modifiers,
                 pressed_button: button.into(),
             },

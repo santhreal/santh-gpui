@@ -1844,7 +1844,7 @@ impl WgpuRenderer {
                             grayscale: false.into(),
                             opacity: surface.opacity,
                             bounds: surface.bounds,
-                            content_mask: surface.content_mask.clone(),
+                            content_mask: surface.content_mask,
                             corner_radii: surface.corner_radii,
                             tile: AtlasTile {
                                 texture_id: AtlasTextureId {

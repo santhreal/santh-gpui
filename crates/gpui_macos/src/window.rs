@@ -126,6 +126,12 @@ unsafe extern "C" {
     #[allow(non_upper_case_globals)]
     static NSDraggingImageComponentIconKey: id;
 }
+
+#[link(name = "CoreGraphics", kind = "framework")]
+unsafe extern "C" {
+    fn CGAssociateMouseAndMouseCursorPosition(connected: i32) -> i32;
+    fn CGWarpMouseCursorPosition(new_cursor_position: core_graphics::geometry::CGPoint) -> i32;
+}
 #[ctor(unsafe)]
 unsafe fn build_classes() {
     unsafe {
@@ -635,9 +641,42 @@ struct MacWindowState {
     accesskit_adapter: Option<accesskit_macos::SubclassingAdapter>,
     // The parent window if this window is a sheet (Dialog kind)
     sheet_parent: Option<id>,
+    last_mouse_position: Option<Point<Pixels>>,
+    pointer_lock_position: Option<Point<Pixels>>,
 }
 
 impl MacWindowState {
+    fn unlock_pointer(&mut self) {
+        let Some(lock_position) = self.pointer_lock_position.take() else {
+            return;
+        };
+        self.last_mouse_position = Some(lock_position);
+        let content_height = self.content_size().height;
+        let window_point = NSPoint::new(
+            lock_position.x.to_f64(),
+            (content_height - lock_position.y).to_f64(),
+        );
+        unsafe {
+            let window_rect = NSRect::new(window_point, NSSize::new(0.0, 0.0));
+            let screen_rect: NSRect =
+                msg_send![self.native_window, convertRectToScreen: window_rect];
+            let screens: id = NSScreen::screens(nil);
+            let primary_screen: id = msg_send![screens, objectAtIndex: 0usize];
+            let primary_height = if !primary_screen.is_null() {
+                NSScreen::frame(primary_screen).size.height
+            } else {
+                0.0
+            };
+            let cg_point = core_graphics::geometry::CGPoint::new(
+                screen_rect.origin.x,
+                primary_height - screen_rect.origin.y,
+            );
+            CGWarpMouseCursorPosition(cg_point);
+            CGAssociateMouseAndMouseCursorPosition(1);
+            let _: () = msg_send![class!(NSCursor), unhide];
+        }
+    }
+
     fn move_traffic_light(&mut self) {
         if let Some(traffic_light_position) = self.traffic_light_position {
             if self.is_fullscreen() {
@@ -1065,6 +1104,8 @@ impl MacWindow {
                 closed: Arc::new(AtomicBool::new(false)),
                 accesskit_adapter: None,
                 sheet_parent: None,
+                last_mouse_position: None,
+                pointer_lock_position: None,
             })));
 
             (*native_window).set_ivar(
@@ -1300,6 +1341,7 @@ impl MacWindow {
 impl Drop for MacWindow {
     fn drop(&mut self) {
         let mut this = self.0.lock();
+        this.unlock_pointer();
         this.renderer.destroy();
         let window = this.native_window;
         let sheet_parent = this.sheet_parent.take();
@@ -1457,6 +1499,9 @@ impl PlatformWindow for MacWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
+        if let Some(lock_position) = self.0.lock().pointer_lock_position {
+            return lock_position;
+        }
         let position = unsafe {
             self.0
                 .lock()
@@ -1464,6 +1509,31 @@ impl PlatformWindow for MacWindow {
                 .mouseLocationOutsideOfEventStream()
         };
         convert_mouse_position(position, self.content_size().height)
+    }
+
+    fn lock_pointer(&self) -> bool {
+        let mut state = self.0.lock();
+        if state.pointer_lock_position.is_some() {
+            return true;
+        }
+        let content_height = state.content_size().height;
+        let position = state.last_mouse_position.unwrap_or_else(|| {
+            let ns_pos = unsafe { state.native_window.mouseLocationOutsideOfEventStream() };
+            convert_mouse_position(ns_pos, content_height)
+        });
+        unsafe {
+            if CGAssociateMouseAndMouseCursorPosition(0) != 0 {
+                return false;
+            }
+            let _: () = msg_send![class!(NSCursor), hide];
+        }
+        state.pointer_lock_position = Some(position);
+        state.synthetic_drag_counter += 1;
+        true
+    }
+
+    fn unlock_pointer(&self) {
+        self.0.lock().unlock_pointer();
     }
 
     fn modifiers(&self) -> Modifiers {
@@ -2635,6 +2705,14 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
                 };
             }
 
+            PlatformInput::MouseMove(event) => {
+                if let Some(lock_position) = lock.pointer_lock_position {
+                    event.position = lock_position;
+                } else {
+                    let prev = lock.last_mouse_position.replace(event.position);
+                    event.delta = prev.map_or(event.delta, |prev| event.position - prev);
+                }
+            }
             _ => {}
         };
 
@@ -2656,14 +2734,17 @@ extern "C" fn handle_view_event(this: &Object, _: Sel, native_event: id) {
                 // Synthetic drag is used for selecting long buffer contents while buffer is being scrolled.
                 // External file drag and drop is able to emit its own synthetic mouse events which will conflict
                 // with these ones.
-                if !lock.external_files_dragged {
+                if !lock.external_files_dragged && lock.pointer_lock_position.is_none() {
                     lock.synthetic_drag_counter += 1;
                     let executor = lock.foreground_executor.clone();
                     executor
                         .spawn(synthetic_drag(
                             weak_window_state,
                             lock.synthetic_drag_counter,
-                            event.clone(),
+                            MouseMoveEvent {
+                                delta: Point::default(),
+                                ..event.clone()
+                            },
                             lock.background_executor.clone(),
                         ))
                         .detach();

@@ -1737,12 +1737,32 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn mouse_position(&self) -> Point<Pixels> {
-        self.borrow()
-            .client
-            .get_client()
-            .borrow()
-            .mouse_location
-            .unwrap_or_default()
+        let client = self.borrow().client.get_client();
+        let state = client.borrow();
+        if let Some(lock) = &state.pointer_lock
+            && lock.window.ptr_eq(&self.0)
+        {
+            return lock.position;
+        }
+        state.mouse_location.unwrap_or_default()
+    }
+
+    fn lock_pointer(&self) -> bool {
+        let client = self.borrow().client.get_client();
+        let mut state = client.borrow_mut();
+        state.lock_pointer(&self.0)
+    }
+
+    fn unlock_pointer(&self) {
+        let client = self.borrow().client.get_client();
+        let mut state = client.borrow_mut();
+        if state
+            .pointer_lock
+            .as_ref()
+            .is_some_and(|lock| lock.window.ptr_eq(&self.0))
+        {
+            state.unlock_pointer();
+        }
     }
 
     fn modifiers(&self) -> Modifiers {

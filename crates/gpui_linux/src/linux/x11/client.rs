@@ -27,6 +27,7 @@ use x11rb::{
     cursor,
     errors::ConnectionError,
     protocol::randr::ConnectionExt as _,
+    protocol::xfixes::{self, ConnectionExt as _},
     protocol::xinput::ConnectionExt,
     protocol::xkb::ConnectionExt as _,
     protocol::xproto::{
@@ -379,6 +380,7 @@ impl X11Client {
         xcb_connection.prefetch_extension_information(randr::X11_EXTENSION_NAME)?;
         xcb_connection.prefetch_extension_information(render::X11_EXTENSION_NAME)?;
         xcb_connection.prefetch_extension_information(xinput::X11_EXTENSION_NAME)?;
+        xcb_connection.prefetch_extension_information(xfixes::X11_EXTENSION_NAME)?;
 
         // Announce to X server that XInput up to 2.4 is supported.
         // Version 2.4 is needed for gesture events (GesturePinchBegin/Update/End).
@@ -401,6 +403,11 @@ impl X11Client {
             supports_xinput_gestures,
         );
 
+        get_reply(
+            || "XFixes QueryVersion failed",
+            xcb_connection.xfixes_query_version(4, 0),
+        )
+        .log_err();
         let pointer_device_states =
             current_pointer_device_states(&xcb_connection, &BTreeMap::new()).unwrap_or_default();
 
@@ -1350,20 +1357,68 @@ impl X11Client {
                     };
                 }
                 let pressed_button = pressed_button_from_mask(event.button_mask[0]);
-                let position = point(
+                let event_dev_x = (event.event_x as f32 / u16::MAX as f32).round() as i16;
+                let event_dev_y = (event.event_y as f32 / u16::MAX as f32).round() as i16;
+                let raw_position = point(
                     px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
                     px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
                 );
+                let scale_factor = state.scale_factor;
                 let modifiers = modifiers_from_xinput_info(event.mods);
                 state.modifiers = modifiers;
+                let xcb_connection = state.xcb_connection.clone();
                 drop(state);
 
+                let mut position = raw_position;
                 if event.valuator_mask[0] & 3 != 0 {
-                    window.handle_input(PlatformInput::MouseMove(gpui::MouseMoveEvent {
-                        position,
-                        pressed_button,
-                        modifiers,
-                    }));
+                    let move_event = {
+                        let mut win_state = window.state.borrow_mut();
+                        if let Some(lock) = win_state.pointer_lock.as_mut() {
+                            position = lock.position;
+                            if lock.ignore_warp
+                                && event_dev_x == lock.warp_target.0
+                                && event_dev_y == lock.warp_target.1
+                            {
+                                lock.ignore_warp = false;
+                                None
+                            } else {
+                                let warp_origin = point(
+                                    px(lock.warp_target.0 as f32 / scale_factor),
+                                    px(lock.warp_target.1 as f32 / scale_factor),
+                                );
+                                let delta = raw_position - warp_origin;
+                                if delta.x == px(0.0) && delta.y == px(0.0) {
+                                    None
+                                } else {
+                                    lock.ignore_warp = true;
+                                    let _ = xcb_connection.warp_pointer(
+                                        x11rb::NONE,
+                                        window.x_window,
+                                        0,
+                                        0,
+                                        0,
+                                        0,
+                                        lock.warp_target.0,
+                                        lock.warp_target.1,
+                                    );
+                                    xcb_flush(&xcb_connection);
+                                    Some((lock.position, delta))
+                                }
+                            }
+                        } else {
+                            let prev = win_state.last_mouse_position.replace(raw_position);
+                            let delta = prev.map_or(Point::default(), |prev| raw_position - prev);
+                            Some((raw_position, delta))
+                        }
+                    };
+                    if let Some((position, delta)) = move_event {
+                        window.handle_input(PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                            position,
+                            delta,
+                            pressed_button,
+                            modifiers,
+                        }));
+                    }
                 }
 
                 state = self.0.borrow_mut();

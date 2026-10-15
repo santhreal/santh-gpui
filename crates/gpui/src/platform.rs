@@ -851,6 +851,8 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn appearance(&self) -> WindowAppearance;
     fn display(&self) -> Option<Rc<dyn PlatformDisplay>>;
     fn mouse_position(&self) -> Point<Pixels>;
+    fn lock_pointer(&self) -> bool;
+    fn unlock_pointer(&self);
     fn modifiers(&self) -> Modifiers;
     fn capslock(&self) -> Capslock;
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler);

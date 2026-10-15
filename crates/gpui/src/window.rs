@@ -1378,6 +1378,8 @@ pub struct Window {
     /// The hitbox that has captured the pointer, if any.
     /// While captured, mouse events route to this hitbox regardless of hit testing.
     captured_hitbox: Option<HitboxId>,
+    /// The window position at which the pointer was locked, if any.
+    pointer_locked: Option<Point<Pixels>>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     inspector: Option<Entity<Inspector>>,
     #[cfg(feature = "profiler")]
@@ -1908,6 +1910,9 @@ impl Window {
             move |active| {
                 let _ = update_from_platform(handle, &mut cx, |window, cx| {
                     window.active.set(active);
+                    if !active {
+                        window.unlock_pointer();
+                    }
                     window.modifiers = window.platform_window.modifiers();
                     window.capslock = window.platform_window.capslock();
                     window
@@ -2076,6 +2081,7 @@ impl Window {
             client_inset: None,
             image_cache_stack: Vec::new(),
             captured_hitbox: None,
+            pointer_locked: None,
             #[cfg(any(feature = "inspector", debug_assertions))]
             inspector: None,
             #[cfg(feature = "profiler")]
@@ -2392,6 +2398,7 @@ impl Window {
 
     /// Close this window.
     pub fn remove_window(&mut self) {
+        self.unlock_pointer();
         self.removed = true;
     }
 
@@ -3243,6 +3250,32 @@ impl Window {
     /// Returns the hitbox that has captured the pointer, if any.
     pub fn captured_hitbox(&self) -> Option<HitboxId> {
         self.captured_hitbox
+    }
+
+    /// Hides the cursor, confines it to this window, and dispatches relative
+    /// motion in [`MouseMoveEvent::delta`] while keeping
+    /// [`MouseMoveEvent::position`] at the position where the lock started.
+    pub fn lock_pointer(&mut self) {
+        if self.pointer_locked.is_some() {
+            return;
+        }
+        if self.platform_window.lock_pointer() {
+            self.pointer_locked = Some(self.mouse_position);
+        }
+    }
+
+    /// Releases any active pointer lock, restores the cursor, and places the
+    /// pointer back at the position where [`Self::lock_pointer`] was called.
+    pub fn unlock_pointer(&mut self) {
+        if let Some(lock_position) = self.pointer_locked.take() {
+            self.platform_window.unlock_pointer();
+            self.mouse_position = lock_position;
+        }
+    }
+
+    /// Returns whether the pointer is currently locked to this window.
+    pub fn is_pointer_locked(&self) -> bool {
+        self.pointer_locked.is_some()
     }
 
     /// The current state of the keyboard's modifiers
@@ -5618,7 +5651,7 @@ impl Window {
 
     fn reset_cursor_style(&self, cx: &mut App) {
         // Set the cursor only if we're the active window.
-        if self.is_window_hovered() {
+        if self.is_window_hovered() && !self.is_pointer_locked() {
             let style = self
                 .rendered_frame
                 .cursor_style(self)
@@ -5697,17 +5730,26 @@ impl Window {
         let event = match event {
             // Track the mouse position with our own state, since accessing the platform
             // API for the mouse position can only occur on the main thread.
-            PlatformInput::MouseMove(mouse_move) => {
+            PlatformInput::MouseMove(mut mouse_move) => {
+                if let Some(lock_position) = self.pointer_locked {
+                    mouse_move.position = lock_position;
+                }
                 self.pointer_at(mouse_move.position);
                 self.modifiers = mouse_move.modifiers;
                 PlatformInput::MouseMove(mouse_move)
             }
-            PlatformInput::MouseDown(mouse_down) => {
+            PlatformInput::MouseDown(mut mouse_down) => {
+                if let Some(lock_position) = self.pointer_locked {
+                    mouse_down.position = lock_position;
+                }
                 self.pointer_at(mouse_down.position);
                 self.modifiers = mouse_down.modifiers;
                 PlatformInput::MouseDown(mouse_down)
             }
-            PlatformInput::MouseUp(mouse_up) => {
+            PlatformInput::MouseUp(mut mouse_up) => {
+                if let Some(lock_position) = self.pointer_locked {
+                    mouse_up.position = lock_position;
+                }
                 self.pointer_at(mouse_up.position);
                 self.modifiers = mouse_up.modifiers;
                 PlatformInput::MouseUp(mouse_up)
@@ -5715,8 +5757,12 @@ impl Window {
             PlatformInput::MousePressure(mouse_pressure) => {
                 PlatformInput::MousePressure(mouse_pressure)
             }
-            PlatformInput::MouseExited(mouse_exited) => {
-                self.pointer_left = true;
+            PlatformInput::MouseExited(mut mouse_exited) => {
+                if let Some(lock_position) = self.pointer_locked {
+                    mouse_exited.position = lock_position;
+                } else {
+                    self.pointer_left = true;
+                }
                 self.modifiers = mouse_exited.modifiers;
                 PlatformInput::MouseExited(mouse_exited)
             }
@@ -5725,12 +5771,18 @@ impl Window {
                 self.capslock = modifiers_changed.capslock;
                 PlatformInput::ModifiersChanged(modifiers_changed)
             }
-            PlatformInput::ScrollWheel(scroll_wheel) => {
+            PlatformInput::ScrollWheel(mut scroll_wheel) => {
+                if let Some(lock_position) = self.pointer_locked {
+                    scroll_wheel.position = lock_position;
+                }
                 self.pointer_at(scroll_wheel.position);
                 self.modifiers = scroll_wheel.modifiers;
                 PlatformInput::ScrollWheel(scroll_wheel)
             }
-            PlatformInput::Pinch(pinch) => {
+            PlatformInput::Pinch(mut pinch) => {
+                if let Some(lock_position) = self.pointer_locked {
+                    pinch.position = lock_position;
+                }
                 self.pointer_at(pinch.position);
                 self.modifiers = pinch.modifiers;
                 PlatformInput::Pinch(pinch)
@@ -5739,6 +5791,7 @@ impl Window {
             // to internal drag and drop events.
             PlatformInput::FileDrop(file_drop) => match file_drop {
                 FileDropEvent::Entered { position, paths } => {
+                    let delta = position - self.mouse_position;
                     self.pointer_at(position);
                     let source_window = self.handle.window_id();
                     if !cx.restore_platform_drag(source_window) && cx.active_drag.is_none() {
@@ -5752,14 +5805,17 @@ impl Window {
                     }
                     PlatformInput::MouseMove(MouseMoveEvent {
                         position,
+                        delta,
                         pressed_button: Some(MouseButton::Left),
                         modifiers: Modifiers::default(),
                     })
                 }
                 FileDropEvent::Pending { position } => {
+                    let delta = position - self.mouse_position;
                     self.pointer_at(position);
                     PlatformInput::MouseMove(MouseMoveEvent {
                         position,
+                        delta,
                         pressed_button: Some(MouseButton::Left),
                         modifiers: Modifiers::default(),
                     })
@@ -5903,6 +5959,9 @@ impl Window {
     fn pointer_at(&mut self, position: Point<Pixels>) {
         self.mouse_position = position;
         self.pointer_left = false;
+        if let Some(test_window) = self.platform_window.as_test() {
+            test_window.0.lock().mouse_position = position;
+        }
     }
 
     /// The hitboxes under the pointer in `frame`; none once the pointer has
@@ -7130,12 +7189,36 @@ impl Window {
     /// which will trigger hover states and tooltips.
     #[cfg(any(test, feature = "test-support"))]
     pub fn simulate_mouse_move(&mut self, position: Point<Pixels>, cx: &mut App) {
+        let delta = position - self.mouse_position;
         let event = PlatformInput::MouseMove(MouseMoveEvent {
             position,
+            delta,
             modifiers: self.modifiers,
             pressed_button: None,
         });
         let _ = self.dispatch_event(event, cx);
+    }
+    /// For testing: simulate a relative mouse move event while the pointer is locked.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn simulate_locked_mouse_move(&mut self, delta: Point<Pixels>, cx: &mut App) {
+        let position = if self.is_pointer_locked() {
+            self.mouse_position
+        } else {
+            self.mouse_position + delta
+        };
+        let event = PlatformInput::MouseMove(MouseMoveEvent {
+            position,
+            delta,
+            modifiers: self.modifiers,
+            pressed_button: None,
+        });
+        let _ = self.dispatch_event(event, cx);
+    }
+}
+
+impl Drop for Window {
+    fn drop(&mut self) {
+        self.unlock_pointer();
     }
 }
 
@@ -7656,9 +7739,9 @@ mod tests {
     use crate::{
         AnyWindowHandle, AppContext as _, Bounds, Context, DragMoveEvent, Empty,
         ExternalDragPayload, ExternalPaths, FileDragPaths, FileDropEvent, FocusHandle,
-        InputEvent as _, InteractiveElement as _, IntoElement, MouseButton, MouseDownEvent,
-        MouseExitEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PinchEvent, Pixels,
-        PlatformInput, Point, Render, RequestFrameOptions, ScrollWheelEvent,
+        InputEvent as _, InteractiveElement as _, IntoElement, Modifiers, MouseButton,
+        MouseDownEvent, MouseExitEvent, MouseMoveEvent, MouseUpEvent, ParentElement, PinchEvent,
+        Pixels, PlatformInput, Point, Render, RequestFrameOptions, ScrollWheelEvent,
         StatefulInteractiveElement as _, Styled, TestAppContext, TouchEvent, TouchPhase, Window,
         WindowAppearance, WindowOptions, canvas, div, point, px, size,
     };
@@ -8323,6 +8406,7 @@ mod tests {
                 window.dispatch_event(
                     MouseMoveEvent {
                         position: point(px(20.), px(20.)),
+                        delta: point(px(10.), px(10.)),
                         pressed_button: Some(MouseButton::Left),
                         modifiers: Default::default(),
                     }
@@ -8351,6 +8435,7 @@ mod tests {
             window.dispatch_event(
                 MouseMoveEvent {
                     position: outside_position,
+                    delta: outside_position - point(px(20.), px(20.)),
                     pressed_button: Some(MouseButton::Left),
                     modifiers: Default::default(),
                 }
@@ -8479,6 +8564,7 @@ mod tests {
             window.dispatch_event(
                 MouseMoveEvent {
                     position: outside_position,
+                    delta: outside_position - point(px(20.), px(20.)),
                     pressed_button: Some(MouseButton::Left),
                     modifiers: Default::default(),
                 }
@@ -8516,6 +8602,7 @@ mod tests {
             window.dispatch_event(
                 MouseMoveEvent {
                     position: outside_position,
+                    delta: outside_position - point(px(20.), px(20.)),
                     pressed_button: Some(MouseButton::Left),
                     modifiers: Default::default(),
                 }
@@ -8538,6 +8625,7 @@ mod tests {
                 window.dispatch_event(
                     MouseMoveEvent {
                         position: point(px(x_position), px(20.)),
+                        delta: Point::default(),
                         pressed_button: Some(MouseButton::Left),
                         modifiers: Default::default(),
                     }
@@ -9247,5 +9335,160 @@ mod tests {
             serve(cx, window);
             assert!(!pending(cx, window), "presenting the frame clears it");
         }
+    }
+
+    /// WHY: Scrubbable drags lock the pointer at the drag origin and consume
+    /// unbounded relative motion (`MouseMoveEvent::delta`) without the cursor
+    /// drifting to a window or screen edge. These tests verify the `Window`
+    /// dispatch invariants across lock, repeated lock, relative motion, button
+    /// release while locked, unlock, unlocked motion, focus loss, and window
+    /// close. Native OS cursor hiding and warping in X11, Wayland, macOS,
+    /// Windows, and Web are exercised by each platform backend rather than
+    /// `TestWindow`.
+    struct PointerLockTestView {
+        observed: Rc<RefCell<Vec<(Point<Pixels>, Point<Pixels>, Option<MouseButton>, Modifiers)>>>,
+    }
+
+    impl Render for PointerLockTestView {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let observed = self.observed.clone();
+            div()
+                .size_full()
+                .on_mouse_move(move |event: &MouseMoveEvent, _, _| {
+                    observed.borrow_mut().push((
+                        event.position,
+                        event.delta,
+                        event.pressed_button,
+                        event.modifiers,
+                    ));
+                })
+        }
+    }
+
+    #[gpui::test]
+    fn pointer_lock_pins_position_and_reports_relative_delta(cx: &mut TestAppContext) {
+        let observed: Rc<
+            RefCell<Vec<(Point<Pixels>, Point<Pixels>, Option<MouseButton>, Modifiers)>>,
+        > = Rc::default();
+        let (_, cx) = cx.add_window_view(|_, _| PointerLockTestView {
+            observed: observed.clone(),
+        });
+        let window_handle = cx.windows()[0];
+
+        let start = point(px(40.), px(55.));
+        cx.simulate_mouse_move(start, None, Modifiers::none());
+        assert_eq!(
+            observed.borrow().as_slice(),
+            &[(start, start, None, Modifiers::none())]
+        );
+        observed.borrow_mut().clear();
+
+        cx.update(|window, _| {
+            assert!(!window.is_pointer_locked());
+            window.lock_pointer();
+            assert!(window.is_pointer_locked());
+        });
+        assert!(cx.test_window(window_handle).is_pointer_locked());
+
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::none()
+        };
+        cx.simulate_locked_mouse_move(point(px(18.), px(-7.)), MouseButton::Left, shift);
+        cx.simulate_locked_mouse_move(point(px(500.), px(300.)), MouseButton::Left, shift);
+        cx.update(|window, _| {
+            window.lock_pointer();
+            assert!(window.is_pointer_locked());
+            assert_eq!(window.mouse_position(), start);
+        });
+
+        assert_eq!(
+            observed.borrow().as_slice(),
+            &[
+                (
+                    start,
+                    point(px(18.), px(-7.)),
+                    Some(MouseButton::Left),
+                    shift
+                ),
+                (
+                    start,
+                    point(px(500.), px(300.)),
+                    Some(MouseButton::Left),
+                    shift
+                ),
+            ]
+        );
+        cx.update(|window, _| {
+            assert_eq!(window.mouse_position(), start);
+            window.unlock_pointer();
+            assert!(!window.is_pointer_locked());
+            assert_eq!(window.mouse_position(), start);
+        });
+        cx.update(|window, _| {
+            window.unlock_pointer();
+            assert!(!window.is_pointer_locked());
+            assert_eq!(window.mouse_position(), start);
+        });
+        assert!(!cx.test_window(window_handle).is_pointer_locked());
+
+        let next = point(px(52.), px(60.));
+        cx.simulate_mouse_move(next, None, Modifiers::none());
+        assert_eq!(
+            observed.borrow().last().copied(),
+            Some((next, next - start, None, Modifiers::none()))
+        );
+    }
+
+    #[gpui::test]
+    fn unlock_pointer_without_lock_is_a_noop(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| Empty);
+        let window_handle = cx.windows()[0];
+        let pos = point(px(25.), px(30.));
+        cx.simulate_mouse_move(pos, None, Modifiers::none());
+
+        cx.update(|window, _| {
+            assert!(!window.is_pointer_locked());
+            window.unlock_pointer();
+            assert!(!window.is_pointer_locked());
+            assert_eq!(window.mouse_position(), pos);
+        });
+        assert!(!cx.test_window(window_handle).is_pointer_locked());
+    }
+
+    #[gpui::test]
+    fn focus_loss_and_window_close_release_pointer_lock(cx: &mut TestAppContext) {
+        let (_, cx) = cx.add_window_view(|_, _| Empty);
+        let window_handle = cx.windows()[0];
+        let start = point(px(30.), px(45.));
+        cx.simulate_mouse_move(start, None, Modifiers::none());
+
+        cx.update(|window, _| {
+            window.activate_window();
+            window.lock_pointer();
+            assert!(window.is_pointer_locked());
+        });
+        cx.run_until_parked();
+        assert!(cx.test_window(window_handle).is_pointer_locked());
+
+        cx.deactivate_window();
+        cx.update(|window, _| {
+            assert!(!window.is_pointer_locked());
+            assert_eq!(window.mouse_position(), start);
+        });
+        assert!(!cx.test_window(window_handle).is_pointer_locked());
+
+        cx.update(|window, _| {
+            window.lock_pointer();
+            assert!(window.is_pointer_locked());
+        });
+        assert!(cx.test_window(window_handle).is_pointer_locked());
+
+        let test_window = cx.test_window(window_handle);
+        cx.update(|window, _| {
+            window.remove_window();
+            assert!(!window.is_pointer_locked());
+        });
+        assert!(!test_window.is_pointer_locked());
     }
 }
