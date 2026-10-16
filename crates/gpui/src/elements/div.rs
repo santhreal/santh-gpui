@@ -3758,6 +3758,9 @@ pub(crate) enum ActiveTooltip {
         tooltip: AnyTooltip,
         _task: Task<()>,
     },
+    /// The element was pressed while its tooltip was pending or shown. No tooltip shows until the
+    /// pointer leaves the element, so a tooltip never opens over what the press opened.
+    Pressed,
 }
 
 pub(crate) fn clear_active_tooltip(
@@ -3766,7 +3769,7 @@ pub(crate) fn clear_active_tooltip(
 ) {
     match active_tooltip.borrow_mut().take() {
         None => {}
-        Some(ActiveTooltip::WaitingForShow { .. }) => {}
+        Some(ActiveTooltip::WaitingForShow { .. } | ActiveTooltip::Pressed) => {}
         Some(ActiveTooltip::Visible { .. }) => window.refresh(),
         Some(ActiveTooltip::WaitingForHide { .. }) => window.refresh(),
     }
@@ -3778,7 +3781,7 @@ pub(crate) fn clear_active_tooltip_if_not_hoverable(
 ) {
     let should_clear = match active_tooltip.borrow().as_ref() {
         None => false,
-        Some(ActiveTooltip::WaitingForShow { .. }) => false,
+        Some(ActiveTooltip::WaitingForShow { .. } | ActiveTooltip::Pressed) => false,
         Some(ActiveTooltip::Visible { is_hoverable, .. }) => !is_hoverable,
         Some(ActiveTooltip::WaitingForHide { .. }) => false,
     };
@@ -3794,7 +3797,7 @@ pub(crate) fn set_tooltip_on_window(
 ) -> Option<TooltipId> {
     let tooltip = match active_tooltip.borrow().as_ref() {
         None => return None,
-        Some(ActiveTooltip::WaitingForShow { .. }) => return None,
+        Some(ActiveTooltip::WaitingForShow { .. } | ActiveTooltip::Pressed) => return None,
         Some(ActiveTooltip::Visible { tooltip, .. }) => tooltip.clone(),
         Some(ActiveTooltip::WaitingForHide { tooltip, .. }) => tooltip.clone(),
     };
@@ -3817,7 +3820,11 @@ pub(crate) fn register_tooltip_mouse_handlers(
         let active_tooltip = active_tooltip.clone();
         let build_tooltip = build_tooltip.clone();
         let check_is_hovered = check_is_hovered.clone();
-        move |_: &MouseMoveEvent, phase, window, cx| {
+        move |event: &MouseMoveEvent, phase, window, cx| {
+            if handle_pressed_tooltip_mouse_move(&active_tooltip, &check_is_hovered, event, window)
+            {
+                return;
+            }
             handle_tooltip_mouse_move(
                 &active_tooltip,
                 &build_tooltip,
@@ -3835,8 +3842,12 @@ pub(crate) fn register_tooltip_mouse_handlers(
 
     window.on_mouse_event({
         let active_tooltip = active_tooltip.clone();
-        move |_: &MouseDownEvent, _phase, window: &mut Window, _cx| {
-            if !tooltip_id.is_some_and(|tooltip_id| tooltip_id.is_hovered(window)) {
+        move |_: &MouseDownEvent, phase, window: &mut Window, _cx| {
+            // The capture phase runs before the pressed element records its pending press, so
+            // `check_is_hovered` still reads the pointer.
+            if phase.capture() && check_is_hovered(window) {
+                press_active_tooltip(&active_tooltip, window);
+            } else if !tooltip_id.is_some_and(|tooltip_id| tooltip_id.is_hovered(window)) {
                 clear_active_tooltip_if_not_hoverable(&active_tooltip, window);
             }
         }
@@ -3850,6 +3861,43 @@ pub(crate) fn register_tooltip_mouse_handlers(
             }
         }
     });
+}
+
+/// Holds back the tooltip of a pressed element: a pending show is cancelled and a shown,
+/// non-hoverable tooltip is hidden. A hoverable tooltip stays, since it can be interacted with.
+fn press_active_tooltip(active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>, window: &mut Window) {
+    let was_visible = match active_tooltip.borrow().as_ref() {
+        Some(
+            ActiveTooltip::Visible {
+                is_hoverable: true, ..
+            }
+            | ActiveTooltip::WaitingForHide { .. },
+        ) => return,
+        Some(ActiveTooltip::Visible { .. }) => true,
+        None | Some(ActiveTooltip::WaitingForShow { .. } | ActiveTooltip::Pressed) => false,
+    };
+    active_tooltip.borrow_mut().replace(ActiveTooltip::Pressed);
+    if was_visible {
+        window.refresh();
+    }
+}
+
+/// Returns whether the element's tooltip is held back by a press, in which case the move must not
+/// schedule a tooltip. The hold ends on the first move with no button held that finds the pointer
+/// off the element.
+fn handle_pressed_tooltip_mouse_move(
+    active_tooltip: &Rc<RefCell<Option<ActiveTooltip>>>,
+    check_is_hovered: &Rc<dyn Fn(&Window) -> bool>,
+    event: &MouseMoveEvent,
+    window: &Window,
+) -> bool {
+    if !matches!(*active_tooltip.borrow(), Some(ActiveTooltip::Pressed)) {
+        return false;
+    }
+    if event.pressed_button.is_none() && !check_is_hovered(window) {
+        active_tooltip.borrow_mut().take();
+    }
+    true
 }
 
 /// Handles displaying tooltips when an element is hovered.
@@ -3922,6 +3970,8 @@ fn handle_tooltip_mouse_move(
                 Action::None
             }
         }
+        // `handle_pressed_tooltip_mouse_move` consumes every move while a press holds the tooltip.
+        Some(ActiveTooltip::Pressed) => Action::None,
     };
 
     match action {
@@ -4026,7 +4076,7 @@ fn handle_tooltip_check_visible_and_update(
                 Action::None
             }
         }
-        None | Some(ActiveTooltip::WaitingForShow { .. }) => Action::None,
+        None | Some(ActiveTooltip::WaitingForShow { .. } | ActiveTooltip::Pressed) => Action::None,
     };
 
     match action {
@@ -5831,5 +5881,95 @@ mod tests {
             (hue_after_remount - hue_before_unmount).abs() < 0.05,
             "remount must preserve transition state, was {hue_before_unmount}, got {hue_after_remount}"
         );
+    }
+
+    const PRESS_TIP_DELAY: Duration = Duration::from_millis(100);
+
+    struct PressTip;
+
+    impl Render for PressTip {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            div().debug_selector(|| "press-tip".into()).size(px(10.))
+        }
+    }
+
+    struct PressTipView {
+        built: Rc<Cell<usize>>,
+    }
+
+    impl Render for PressTipView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let built = self.built.clone();
+            div().size_full().child(
+                div()
+                    .id("press-target")
+                    .size(px(50.))
+                    .on_click(|_, _, _| {})
+                    .tooltip(move |_, cx| {
+                        built.set(built.get() + 1);
+                        cx.new(|_| PressTip).into()
+                    })
+                    .tooltip_show_delay(PRESS_TIP_DELAY),
+            )
+        }
+    }
+
+    /// A press holds an element's tooltip back until the pointer leaves the element: a tooltip
+    /// opening after a press covers what the press opened, such as a menu under its button. Covers
+    /// a press on a shown tooltip followed by a move inside the element, and a press during the
+    /// show delay with no move after it. Does not cover hoverable tooltips, which a press leaves
+    /// up.
+    #[gpui::test]
+    fn a_press_holds_the_tooltip_back_until_the_pointer_leaves(cx: &mut TestAppContext) {
+        use crate::{Modifiers, VisualTestContext};
+        let executor = cx.executor();
+        let built = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let built = built.clone();
+            move |_, _| PressTipView { built }
+        });
+        cx.run_until_parked();
+        let inside = point(px(20.), px(20.));
+        let inside_again = point(px(30.), px(30.));
+        let outside = point(px(200.), px(200.));
+        let none = Modifiers::none();
+        let rest = |cx: &mut VisualTestContext| {
+            executor.advance_clock(PRESS_TIP_DELAY * 2);
+            cx.run_until_parked();
+            cx.debug_bounds("press-tip").is_some()
+        };
+
+        cx.simulate_mouse_move(inside, None, none);
+        assert!(rest(cx), "resting on the element shows no tooltip");
+        assert_eq!(built.get(), 1);
+
+        cx.simulate_mouse_down(inside, MouseButton::Left, none);
+        cx.simulate_mouse_up(inside, MouseButton::Left, none);
+        assert!(!rest(cx), "the tooltip stayed up through a press");
+        cx.simulate_mouse_move(inside_again, None, none);
+        assert!(
+            !rest(cx),
+            "a move inside the pressed element brought its tooltip back"
+        );
+        assert_eq!(built.get(), 1);
+
+        cx.simulate_mouse_move(outside, None, none);
+        cx.simulate_mouse_move(inside, None, none);
+        assert!(
+            rest(cx),
+            "leaving and re-entering the element still shows no tooltip"
+        );
+        assert_eq!(built.get(), 2);
+
+        cx.simulate_mouse_move(outside, None, none);
+        assert!(!rest(cx), "leaving the element left its tooltip up");
+        cx.simulate_mouse_move(inside, None, none);
+        cx.simulate_mouse_down(inside, MouseButton::Left, none);
+        cx.simulate_mouse_up(inside, MouseButton::Left, none);
+        assert!(
+            !rest(cx),
+            "a press during the show delay let the tooltip open after it"
+        );
+        assert_eq!(built.get(), 2);
     }
 }
