@@ -50,6 +50,9 @@ pub(crate) struct TestWindowState {
     start_external_drag_result: bool,
     pub(crate) mouse_position: Point<Pixels>,
     pub(crate) locked_mouse_position: Option<Point<Pixels>>,
+    /// What [`PlatformWindow::is_subpixel_rendering_supported`] reports.
+    /// `false` unless a test sets it.
+    pub(crate) subpixel_rendering_supported: bool,
 }
 
 #[derive(Clone)]
@@ -116,6 +119,7 @@ impl TestWindow {
             start_external_drag_result: false,
             mouse_position: Point::default(),
             locked_mouse_position: None,
+            subpixel_rendering_supported: false,
         })))
     }
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -444,7 +448,7 @@ impl PlatformWindow for TestWindow {
     }
 
     fn is_subpixel_rendering_supported(&self) -> bool {
-        false
+        self.0.lock().subpixel_rendering_supported
     }
 
     fn set_title(&mut self, title: &str) {

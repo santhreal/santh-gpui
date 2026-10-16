@@ -1306,6 +1306,9 @@ pub struct Window {
     sprite_atlas: Arc<dyn PlatformAtlas>,
     text_system: Arc<WindowTextSystem>,
     text_rendering_mode: Rc<Cell<TextRenderingMode>>,
+    /// How many layer masks enclose the subtree being painted. Text inside
+    /// one is drawn grayscale, see [`Window::should_use_subpixel_rendering`].
+    layer_masks_open: usize,
     rem_size: Pixels,
     /// The stack of override values for the window's rem size.
     ///
@@ -2022,6 +2025,7 @@ impl Window {
             sprite_atlas,
             text_system,
             text_rendering_mode: cx.text_rendering_mode.clone(),
+            layer_masks_open: 0,
             rem_size: px(16.),
             rem_size_override_stack: SmallVec::new(),
             viewport_size: content_size,
@@ -4098,7 +4102,9 @@ impl Window {
 
     fn with_layer_mask<R>(&mut self, mask: LayerMask, f: impl FnOnce(&mut Self) -> R) -> R {
         self.next_frame.scene.push_layer_mask(mask);
+        self.layer_masks_open += 1;
         let result = f(self);
+        self.layer_masks_open -= 1;
         self.next_frame.scene.pop_layer_mask();
         result
     }
@@ -4967,7 +4973,16 @@ impl Window {
             || self.needs_present.get()
     }
 
+    /// Subpixel text blends each channel against the pixels under it and
+    /// writes no alpha, so it needs an opaque destination. A layer mask's
+    /// subtree draws into a target cleared to transparent and is composited
+    /// as premultiplied colour: subpixel glyphs there keep alpha 0 and add
+    /// their colour to the frame, so text inside a layer is drawn grayscale.
     fn should_use_subpixel_rendering(&self, font_id: FontId, font_size: Pixels) -> bool {
+        if self.layer_masks_open > 0 {
+            return false;
+        }
+
         if self.platform_window.background_appearance() != WindowBackgroundAppearance::Opaque {
             return false;
         }
@@ -9009,7 +9024,8 @@ mod tests {
     mod layer_masks {
         use super::*;
         use crate::{
-            EdgeFade, LayerMask, Path, PrimitiveBatch, canvas, div, fill, point, px, red, size,
+            EdgeFade, FontId, LayerMask, Path, PrimitiveBatch, TextRenderingMode, canvas, div,
+            fill, point, px, red, size,
         };
 
         type Paint = Rc<dyn Fn(&mut Window)>;
@@ -9181,6 +9197,69 @@ mod tests {
                 assert_eq!(drawn, expected, "{name}");
                 assert_eq!(masks.len(), mask_count, "{name}: {masks:?}");
             }
+        }
+
+        /// WHY: a subpixel glyph writes colour and no alpha, so inside a
+        /// layer mask, whose target starts transparent, it composites as
+        /// added colour: grey text on a light surface came out white. Each
+        /// layer producer, a nesting of both, and the frame after a layer
+        /// closes are read from the decision every glyph takes. A fade with
+        /// no band draws to the frame and keeps subpixel text. Does not catch
+        /// a renderer that composites a grayscale layer wrongly.
+        #[gpui::test]
+        fn text_inside_a_layer_mask_is_drawn_grayscale(cx: &mut TestAppContext) {
+            cx.update(|cx| cx.set_text_rendering_mode(TextRenderingMode::Subpixel));
+            let region = bounds(10.0, 10.0, 300.0, 300.0);
+            let fade = EdgeFade {
+                bounds: region,
+                bands: Edges::all(px(8.0)),
+            };
+            let unfaded = EdgeFade {
+                bounds: region,
+                bands: Edges::all(px(0.0)),
+            };
+            let mut square = Path::new(point(px(40.0), px(40.0)));
+            square.line_to(point(px(100.0), px(40.0)));
+            square.line_to(point(px(100.0), px(100.0)));
+            square.line_to(point(px(40.0), px(100.0)));
+            let seen: Rc<RefCell<Vec<(&'static str, bool)>>> = Rc::default();
+            let record = seen.clone();
+            frame(cx, move |window| {
+                window
+                    .platform_window
+                    .as_test()
+                    .expect("a test window")
+                    .0
+                    .lock()
+                    .subpixel_rendering_supported = true;
+                let subpixel =
+                    |window: &Window| window.should_use_subpixel_rendering(FontId(0), px(12.0));
+                let push = |name, window: &mut Window| {
+                    record.borrow_mut().push((name, subpixel(&*window)));
+                };
+                record.borrow_mut().clear();
+                push("frame", window);
+                window.with_edge_fade(Some(fade), |window| push("fade", window));
+                window.with_clip_path(square.clone(), |window| push("clip path", window));
+                window.with_edge_fade(Some(fade), |window| {
+                    window.with_clip_path(square.clone(), |window| {
+                        push("clip path in a fade", window)
+                    })
+                });
+                push("after the layers", window);
+                window.with_edge_fade(Some(unfaded), |window| push("fade without a band", window));
+            });
+            assert_eq!(
+                *seen.borrow(),
+                [
+                    ("frame", true),
+                    ("fade", false),
+                    ("clip path", false),
+                    ("clip path in a fade", false),
+                    ("after the layers", true),
+                    ("fade without a band", true),
+                ]
+            );
         }
     }
 
