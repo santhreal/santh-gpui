@@ -4,11 +4,15 @@
 //!
 //! Catches a mask marker keyed so that a child sorts outside its mask (a
 //! child at a higher z-index, or a child of an outer mask after an inner mask
-//! closed), which draws the child unmasked; a replay that records a mask's
-//! scope twice, which nests one more layer per replayed frame; a replay that
-//! drops or alters the mask payload; and edge fade bounds that cut off
-//! content beyond an unfaded edge or keep content beyond a faded edge. Does
-//! not catch a renderer that composites a correctly ordered mask wrongly.
+//! closed), which draws the child unmasked; a scope beside a mask keyed so
+//! that its primitives sort between the mask's markers (a layer, a layer in a
+//! layer, or a second mask, painted before or after the mask and not
+//! overlapping it), which draws them into the mask's layer and composites
+//! them away outside the mask; a replay that records a mask's scope twice,
+//! which nests one more layer per replayed frame; a replay that drops or
+//! alters the mask payload; and edge fade bounds that cut off content beyond
+//! an unfaded edge or keep content beyond a faded edge. Does not catch a
+//! renderer that composites a correctly ordered mask wrongly.
 
 use super::*;
 use crate::{point, px, size};
@@ -126,6 +130,165 @@ fn children_of_an_outer_mask_painted_after_an_inner_mask_draw_inside_the_outer_m
             assert!(
                 drawn.starts_with('S') && drawn.ends_with('E') && drawn.contains("SQE"),
                 "a quad drew outside its mask ({outer_kind} around {inner_kind}): {drawn}"
+            );
+        }
+    }
+}
+
+/// A mask around a quad, covering the square from `lo` to `lo + 100`.
+fn masked_quad(scene: &mut Scene, square: fn(f32, f32) -> LayerMask, lo: f32) {
+    scene.push_layer_mask(square(lo, lo + 100.0));
+    scene.insert_primitive(quad(rect(lo + 10.0, lo + 10.0, 20.0, 20.0)));
+    scene.pop_layer_mask();
+}
+
+/// A quad inside `depth` nested layers, covering the square from `lo` to
+/// `lo + 100`.
+fn layered_quad(scene: &mut Scene, depth: usize, lo: f32) {
+    let bounds = rect(lo, lo, 100.0, 100.0);
+    for _ in 0..depth {
+        scene.push_layer(bounds);
+    }
+    scene.insert_primitive(quad(rect(lo + 10.0, lo + 10.0, 20.0, 20.0)));
+    for _ in 0..depth {
+        scene.pop_layer();
+    }
+}
+
+/// Paints `masked` inside a layer covering the square from `lo` to
+/// `lo + 100`.
+fn in_layer(scene: &mut Scene, lo: f32, masked: impl FnOnce(&mut Scene)) {
+    scene.push_layer(rect(lo, lo, 100.0, 100.0));
+    masked(scene);
+    scene.pop_layer();
+}
+
+type Arrangement = fn(&mut Scene, fn(f32, f32) -> LayerMask);
+
+/// Every way to paint a scope beside a mask without overlapping it, so that
+/// the scope and the mask share their step in the enclosing scope: each
+/// operation that opens a scope, at the mask's depth and one level deeper,
+/// painted before and after the mask. The exhaustive match fails to compile
+/// when a paint operation is added without a case.
+fn arrangements_beside_a_mask() -> Vec<(&'static str, Arrangement)> {
+    let arrangements: Vec<(&'static str, Arrangement)> = vec![
+        ("a quad after the mask", |scene, square| {
+            masked_quad(scene, square, 0.0);
+            layered_quad(scene, 0, 300.0);
+        }),
+        ("a layer after the mask", |scene, square| {
+            masked_quad(scene, square, 0.0);
+            layered_quad(scene, 1, 300.0);
+        }),
+        ("a layer before the mask", |scene, square| {
+            layered_quad(scene, 1, 300.0);
+            masked_quad(scene, square, 0.0);
+        }),
+        ("a layer in a layer after the mask", |scene, square| {
+            masked_quad(scene, square, 0.0);
+            layered_quad(scene, 2, 300.0);
+        }),
+        ("a layer in a layer before the mask", |scene, square| {
+            layered_quad(scene, 2, 300.0);
+            masked_quad(scene, square, 0.0);
+        }),
+        (
+            "a layer in a layer after a mask in a layer",
+            |scene, square| {
+                in_layer(scene, 0.0, |scene| masked_quad(scene, square, 0.0));
+                layered_quad(scene, 2, 300.0);
+            },
+        ),
+        ("a mask after the mask", |scene, square| {
+            masked_quad(scene, square, 0.0);
+            masked_quad(scene, square, 300.0);
+        }),
+        (
+            "a mask in a layer after a mask in a layer",
+            |scene, square| {
+                in_layer(scene, 0.0, |scene| masked_quad(scene, square, 0.0));
+                in_layer(scene, 300.0, |scene| masked_quad(scene, square, 300.0));
+            },
+        ),
+        (
+            "a layer at the lowest z-index in a layer after two masks",
+            |scene, square| {
+                masked_quad(scene, square, 0.0);
+                masked_quad(scene, square, 150.0);
+                scene.push_layer(rect(300.0, 300.0, 100.0, 100.0));
+                scene.push_z_index(i32::MIN);
+                layered_quad(scene, 1, 300.0);
+                scene.pop_z_index();
+                scene.pop_layer();
+            },
+        ),
+    ];
+    let operation = PaintOperation::EndLayer;
+    match operation {
+        // A quad and a mask: the primitive arrangements above.
+        PaintOperation::Primitive(_) => {}
+        // A layer: the layer arrangements above.
+        PaintOperation::StartLayer(_) | PaintOperation::EndLayer => {}
+        // A z-index: the lowest z-index arrangement above, whose layer's step
+        // is the smallest a scope's step reaches.
+        PaintOperation::PushZIndex(_) | PaintOperation::PopZIndex => {}
+    }
+    arrangements
+}
+
+/// Asserts that the masks open around each quad when it draws are the masks
+/// whose bounds contain it, and that every mask closes.
+fn assert_each_quad_draws_in_the_masks_around_it(scene: &Scene, arrangement: &str) {
+    let masks: Vec<Bounds<ScaledPixels>> = scene
+        .batches()
+        .filter_map(|batch| match batch {
+            PrimitiveBatch::StartLayerMask(mask) => Some(mask.bounds()),
+            _ => None,
+        })
+        .collect();
+    let around =
+        |mask: &Bounds<ScaledPixels>, quad: &Quad| mask.intersect(&quad.bounds) == quad.bounds;
+    let mut open: Vec<Bounds<ScaledPixels>> = Vec::new();
+    for batch in scene.batches() {
+        match batch {
+            PrimitiveBatch::StartLayerMask(mask) => open.push(mask.bounds()),
+            PrimitiveBatch::EndLayerMask => {
+                assert!(open.pop().is_some(), "{arrangement}: a mask closed twice");
+            }
+            PrimitiveBatch::Quads(range) => {
+                for quad in &scene.quads[range] {
+                    let containing = masks.iter().filter(|mask| around(mask, quad)).count();
+                    assert!(
+                        open.len() == containing && open.iter().all(|mask| around(mask, quad)),
+                        "{arrangement}: the quad at {:?} drew inside the masks {open:?}",
+                        quad.bounds
+                    );
+                }
+            }
+            other => panic!("{arrangement}: unexpected batch {other:?}"),
+        }
+    }
+    assert!(open.is_empty(), "{arrangement}: a mask never closed");
+}
+
+/// A scope painted beside a mask draws outside the mask, and the mask's own
+/// quad draws inside it, for every mask kind, as painted and as replayed.
+#[test]
+fn a_scope_beside_a_mask_draws_outside_the_mask() {
+    for (kind, square) in mask_kinds() {
+        for (arrangement, paint) in arrangements_beside_a_mask() {
+            let context = format!("{arrangement} ({kind})");
+            let mut scene = Scene::default();
+            paint(&mut scene, square);
+            scene.finish();
+            assert_each_quad_draws_in_the_masks_around_it(&scene, &context);
+
+            let mut replayed = Scene::default();
+            replayed.replay(0..scene.len(), &scene);
+            replayed.finish();
+            assert_each_quad_draws_in_the_masks_around_it(
+                &replayed,
+                &format!("{context}, replayed"),
             );
         }
     }

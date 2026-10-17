@@ -40,13 +40,23 @@ impl From<bool> for PaddedBool32 {
 /// One `(z_index, order)` pair per enclosing scope, root first, each packed
 /// by `sort_step`. A layer's children extend the layer's own key, so they
 /// sort after it and before the next sibling of the layer; two primitives in
-/// one scope that do not overlap share an order and keep batching together.
+/// one scope that do not overlap share an order and keep batching together,
+/// and so do the children of two layers that do not overlap. A mask's key
+/// continues with `MASK_STEP` and the mask's index, so that no primitive
+/// outside the mask sorts between its markers.
 type SortKey = SmallVec<[u64; 4]>;
 
 /// `(z_index, order)` as one integer that orders as the pair does.
 fn sort_step(z_index: i32, order: DrawOrder) -> u64 {
     (u64::from(z_index.cast_unsigned() ^ 0x8000_0000) << 32) | u64::from(order)
 }
+
+/// The step that follows a mask's own step in the key of the mask's scope:
+/// `sort_step(i32::MAX, DrawOrder::MAX)`, which no primitive's order reaches.
+/// A scope beside the mask that does not overlap it shares the mask's own
+/// step, and its children sort before `MASK_STEP` rather than among the
+/// mask's children.
+const MASK_STEP: u64 = u64::MAX;
 
 /// The paint scope a primitive is inserted into: the root, or one layer.
 struct Scope {
@@ -163,6 +173,11 @@ impl Scene {
     /// operation, for the callers whose own operation reopens it on replay.
     fn open_scope(&mut self, bounds: Bounds<ScaledPixels>) {
         let prefix = self.key_for(bounds);
+        self.open_scope_at(prefix);
+    }
+
+    /// Opens a scope whose children extend `prefix`.
+    fn open_scope_at(&mut self, prefix: SortKey) {
         let tree = self.scopes.len();
         if self.bounds_trees.len() <= tree {
             self.bounds_trees.push(BoundsTree::default());
@@ -206,9 +221,12 @@ impl Scene {
     /// Start a subtree that draws into a layer composited through `mask`.
     /// See [`StartLayerMask`].
     pub fn push_layer_mask(&mut self, mask: LayerMask) {
-        self.open_scope(mask.bounds());
-        let key = self.scope_edge_key(i32::MIN, DrawOrder::MIN);
         let index = self.start_layer_masks.len();
+        // The index separates masks that share a step.
+        let mut prefix = self.key_for(mask.bounds());
+        prefix.extend([MASK_STEP, index as u64]);
+        self.open_scope_at(prefix);
+        let key = self.scope_edge_key(i32::MIN, DrawOrder::MIN);
         self.start_layer_masks
             .push(StartLayerMask { order: 0, mask });
         self.record(key, PrimitiveKind::StartLayerMask, 0, index);
