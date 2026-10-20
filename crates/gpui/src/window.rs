@@ -1143,6 +1143,10 @@ pub(crate) struct Frame {
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) debug_bounds: FxHashMap<String, Bounds<Pixels>>,
+    /// Every debug selector this frame painted, in paint order, so a frame
+    /// that reuses a range of this one's paint records the same bounds.
+    #[cfg(any(test, feature = "test-support"))]
+    debug_bounds_painted: Vec<(String, Bounds<Pixels>)>,
     #[cfg(any(feature = "inspector", debug_assertions))]
     pub(crate) next_inspector_instance_ids: FxHashMap<Rc<crate::InspectorElementPath>, usize>,
     #[cfg(any(feature = "inspector", debug_assertions))]
@@ -1169,6 +1173,8 @@ pub(crate) struct PaintIndex {
     accessed_element_states_index: usize,
     tab_handle_index: usize,
     text_runs_index: usize,
+    #[cfg(any(test, feature = "test-support"))]
+    debug_bounds_index: usize,
     line_layout_index: LineLayoutIndex,
 }
 
@@ -1192,6 +1198,8 @@ impl Frame {
 
             #[cfg(any(test, feature = "test-support"))]
             debug_bounds: FxHashMap::default(),
+            #[cfg(any(test, feature = "test-support"))]
+            debug_bounds_painted: Vec::new(),
 
             #[cfg(any(feature = "inspector", debug_assertions))]
             next_inspector_instance_ids: FxHashMap::default(),
@@ -1220,6 +1228,7 @@ impl Frame {
         #[cfg(any(test, feature = "test-support"))]
         {
             self.debug_bounds.clear();
+            self.debug_bounds_painted.clear();
         }
 
         #[cfg(any(feature = "inspector", debug_assertions))]
@@ -1227,6 +1236,13 @@ impl Frame {
             self.next_inspector_instance_ids.clear();
             self.inspector_hitboxes.clear();
         }
+    }
+
+    /// Records that the element with `selector` was painted at `bounds`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) fn insert_debug_bounds(&mut self, selector: String, bounds: Bounds<Pixels>) {
+        self.debug_bounds.insert(selector.clone(), bounds);
+        self.debug_bounds_painted.push((selector, bounds));
     }
 
     pub(crate) fn cursor_style(&self, window: &Window) -> Option<CursorStyle> {
@@ -3912,6 +3928,8 @@ impl Window {
             accessed_element_states_index: self.next_frame.accessed_element_states.len(),
             tab_handle_index: self.next_frame.tab_stops.paint_index(),
             text_runs_index: self.next_frame.text_runs.len(),
+            #[cfg(any(test, feature = "test-support"))]
+            debug_bounds_index: self.next_frame.debug_bounds_painted.len(),
             line_layout_index: self.text_system.layout_index(),
         }
     }
@@ -3948,6 +3966,11 @@ impl Window {
         self.next_frame.text_runs.extend_from_slice(
             &self.rendered_frame.text_runs[range.start.text_runs_index..range.end.text_runs_index],
         );
+        #[cfg(any(test, feature = "test-support"))]
+        for index in range.start.debug_bounds_index..range.end.debug_bounds_index {
+            let (selector, bounds) = self.rendered_frame.debug_bounds_painted[index].clone();
+            self.next_frame.insert_debug_bounds(selector, bounds);
+        }
 
         self.text_system
             .reuse_layouts(range.start.line_layout_index..range.end.line_layout_index);
@@ -9271,9 +9294,9 @@ mod tests {
     /// clipped region is still reported.
     mod rendered_frame {
         use crate::{
-            AppContext as _, Context, Entity, IntoElement, ParentElement, Render,
-            RequestFrameOptions, SharedString, StyleRefinement, Styled, TestAppContext, Window,
-            WindowHandle, div,
+            AppContext as _, Context, Entity, InteractiveElement as _, IntoElement, ParentElement,
+            Render, RequestFrameOptions, SharedString, StyleRefinement, Styled, TestAppContext,
+            Window, WindowHandle, div,
         };
 
         struct Label {
@@ -9283,7 +9306,9 @@ mod tests {
         impl Render for Label {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 self.renders += 1;
-                div().child("cached label")
+                div()
+                    .debug_selector(|| "cached label".into())
+                    .child("cached label")
             }
         }
 
@@ -9386,6 +9411,48 @@ mod tests {
                 .unwrap();
             serve(cx, window);
             assert_eq!(texts(cx, window), expected(cx, window));
+        }
+
+        /// A frame that reuses a cached view's paint keeps the bounds its
+        /// debug selectors were painted at, so a test reads an element of a
+        /// view the frame replayed as it reads one the frame rebuilt.
+        #[gpui::test]
+        fn a_reused_view_keeps_its_debug_bounds(cx: &mut TestAppContext) {
+            let window = open(cx);
+            serve(cx, window);
+            let bounds = |cx: &mut TestAppContext| {
+                window
+                    .update(cx, |_, window, _| {
+                        window
+                            .rendered_frame
+                            .debug_bounds
+                            .get("cached label")
+                            .copied()
+                    })
+                    .unwrap()
+            };
+            let label_renders = |cx: &mut TestAppContext| {
+                window
+                    .update(cx, |root, _, cx| root.label.read(cx).renders)
+                    .unwrap()
+            };
+            let drawn = bounds(cx);
+            assert!(drawn.is_some(), "the first frame records the label");
+            let label_before = label_renders(cx);
+            for frame in 0..3 {
+                window.update(cx, |_, _, cx| cx.notify()).unwrap();
+                serve(cx, window);
+                assert_eq!(
+                    label_renders(cx),
+                    label_before,
+                    "frame {frame} reuses the label"
+                );
+                assert_eq!(
+                    bounds(cx),
+                    drawn,
+                    "frame {frame} keeps the reused label's bounds"
+                );
+            }
         }
 
         /// `frame_pending` holds for every source of frame demand (a dirty
