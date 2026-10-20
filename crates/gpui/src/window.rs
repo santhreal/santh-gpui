@@ -9482,6 +9482,130 @@ mod tests {
             serve(cx, window);
             assert!(!pending(cx, window), "presenting the frame clears it");
         }
+
+        /// How a root touches its cached label in the frame the label
+        /// renders in, before the label renders.
+        #[derive(Clone, Copy, Debug)]
+        enum Touch {
+            /// The root creates the label.
+            Creates,
+            /// The root reads the label before mounting it.
+            Reads,
+        }
+
+        /// A root that touches its label once, in the next render after
+        /// `touch` is set, and mounts the label as a cached view.
+        struct TouchingRoot {
+            touch: Option<Touch>,
+            label: Option<Entity<Label>>,
+        }
+
+        impl Render for TouchingRoot {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                match self.touch.take() {
+                    Some(Touch::Creates) => self.label = Some(cx.new(|_| Label { renders: 0 })),
+                    Some(Touch::Reads) => {
+                        if let Some(label) = &self.label {
+                            let _ = label.read(cx).renders;
+                        }
+                    }
+                    None => {}
+                }
+                div().size_full().children(
+                    self.label
+                        .clone()
+                        .map(|label| label.cached(StyleRefinement::default().size_full())),
+                )
+            }
+        }
+
+        /// Draws a frame in which the root touches its label before the
+        /// label renders, then checks that the label is reused by root-only
+        /// frames and redrawn once notified.
+        fn redraws_when_notified_after(touch: Touch, cx: &mut TestAppContext) {
+            let window = cx.add_window(|_, cx| TouchingRoot {
+                touch: None,
+                label: matches!(touch, Touch::Reads).then(|| cx.new(|_| Label { renders: 0 })),
+            });
+            cx.test_window(window.into())
+                .simulate_active_status_change(true);
+            let serve = |cx: &mut TestAppContext| {
+                cx.test_window(window.into())
+                    .simulate_frame_request(RequestFrameOptions::default());
+            };
+            let renders = |cx: &mut TestAppContext| {
+                window
+                    .update(cx, |root, _, cx| {
+                        root.label.as_ref().map(|label| label.read(cx).renders)
+                    })
+                    .unwrap()
+            };
+            serve(cx);
+            let before = renders(cx);
+
+            // The label renders in the frame the root touches it in.
+            window
+                .update(cx, |root, _, cx| {
+                    root.touch = Some(touch);
+                    cx.notify();
+                    if let Some(label) = &root.label {
+                        label.update(cx, |_, cx| cx.notify());
+                    }
+                })
+                .unwrap();
+            serve(cx);
+            let first = renders(cx).expect("the root mounts a label");
+            assert_eq!(
+                first,
+                before.map_or(1, |before| before + 1),
+                "{touch:?}: the touched frame renders the label"
+            );
+
+            for frame in 0..3 {
+                window.update(cx, |_, _, cx| cx.notify()).unwrap();
+                serve(cx);
+                assert_eq!(
+                    renders(cx),
+                    Some(first),
+                    "{touch:?}: frame {frame} reuses the label"
+                );
+            }
+            window
+                .update(cx, |root, _, cx| {
+                    if let Some(label) = &root.label {
+                        label.update(cx, |_, cx| cx.notify());
+                    }
+                })
+                .unwrap();
+            serve(cx);
+            assert_eq!(
+                renders(cx),
+                Some(first + 1),
+                "{touch:?}: the notified label was not drawn again"
+            );
+        }
+
+        /// A cached view that the frame touched before the view rendered
+        /// redraws when notified after frames that reused its paint.
+        ///
+        /// The class closed here is a cached view that drops out of the
+        /// window's tracked entities: the set a view records on render held
+        /// only entities the frame had not touched yet, so the view's own id
+        /// was missing from it, every frame that reused the view's paint
+        /// stopped tracking the view, and a notify of the view then marked
+        /// nothing dirty and the view replayed its stale paint. One test runs
+        /// per [`Touch`]. Not caught: an entity a view reads that only
+        /// another, unmounted view notifies.
+        #[gpui::test]
+        fn a_view_created_before_it_renders_redraws_when_notified(cx: &mut TestAppContext) {
+            redraws_when_notified_after(Touch::Creates, cx);
+        }
+
+        /// See [`a_view_created_before_it_renders_redraws_when_notified`].
+        #[gpui::test]
+        fn a_view_read_before_it_renders_redraws_when_notified(cx: &mut TestAppContext) {
+            redraws_when_notified_after(Touch::Reads, cx);
+        }
     }
 
     /// WHY: Scrubbable drags lock the pointer at the drag origin and consume
