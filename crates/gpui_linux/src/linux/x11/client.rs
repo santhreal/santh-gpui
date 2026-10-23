@@ -881,11 +881,18 @@ impl X11Client {
                 state.update_frame_loop(event.window);
             }
             Event::MapNotify(event) => {
-                let mut state = self.0.borrow_mut();
-                if let Some(window_ref) = state.windows.get_mut(&event.window) {
-                    window_ref.is_mapped = true;
+                {
+                    let mut state = self.0.borrow_mut();
+                    if let Some(window_ref) = state.windows.get_mut(&event.window) {
+                        window_ref.is_mapped = true;
+                    }
+                    state.update_frame_loop(event.window);
                 }
-                state.update_frame_loop(event.window);
+                // The window manager has the window now, so it acts on the
+                // states the window asked for before it was mapped.
+                if let Some(window) = self.get_window(event.window) {
+                    window.send_open_state();
+                }
             }
             Event::VisibilityNotify(event) => {
                 let mut state = self.0.borrow_mut();

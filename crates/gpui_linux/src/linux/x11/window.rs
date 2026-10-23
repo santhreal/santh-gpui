@@ -37,7 +37,9 @@ use super::{
     FrameLoop, X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES, gpu_context::WindowGpu,
 };
 
+mod open_state;
 mod placement;
+use open_state::{OpenState, WmState};
 pub(crate) use placement::xi_root_position;
 use placement::{
     ConfigureChange, configure_change, creation_background_pixel, map_waits_for_configure,
@@ -295,6 +297,9 @@ pub struct X11WindowState {
     /// presents it.
     pub(crate) present_when_configured: bool,
     fullscreen: bool,
+    /// The maximize and fullscreen asked for before the first map; see
+    /// `open_state`.
+    open_state: OpenState,
     /// Whether a compositing manager ran when the window opened. A window
     /// that draws its own frame needs one to blend its transparent corners.
     compositor_present: bool,
@@ -860,6 +865,7 @@ impl X11WindowState {
                 force_render_after_recovery: false,
                 present_when_configured: false,
                 fullscreen: false,
+                open_state: OpenState::default(),
                 maximized_vertical: false,
                 maximized_horizontal: false,
                 hidden: false,
@@ -953,8 +959,23 @@ impl Drop for X11Window {
 
 enum WmHintPropertyState {
     // Remove = 0,
-    // Add = 1,
+    Add = 1,
     Toggle = 2,
+}
+
+/// The `_NET_WM_STATE` atoms of `wm_state` as a state message carries them,
+/// the second `NONE` for a state of one atom.
+fn wm_state_atoms(atoms: &XcbAtoms, wm_state: WmState) -> [u32; 2] {
+    match wm_state {
+        WmState::Maximized => [
+            atoms._NET_WM_STATE_MAXIMIZED_VERT,
+            atoms._NET_WM_STATE_MAXIMIZED_HORZ,
+        ],
+        WmState::Fullscreen => [
+            atoms._NET_WM_STATE_FULLSCREEN,
+            xproto::AtomEnum::NONE.into(),
+        ],
+    }
 }
 
 impl X11Window {
@@ -1004,33 +1025,6 @@ impl X11Window {
         ptr.set_wm_properties(state)?;
 
         Ok(Self(ptr))
-    }
-
-    fn set_wm_hints<C: Display + Send + Sync + 'static, F: FnOnce() -> C>(
-        &self,
-        failure_context: F,
-        wm_hint_property_state: WmHintPropertyState,
-        prop1: u32,
-        prop2: u32,
-    ) -> anyhow::Result<()> {
-        let state = self.0.state.borrow();
-        let message = ClientMessageEvent::new(
-            32,
-            self.0.x_window,
-            state.atoms._NET_WM_STATE,
-            [wm_hint_property_state as u32, prop1, prop2, 1, 0],
-        );
-        check_reply(
-            failure_context,
-            self.0.xcb.send_event(
-                false,
-                state.x_root_window,
-                xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
-                message,
-            ),
-        )?;
-        xcb_flush(&self.0.xcb);
-        Ok(())
     }
 
     fn get_root_position(
@@ -1260,6 +1254,51 @@ impl X11WindowStatePtr {
                 force_render: false,
             });
         }
+    }
+
+    /// Toggles `wm_state`: by a message once the window manager has mapped
+    /// the window, and before that on the property the map writes and the
+    /// message the first `MapNotify` sends (`open_state`).
+    fn toggle_wm_state(&self, wm_state: WmState) {
+        if self.state.borrow_mut().open_state.toggle(wm_state) {
+            self.send_wm_state(WmHintPropertyState::Toggle, wm_state)
+                .log_err();
+        }
+    }
+
+    /// Sends the window manager the states the window asked for before its
+    /// first map, as add messages, on that map: the first moment a window
+    /// manager acts on one.
+    pub(crate) fn send_open_state(&self) {
+        let Some(asked) = self.state.borrow_mut().open_state.map() else {
+            return;
+        };
+        for wm_state in asked.requested() {
+            self.send_wm_state(WmHintPropertyState::Add, wm_state)
+                .log_err();
+        }
+    }
+
+    fn send_wm_state(&self, action: WmHintPropertyState, wm_state: WmState) -> anyhow::Result<()> {
+        let state = self.state.borrow();
+        let [first, second] = wm_state_atoms(&state.atoms, wm_state);
+        let message = ClientMessageEvent::new(
+            32,
+            self.x_window,
+            state.atoms._NET_WM_STATE,
+            [action as u32, first, second, 1, 0],
+        );
+        check_reply(
+            || format!("X11 SendEvent for {wm_state:?} failed."),
+            self.xcb.send_event(
+                false,
+                state.x_root_window,
+                xproto::EventMask::SUBSTRUCTURE_REDIRECT | xproto::EventMask::SUBSTRUCTURE_NOTIFY,
+                message,
+            ),
+        )?;
+        xcb_flush(&self.xcb);
+        Ok(())
     }
 
     pub fn handle_input(&self, input: PlatformInput) {
@@ -1788,6 +1827,26 @@ impl PlatformWindow for X11Window {
             if state.map_waits_for_configure {
                 state.renderer.finish_configure().log_err();
             }
+            // EWMH reads an unmapped window's states from its property.
+            for wm_state in state.open_state.requested() {
+                let atoms = wm_state_atoms(&state.atoms, wm_state);
+                let listed = if atoms[1] == u32::from(xproto::AtomEnum::NONE) {
+                    &atoms[..1]
+                } else {
+                    &atoms[..]
+                };
+                check_reply(
+                    || format!("X11 ChangeProperty32 setting {wm_state:?} before the map failed."),
+                    self.0.xcb.change_property32(
+                        xproto::PropMode::APPEND,
+                        self.0.x_window,
+                        state.atoms._NET_WM_STATE,
+                        xproto::AtomEnum::ATOM,
+                        listed,
+                    ),
+                )
+                .log_err();
+            }
         }
         check_reply(
             || "X11 MapWindow failed.",
@@ -1847,25 +1906,11 @@ impl PlatformWindow for X11Window {
     }
 
     fn zoom(&self) {
-        let state = self.0.state.borrow();
-        self.set_wm_hints(
-            || "X11 SendEvent to maximize a window failed.",
-            WmHintPropertyState::Toggle,
-            state.atoms._NET_WM_STATE_MAXIMIZED_VERT,
-            state.atoms._NET_WM_STATE_MAXIMIZED_HORZ,
-        )
-        .log_err();
+        self.0.toggle_wm_state(WmState::Maximized);
     }
 
     fn toggle_fullscreen(&self) {
-        let state = self.0.state.borrow();
-        self.set_wm_hints(
-            || "X11 SendEvent to fullscreen a window failed.",
-            WmHintPropertyState::Toggle,
-            state.atoms._NET_WM_STATE_FULLSCREEN,
-            xproto::AtomEnum::NONE.into(),
-        )
-        .log_err();
+        self.0.toggle_wm_state(WmState::Fullscreen);
     }
 
     fn is_fullscreen(&self) -> bool {
