@@ -47,7 +47,7 @@ use super::{
     check_reply,
     clipboard::{self, Clipboard},
     compositor::compositor_present,
-    get_reply, get_valuator_axis_index,
+    configure_origin, get_reply, get_valuator_axis_index,
     gpu_context::{self, WindowGpu},
     modifiers_from_state, pressed_button_from_mask, xcb_flush, xi_root_position,
 };
@@ -1028,17 +1028,21 @@ impl X11Client {
                 }
             }
             Event::ConfigureNotify(event) => {
+                let window = self.get_window(event.window)?;
+                let synthetic = event.response_type & 0x80 != 0;
+                let (x, y) = configure_origin(synthetic, (event.x, event.y), || {
+                    window.root_origin().log_err()
+                });
                 let bounds = Bounds {
                     origin: Point {
-                        x: event.x.into(),
-                        y: event.y.into(),
+                        x: x.into(),
+                        y: y.into(),
                     },
                     size: Size {
                         width: event.width.into(),
                         height: event.height.into(),
                     },
                 };
-                let window = self.get_window(event.window)?;
                 window
                     .set_bounds(bounds)
                     .context("X11: Failed to set window bounds")

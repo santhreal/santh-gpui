@@ -40,11 +40,11 @@ use super::{
 mod open_state;
 mod placement;
 use open_state::{OpenState, WmState};
-pub(crate) use placement::xi_root_position;
 use placement::{
     ConfigureChange, configure_change, creation_background_pixel, map_waits_for_configure,
     normal_hints,
 };
+pub(crate) use placement::{configure_origin, xi_root_position};
 
 x11rb::atom_manager! {
     pub XcbAtoms: AtomsCookie {
@@ -1398,6 +1398,17 @@ impl X11WindowStatePtr {
         bounds.map(|b| b.scale(scale_factor))
     }
 
+    /// The root position of the window's top-left corner, asked of the
+    /// server.
+    pub fn root_origin(&self) -> anyhow::Result<(i16, i16)> {
+        let root = self.state.borrow().x_root_window;
+        let reply = get_reply(
+            || "X11 TranslateCoordinates of the window origin failed.",
+            self.xcb.translate_coordinates(self.x_window, root, 0, 0),
+        )?;
+        Ok((reply.dst_x, reply.dst_y))
+    }
+
     /// Apply a ConfigureNotify reporting `bounds` in root device pixels.
     pub fn set_bounds(&self, bounds: Bounds<i32>) -> anyhow::Result<()> {
         let mut resize_args = None;
@@ -1406,8 +1417,9 @@ impl X11WindowStatePtr {
             let mut state = self.state.borrow_mut();
             let reported = bounds.map(|f| px(f as f32 / state.scale_factor));
             match configure_change(state.bounds, reported) {
-                ConfigureChange::Resized(size) => {
-                    state.bounds.size = size;
+                ConfigureChange::Resized(reported) => {
+                    moved = reported.origin != state.bounds.origin;
+                    state.bounds = reported;
                     let gpu_size = query_render_extent(&self.xcb, self.x_window)?;
                     state.renderer.update_drawable_size(gpu_size);
                     resize_args = Some((state.content_size(), state.scale_factor));

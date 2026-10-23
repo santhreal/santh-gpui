@@ -1,16 +1,22 @@
 //! X11 window placement and configure handling that does not need a server
 //! connection: the `WM_NORMAL_HINTS` a new window sets, the background pixel
-//! it is created with, and what a `ConfigureNotify` changes.
+//! it is created with, and where a `ConfigureNotify` places the window and
+//! what it changes.
 
 use gpui::{Bounds, DevicePixels, Pixels, Point, Size};
 use x11rb::properties::{WmSizeHints, WmSizeHintsSpecification};
+use x11rb::protocol::xproto::Gravity;
 
 /// `WM_NORMAL_HINTS` for a new window at `origin` (root device pixels).
 ///
 /// The position hint places the window where the application put it: a
 /// window manager applies its own placement to a window without one, which
-/// only a move after the map would undo. Sizes are in device pixels, so the
-/// logical `min_size` is multiplied by `scale_factor`. `max_texture_size`
+/// only a move after the map would undo. The position is the client area's,
+/// as the bounds a window reports are, so the hint carries static gravity: a
+/// window manager with the default north-west gravity puts the frame's corner
+/// there instead, and a window reopened at the bounds it closed with moves by
+/// its frame's left and top extents each time. Sizes are in device pixels, so
+/// the logical `min_size` is multiplied by `scale_factor`. `max_texture_size`
 /// bounds the window to what the renderer can draw.
 pub(super) fn normal_hints(
     origin: Point<DevicePixels>,
@@ -24,6 +30,7 @@ pub(super) fn normal_hints(
         origin.x.0,
         origin.y.0,
     ));
+    hints.win_gravity = Some(Gravity::STATIC);
     hints.min_size = min_size.map(|size| {
         (
             (f32::from(size.width) * scale_factor).round() as i32,
@@ -66,12 +73,32 @@ pub(super) fn map_waits_for_configure(
         && creation_background_pixel(transparent, compositor_present, argb_visual).is_none()
 }
 
-/// What a `ConfigureNotify` changes on a window whose bounds are `current`.
+/// The root position of a window whose `ConfigureNotify` reports `reported`.
+///
+/// A window manager that moves a window reports the move with a synthetic
+/// `ConfigureNotify` in root coordinates (ICCCM 4.1.5). One the server
+/// generates places the window in its parent, which under a reparenting
+/// window manager is the frame, so the root position is asked of the server
+/// with `in_root`, and the reported one stands when that fails.
+pub(crate) fn configure_origin(
+    synthetic: bool,
+    reported: (i16, i16),
+    in_root: impl FnOnce() -> Option<(i16, i16)>,
+) -> (i16, i16) {
+    if synthetic {
+        reported
+    } else {
+        in_root().unwrap_or(reported)
+    }
+}
+
+/// What a `ConfigureNotify` changes on a window whose bounds are `current`,
+/// given the bounds it reports in root coordinates.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(super) enum ConfigureChange {
-    /// The size changed. The reported origin is relative to the window
-    /// manager's frame on a resize, so only the size is read.
-    Resized(Size<Pixels>),
+    /// The size changed, and the window is at these bounds: a resize from
+    /// the left or top edge moves the origin too.
+    Resized(Bounds<Pixels>),
     /// The size is unchanged and the window moved to this root position.
     Moved(Point<Pixels>),
     /// Neither changed, as on a restack or a repeated move request: nothing
@@ -84,7 +111,7 @@ pub(super) fn configure_change(
     reported: Bounds<Pixels>,
 ) -> ConfigureChange {
     if reported.size != current.size {
-        ConfigureChange::Resized(reported.size)
+        ConfigureChange::Resized(reported)
     } else if reported.origin != current.origin {
         ConfigureChange::Moved(reported.origin)
     } else {
@@ -108,9 +135,14 @@ mod tests {
     const P_POSITION: u32 = 1 << 2;
     const P_MIN_SIZE: u32 = 1 << 4;
     const P_MAX_SIZE: u32 = 1 << 5;
+    const P_WIN_GRAVITY: u32 = 1 << 9;
+
+    /// `StaticGravity` in the core protocol's encoding.
+    const STATIC_GRAVITY: u32 = 10;
 
     /// The WM_NORMAL_HINTS property as the window manager reads it: 18
-    /// CARD32 words, flags first, then x, y, width, height, min and max.
+    /// CARD32 words, flags first, then x, y, width, height, min and max, and
+    /// the gravity last.
     fn words(hints: &WmSizeHints) -> Vec<u32> {
         hints
             .serialize()
@@ -119,18 +151,22 @@ mod tests {
             .collect()
     }
 
-    /// A window opens at the position the application gave it: the hint
-    /// carries the program-specified position, including a negative origin
-    /// on a monitor left of or above the primary one, and a window at the
+    /// A window opens with its client area at the position the application
+    /// gave it: the hint carries the program-specified position, including a
+    /// negative origin on a monitor left of or above the primary one, with
+    /// static gravity, so a window manager places the client there and the
+    /// frame around it rather than the frame's corner there. A window at the
     /// root origin is not moved off it.
     #[test]
-    fn position_hint_is_the_requested_origin() {
+    fn position_hint_is_the_requested_client_origin() {
         for (x, y) in [(0, 0), (640, 360), (-1920, 0), (3840, -200)] {
             let hints = normal_hints(point(DevicePixels(x), DevicePixels(y)), None, 1.0, 8192);
             let words = words(&hints);
             assert_eq!(words.len(), 18);
             assert_eq!(words[0] & P_POSITION, P_POSITION, "origin {x},{y}");
             assert_eq!((words[1] as i32, words[2] as i32), (x, y));
+            assert_eq!(words[0] & P_WIN_GRAVITY, P_WIN_GRAVITY, "origin {x},{y}");
+            assert_eq!(words[17], STATIC_GRAVITY, "origin {x},{y}");
         }
     }
 
@@ -219,14 +255,14 @@ mod tests {
                 bounds(140.0, 90.0, 800.0, 600.0),
                 ConfigureChange::Moved(point(px(140.0), px(90.0))),
             ),
-            // A resize reports a frame-relative origin; the size alone is read.
+            // A resize from the left or top edge moves the origin with it.
             (
-                bounds(0.0, 0.0, 801.0, 600.0),
-                ConfigureChange::Resized(size(px(801.0), px(600.0))),
+                bounds(60.0, 50.0, 840.0, 600.0),
+                ConfigureChange::Resized(bounds(60.0, 50.0, 840.0, 600.0)),
             ),
             (
                 bounds(100.0, 50.0, 800.0, 599.0),
-                ConfigureChange::Resized(size(px(800.0), px(599.0))),
+                ConfigureChange::Resized(bounds(100.0, 50.0, 800.0, 599.0)),
             ),
         ];
         for (reported, expected) in cases {
@@ -236,6 +272,28 @@ mod tests {
                 "{reported:?}"
             );
         }
+    }
+
+    /// A synthetic `ConfigureNotify` is in root coordinates and is read as
+    /// it is, without asking the server. One the server generates is in the
+    /// parent's, the frame's under a reparenting window manager, so the root
+    /// position is asked for, and the reported one stands when the server
+    /// cannot answer. The frame-relative origin is the frame's left and top
+    /// extents, which a window reopened at it would drift by.
+    #[test]
+    fn a_configure_origin_is_read_in_root_coordinates() {
+        let unasked = || -> Option<(i16, i16)> { panic!("a synthetic origin was asked for") };
+        assert_eq!(configure_origin(true, (200, 150), unasked), (200, 150));
+        assert_eq!(configure_origin(true, (-1920, 0), unasked), (-1920, 0));
+        assert_eq!(
+            configure_origin(false, (1, 22), || Some((200, 150))),
+            (200, 150)
+        );
+        assert_eq!(
+            configure_origin(false, (1, 22), || Some((-1720, 172))),
+            (-1720, 172)
+        );
+        assert_eq!(configure_origin(false, (1, 22), || None), (1, 22));
     }
 
     /// XI2 root coordinates are 16.16 fixed point. Fractional pixels
