@@ -236,32 +236,43 @@ impl TaffyLayoutEngine {
             .compute_layout_with_measure(
                 id.into(),
                 available_space.into(),
-                |known_dimensions, available_space, _id, node_context, _style| {
-                    let Some(node_context) = node_context else {
-                        return taffy::geometry::Size::default();
-                    };
+                |inputs, _id, node_context, style| {
+                    taffy::compute_leaf_layout(
+                        inputs,
+                        style,
+                        |_, _| 0.0,
+                        |known_dimensions, available_space| {
+                            let Some(node_context) = node_context else {
+                                return taffy::geometry::Size::default();
+                            };
 
-                    let known_dimensions = Size {
-                        width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
-                        height: known_dimensions.height.map(|e| Pixels(e / scale_factor)),
-                    };
+                            let known_dimensions = Size {
+                                width: known_dimensions.width.map(|e| Pixels(e / scale_factor)),
+                                height: known_dimensions.height.map(|e| Pixels(e / scale_factor)),
+                            };
 
-                    let available_space: Size<AvailableSpace> = available_space.into();
-                    let untransform = |ev: AvailableSpace| match ev {
-                        AvailableSpace::Definite(pixels) => {
-                            AvailableSpace::Definite(Pixels(pixels.0 / scale_factor))
-                        }
-                        AvailableSpace::MinContent => AvailableSpace::MinContent,
-                        AvailableSpace::MaxContent => AvailableSpace::MaxContent,
-                    };
-                    let available_space = size(
-                        untransform(available_space.width),
-                        untransform(available_space.height),
-                    );
+                            let available_space: Size<AvailableSpace> = available_space.into();
+                            let untransform = |ev: AvailableSpace| match ev {
+                                AvailableSpace::Definite(pixels) => {
+                                    AvailableSpace::Definite(Pixels(pixels.0 / scale_factor))
+                                }
+                                AvailableSpace::MinContent => AvailableSpace::MinContent,
+                                AvailableSpace::MaxContent => AvailableSpace::MaxContent,
+                            };
+                            let available_space = size(
+                                untransform(available_space.width),
+                                untransform(available_space.height),
+                            );
 
-                    let measured_size: Size<Pixels> =
-                        (node_context.measure)(known_dimensions, available_space, window, cx);
-                    snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                            let measured_size: Size<Pixels> = (node_context.measure)(
+                                known_dimensions,
+                                available_space,
+                                window,
+                                cx,
+                            );
+                            snap_measured_size_to_device_pixels(measured_size, scale_factor).into()
+                        },
+                    )
                 },
             )
             .expect(EXPECT_MESSAGE);
@@ -507,10 +518,18 @@ impl ToTaffy<taffy::style::Style> for Style {
             margin: self.margin.to_taffy(rem_size, scale_factor),
             padding: self.padding.to_taffy(rem_size, scale_factor),
             border: border_widths_to_taffy(&self.border_widths, rem_size, scale_factor),
-            align_items: self.align_items.map(|x| x.into()),
+            // An unset alignment is CSS `normal`, the value taffy applies when
+            // a style sets none.
+            align_items: self
+                .align_items
+                .map_or(taffy::style::AlignItems::NORMAL, Into::into),
             align_self: self.align_self.map(|x| x.into()),
-            align_content: self.align_content.map(|x| x.into()),
-            justify_content: self.justify_content.map(|x| x.into()),
+            align_content: self
+                .align_content
+                .map_or(taffy::style::AlignContent::NORMAL, Into::into),
+            justify_content: self
+                .justify_content
+                .map_or(taffy::style::JustifyContent::NORMAL, Into::into),
             gap: self.gap.to_taffy(rem_size, scale_factor),
             flex_direction: self.flex_direction.into(),
             flex_wrap: self.flex_wrap.into(),
@@ -759,6 +778,89 @@ impl From<Size<Pixels>> for Size<AvailableSpace> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{self as gpui, Display, FlexDirection, TestAppContext, px};
+    use std::{cell::Cell, rc::Rc};
+
+    /// A measured leaf under plain flex columns is measured a number of
+    /// times linear in the number of measured leaves, at any depth.
+    ///
+    /// Class: superlinear measurement of nested auto-width flex containers.
+    /// taffy 0.13 measured each stretched flex item for its hypothetical
+    /// cross size under an unknown width, and its size cache stored that
+    /// result and the one under the definite width in the same slot, so the
+    /// two evicted each other at every level: one leaf under 12 columns was
+    /// measured 24,574 times, and 8 ms of layout went to one media tile. The
+    /// tree is built through `request_layout` and `Style::to_taffy`, the
+    /// path every element takes, at depths up to 16, bare and with a measured
+    /// sibling, padding and a gap at every level.
+    ///
+    /// It does not cover grid or block containers, and it bounds measure
+    /// calls, not time.
+    #[gpui::test]
+    fn nested_flex_columns_measure_each_leaf_a_bounded_number_of_times(cx: &mut TestAppContext) {
+        const CALLS_PER_LEAF: usize = 6;
+        let cx = cx.add_empty_window();
+        for padded in [false, true] {
+            for depth in [0_usize, 1, 2, 4, 8, 12, 16] {
+                let calls = Rc::new(Cell::new(0_usize));
+                let leaves = 1 + if padded { depth } else { 0 };
+                cx.update(|window, cx| {
+                    let mut engine = TaffyLayoutEngine::new();
+                    let rem = px(16.);
+                    let leaf = |engine: &mut TaffyLayoutEngine| {
+                        let calls = calls.clone();
+                        engine.request_measured_layout(
+                            Style::default(),
+                            rem,
+                            1.0,
+                            move |known, available, _, _| {
+                                calls.set(calls.get() + 1);
+                                let width = known.width.unwrap_or(match available.width {
+                                    AvailableSpace::Definite(width) => width.min(px(180.)),
+                                    AvailableSpace::MinContent => px(60.),
+                                    AvailableSpace::MaxContent => px(180.),
+                                });
+                                size(width, known.height.unwrap_or(px(16.)))
+                            },
+                        )
+                    };
+                    let mut column = Style {
+                        display: Display::Flex,
+                        flex_direction: FlexDirection::Column,
+                        ..Style::default()
+                    };
+                    if padded {
+                        column.padding = Edges {
+                            top: px(2.).into(),
+                            right: px(4.).into(),
+                            bottom: px(2.).into(),
+                            left: px(4.).into(),
+                        };
+                        column.gap = size(px(0.).into(), px(4.).into());
+                    }
+                    let mut node = leaf(&mut engine);
+                    for _ in 0..depth {
+                        let children = if padded {
+                            vec![node, leaf(&mut engine)]
+                        } else {
+                            vec![node]
+                        };
+                        node = engine.request_layout(column.clone(), rem, 1.0, &children);
+                    }
+                    let mut root = column;
+                    root.size = size(px(300.).into(), px(800.).into());
+                    let root = engine.request_layout(root, rem, 1.0, &[node]);
+                    engine.compute_layout(root, size(px(300.), px(800.)).into(), window, cx);
+                });
+                assert!(
+                    calls.get() <= CALLS_PER_LEAF * leaves,
+                    "{} measure calls for {leaves} leaves under {depth} flex columns \
+                     (padded: {padded}); the bound is {CALLS_PER_LEAF} per leaf",
+                    calls.get(),
+                );
+            }
+        }
+    }
 
     #[test]
     fn border_widths_to_taffy_use_stroke_snapping() {
