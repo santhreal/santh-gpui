@@ -5,11 +5,9 @@ use std::ops::Range;
 
 use crate::{
     App, Bounds, ListOffset, Pixels, Window,
-    motion::{ElementSpring, PIXEL_REST_DISTANCE},
+    motion::{ElementSpring, PIXEL_REST_DISTANCE, SpringConfig},
     px,
 };
-
-use super::smooth_wheel::WHEEL_SPRING;
 
 #[cfg(test)]
 mod tests;
@@ -19,10 +17,14 @@ mod tests;
 /// in the frame that draws it.
 pub(crate) const GROWTH_HELD: f32 = 0.4;
 
+/// The spring a following list uses to bring newly grown content into
+/// view: critically damped with a 120 ms response.
+const FOLLOW_SPRING: SpringConfig = SpringConfig::new(2741.557, 104.719_76, 1.0);
+
 /// The follow motion of one list.
 ///
 /// `lag` is how far the end of the content lies below the end of the
-/// viewport, carried to zero on [`WHEEL_SPRING`]. `shown` is the scroll top
+/// viewport, carried to zero on [`FOLLOW_SPRING`]. `shown` is the scroll top
 /// the last layout that followed the tail displayed. The next following
 /// layout measures from it how far the end moved since. Of a growth, the
 /// share [`GROWTH_HELD`] joins the lag at the frame instant already moving
@@ -38,7 +40,7 @@ impl FollowEase {
     /// A motion at rest with nothing shown.
     pub(crate) fn new() -> Self {
         Self {
-            lag: ElementSpring::at_rest(0.0, WHEEL_SPRING, PIXEL_REST_DISTANCE),
+            lag: ElementSpring::at_rest(0.0, FOLLOW_SPRING, PIXEL_REST_DISTANCE),
             shown: None,
         }
     }

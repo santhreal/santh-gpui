@@ -702,8 +702,8 @@ impl ListState {
 
     /// Eases following the tail when `smooth` is set. While the list follows
     /// its tail, content that grows at the end, as an item that streams or
-    /// arrives, moves into view on [`WHEEL_SPRING`](crate::WHEEL_SPRING)
-    /// instead of at once, one frame per display frame; growth during the
+    /// arrives, moves into view on a critically damped spring instead of at
+    /// once, one frame per display frame; growth during the
     /// motion extends it and keeps its velocity. Any other change of the
     /// scroll position, such as a wheel event, [`Self::scroll_to`],
     /// [`Self::scroll_to_end`] or [`Self::set_follow_mode`], ends the motion,

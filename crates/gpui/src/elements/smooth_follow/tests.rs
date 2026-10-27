@@ -179,15 +179,15 @@ fn run_to_rest(
 
 /// The lag and velocity a growth of `by` at the end of a list at rest joins
 /// the motion with: the share [`GROWTH_HELD`], moving along the decay of
-/// the critically damped [`WHEEL_SPRING`].
+/// the critically damped [`FOLLOW_SPRING`].
 fn held(by: f32) -> (f32, f32) {
     let held = by * GROWTH_HELD;
-    let rate = (WHEEL_SPRING.stiffness / WHEEL_SPRING.mass).sqrt();
+    let rate = (FOLLOW_SPRING.stiffness / FOLLOW_SPRING.mass).sqrt();
     (held, -held * rate)
 }
 
 /// Asserts that `frames`, one per display frame after the end moved `by`
-/// below the viewport at rest, follow [`WHEEL_SPRING`] from the share of
+/// below the viewport at rest, follow [`FOLLOW_SPRING`] from the share of
 /// `by` held back to the end, closer on every frame.
 fn assert_eases(
     window: &WindowHandle<Feed>,
@@ -200,7 +200,7 @@ fn assert_eases(
     assert!(frames.len() > 5, "the motion took {} frames", frames.len());
     let mut previous = start;
     for (ix, (lag, _)) in frames.iter().enumerate() {
-        let (expected, _) = spring_at(WHEEL_SPRING, start, velocity, 0.0, ix as u32 + 1);
+        let (expected, _) = spring_at(FOLLOW_SPRING, start, velocity, 0.0, ix as u32 + 1);
         assert!(
             (lag - expected).abs() <= tolerance,
             "frame {}: {lag} behind, the spring {expected}",
@@ -277,7 +277,7 @@ fn growth_during_the_motion_extends_it_and_keeps_its_velocity(cx: &mut TestAppCo
     next_frame(&window, cx);
     next_frame(&window, cx);
     let (start, pull) = held(40.0);
-    let (behind, velocity) = spring_at(WHEEL_SPRING, start, pull, 0.0, 2);
+    let (behind, velocity) = spring_at(FOLLOW_SPRING, start, pull, 0.0, 2);
 
     grow(&window, cx, 30.0);
     let (more, more_pull) = held(30.0);
@@ -286,7 +286,7 @@ fn growth_during_the_motion_extends_it_and_keeps_its_velocity(cx: &mut TestAppCo
         "the growth adds its held share to the lag at once"
     );
     next_frame(&window, cx);
-    let (expected, _) = spring_at(WHEEL_SPRING, behind + more, velocity + more_pull, 0.0, 1);
+    let (expected, _) = spring_at(FOLLOW_SPRING, behind + more, velocity + more_pull, 0.0, 1);
     let lag = lag(&window, cx);
     assert!(
         (lag - expected).abs() <= tolerance,
@@ -307,7 +307,7 @@ fn splices_that_keep_the_shown_row_continue_the_motion(cx: &mut TestAppContext) 
     next_frame(&window, cx);
     next_frame(&window, cx);
     let (start, pull) = held(40.0);
-    let (behind, velocity) = spring_at(WHEEL_SPRING, start, pull, 0.0, 2);
+    let (behind, velocity) = spring_at(FOLLOW_SPRING, start, pull, 0.0, 2);
 
     // Rows loaded above the view, and the shown row replaced in place by a
     // row of its height, as a streamed reply by its committed entry.
@@ -319,7 +319,7 @@ fn splices_that_keep_the_shown_row_continue_the_motion(cx: &mut TestAppContext) 
         "the splices move nothing at once"
     );
     next_frame(&window, cx);
-    let (expected, _) = spring_at(WHEEL_SPRING, behind, velocity, 0.0, 1);
+    let (expected, _) = spring_at(FOLLOW_SPRING, behind, velocity, 0.0, 1);
     let lag = lag(&window, cx);
     assert!(
         (lag - expected).abs() <= tolerance,

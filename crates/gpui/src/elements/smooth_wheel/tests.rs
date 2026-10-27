@@ -213,6 +213,13 @@ fn a_line_tick_eases_a_scroll_handle_along_the_spring_to_its_target(cx: &mut Tes
     let viewport = painted_bounds(&window, cx, SCROLLER).unwrap();
     let frames = run_to_rest(&window, cx, || handle.offset().y.0);
     assert_eases(first, &frames, 0.0, target);
+    // Three lines must retain an eased motion (assert_eases requires
+    // more than five frames) without extending the tail past eight.
+    assert!(
+        frames.len() <= 8,
+        "a three-line tick took {} frames",
+        frames.len()
+    );
     for (ix, (_, damage)) in frames.iter().enumerate() {
         let damage = damage.expect("a frame of the motion repaints a region");
         assert!(
