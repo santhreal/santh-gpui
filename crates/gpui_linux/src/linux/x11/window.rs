@@ -796,12 +796,12 @@ impl X11WindowState {
                     transparent,
                     // Fifo blocks the thread that draws in
                     // `get_current_texture` until the display releases a
-                    // swapchain image. The frame loop runs at the first
-                    // CRTC's refresh rate; under a compositor that presents
-                    // at a lower rate, every frame then waits up to one
-                    // compositor period with input queued behind it.
+                    // swapchain image, with input queued behind it, whenever
+                    // frames outpace the display, as under a compositor that
+                    // presents at a lower rate than the window's CRTC.
                     // Mailbox replaces the queued image instead. Falls back
-                    // to Fifo where the surface lacks Mailbox.
+                    // to Fifo where the surface lacks Mailbox, as NVIDIA's
+                    // X11 surfaces do.
                     preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
                 };
                 gpu.renderer(&raw_window, config)?
@@ -1404,6 +1404,14 @@ impl X11WindowStatePtr {
             state.input_handler = Some(input_handler);
         };
         bounds.map(|b| b.scale(scale_factor))
+    }
+
+    /// The rectangle of the root window the window covers, in device pixels.
+    pub(crate) fn device_bounds(&self) -> Bounds<i32> {
+        let state = self.state.borrow();
+        state
+            .bounds
+            .map(|length| (f32::from(length) * state.scale_factor).round() as i32)
     }
 
     /// The root position of the window's top-left corner, asked of the

@@ -20,7 +20,7 @@ const INTERVAL: Duration = Duration::from_millis(16);
 /// A pacer of a window the X server does not show yet.
 fn hidden_pacer() -> Pacer {
     let mut pacer = Pacer::new();
-    pacer.interval = Some(INTERVAL);
+    pacer.interval = INTERVAL;
     pacer
 }
 
@@ -28,7 +28,11 @@ fn hidden_pacer() -> Pacer {
 fn a_window_draws_when_shown_and_parks_after_a_frame_without_demand() {
     let t0 = Instant::now();
     let mut pacer = hidden_pacer();
-    assert_eq!(pacer.show(t0), Some(t0), "a window that becomes visible draws at once");
+    assert_eq!(
+        pacer.show(t0),
+        Some(t0),
+        "a window that becomes visible draws at once"
+    );
     pacer.begin_frame(t0);
     assert_eq!(
         pacer.end_frame(t0, t0 + Duration::from_millis(2)),
@@ -44,7 +48,11 @@ fn demand_while_a_frame_runs_keeps_the_timer_on_the_frame_grid() {
     let mut pacer = hidden_pacer();
     pacer.show(t0);
     pacer.begin_frame(t0);
-    assert_eq!(pacer.wake(t0), None, "a running frame registers no second timer");
+    assert_eq!(
+        pacer.wake(t0),
+        None,
+        "a running frame registers no second timer"
+    );
     assert_eq!(
         pacer.end_frame(t0, t0 + Duration::from_millis(3)),
         Some(t0 + INTERVAL),
@@ -62,12 +70,20 @@ fn demand_after_an_idle_stretch_draws_at_once_and_demand_within_an_interval_wait
     pacer.end_frame(t0, t0);
 
     let soon = t0 + Duration::from_millis(5);
-    assert_eq!(pacer.wake(soon), Some(t0 + INTERVAL), "frames never outpace the display");
+    assert_eq!(
+        pacer.wake(soon),
+        Some(t0 + INTERVAL),
+        "frames never outpace the display"
+    );
     pacer.begin_frame(t0 + INTERVAL);
     pacer.end_frame(t0 + INTERVAL, t0 + INTERVAL);
 
     let later = t0 + Duration::from_secs(2);
-    assert_eq!(pacer.wake(later), Some(later), "demand after an idle stretch draws at once");
+    assert_eq!(
+        pacer.wake(later),
+        Some(later),
+        "demand after an idle stretch draws at once"
+    );
 }
 
 #[test]
@@ -89,7 +105,11 @@ fn demand_while_hidden_draws_when_the_window_is_shown() {
     assert_eq!(pacer.phase, Phase::Idle);
     let shown = t0 + Duration::from_millis(40);
     assert_eq!(pacer.show(shown), Some(shown));
-    assert_eq!(pacer.show(shown), None, "a second show registers no second timer");
+    assert_eq!(
+        pacer.show(shown),
+        None,
+        "a second show registers no second timer"
+    );
 }
 
 #[test]
@@ -103,7 +123,10 @@ fn hiding_removes_an_armed_timer_and_a_running_frame_drops_its_own() {
     pacer.show(t0);
     pacer.begin_frame(t0);
     pacer.wake(t0);
-    assert!(!pacer.hide(), "the running frame's timer is not removed under it");
+    assert!(
+        !pacer.hide(),
+        "the running frame's timer is not removed under it"
+    );
     assert_eq!(
         pacer.end_frame(t0, t0),
         None,
@@ -146,7 +169,9 @@ enum Step {
     Show,
     Hide,
     /// The registered timer fires; the frame leaves demand or none.
-    Frame { demand: bool },
+    Frame {
+        demand: bool,
+    },
     /// Registering the timer of the previous `wake` or `show` failed.
     RegisterFails,
 }
@@ -198,7 +223,10 @@ impl Model {
             }
             Step::Hide => {
                 if self.pacer.hide() {
-                    assert!(self.timer.take().is_some(), "removed no timer after {trace:?}");
+                    assert!(
+                        self.timer.take().is_some(),
+                        "removed no timer after {trace:?}"
+                    );
                 }
             }
             Step::Frame { demand } => {
@@ -250,7 +278,10 @@ impl Model {
             "the pacer and the event loop disagree on the timer after {trace:?}"
         );
         if !self.pacer.visible {
-            assert!(self.timer.is_none(), "a hidden window holds a timer after {trace:?}");
+            assert!(
+                self.timer.is_none(),
+                "a hidden window holds a timer after {trace:?}"
+            );
         }
         if self.pacer.visible && self.unserved {
             assert!(

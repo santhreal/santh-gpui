@@ -177,7 +177,7 @@ fn present_mode(
             mode
         }
         Some(mode) => {
-            warn!(
+            log::info!(
                 "present mode {mode:?} is unsupported by the surface, which offers {supported:?}; presenting with Fifo"
             );
             wgpu::PresentMode::Fifo

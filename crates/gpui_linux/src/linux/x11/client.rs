@@ -42,14 +42,14 @@ use xkbc::x11::ffi::{XKB_X11_MIN_MAJOR_XKB_VERSION, XKB_X11_MIN_MINOR_XKB_VERSIO
 use xkbcommon::xkb::{self as xkbc, STATE_LAYOUT_EFFECTIVE};
 
 use super::{
-    ButtonOrScroll, DEFAULT_FRAME_INTERVAL, FrameLoop, ScrollDirection, X11Display,
+    ButtonOrScroll, CrtcRate, DEFAULT_FRAME_INTERVAL, FrameLoop, ScrollDirection, X11Display,
     X11WindowStatePtr, XcbAtoms, XimCallbackEvent, XimHandler, button_or_scroll_from_event_detail,
     check_reply,
     clipboard::{self, Clipboard},
     compositor::compositor_present,
     configure_origin, get_reply, get_valuator_axis_index,
     gpu_context::{self, WindowGpu},
-    modifiers_from_state, pressed_button_from_mask, xcb_flush, xi_root_position,
+    interval_at, modifiers_from_state, pressed_button_from_mask, xcb_flush, xi_root_position,
 };
 
 use crate::linux::{
@@ -205,6 +205,9 @@ pub struct X11ClientState {
     /// Whether an EWMH window manager ran when the client connected.
     window_manager_present: bool,
     pub(crate) x_root_index: usize,
+    /// The CRTCs that show a mode, with their frame intervals, read from
+    /// RandR on first use after the screen configuration changed.
+    crtc_rates: Option<Vec<CrtcRate>>,
     pub(crate) resource_database: Database,
     pub(crate) atoms: XcbAtoms,
     pub(crate) windows: HashMap<xproto::Window, WindowRef>,
@@ -424,6 +427,17 @@ impl X11Client {
             window_manager_present
         );
 
+        // Each window runs frames at the refresh rate of the CRTC that shows
+        // it; a screen or CRTC change re-reads the CRTCs.
+        check_reply(
+            || "RandR SelectInput failed",
+            xcb_connection.randr_select_input(
+                root,
+                randr::NotifyMask::SCREEN_CHANGE | randr::NotifyMask::CRTC_CHANGE,
+            ),
+        )
+        .log_err();
+
         let xkb = get_reply(
             || "Failed to initialize XKB extension",
             xcb_connection
@@ -587,6 +601,7 @@ impl X11Client {
             compositor_present,
             window_manager_present,
             x_root_index,
+            crtc_rates: None,
             resource_database,
             atoms,
             windows: HashMap::default(),
@@ -1047,6 +1062,12 @@ impl X11Client {
                     .set_bounds(bounds)
                     .context("X11: Failed to set window bounds")
                     .log_err();
+                let mut state = self.0.borrow_mut();
+                let interval = state.frame_interval_at(bounds);
+                window.frame_loop.set_interval(interval);
+            }
+            Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
+                self.0.borrow_mut().retime_frame_loops();
             }
             Event::PropertyNotify(event) => {
                 let window = self.get_window(event.window)?;
@@ -2044,60 +2065,51 @@ impl X11ClientState {
         self.xim_handler = Some(xim_handler);
     }
 
-    /// Starts frames for a window the X server shows and stops them for one
-    /// it does not.
-    fn update_frame_loop(&self, x_window: xproto::Window) {
+    /// Starts frames for a window the X server shows, at the frame interval
+    /// of the CRTC that shows it, and stops them for one it does not.
+    fn update_frame_loop(&mut self, x_window: xproto::Window) {
         let Some(window_ref) = self.windows.get(&x_window) else {
             return;
         };
         let is_visible = window_ref.is_mapped
             && !matches!(window_ref.last_visibility, Visibility::FULLY_OBSCURED);
-        let frame_loop = &window_ref.window.frame_loop;
+        let frame_loop = window_ref.window.frame_loop.clone();
         if is_visible {
-            frame_loop.show(|| self.display_frame_interval(x_window));
+            let bounds = window_ref.window.device_bounds();
+            frame_loop.show(self.frame_interval_at(bounds));
         } else {
             frame_loop.hide();
         }
     }
 
-    /// The refresh interval of the display mode of the first CRTC RandR
-    /// reports a mode for, or [`DEFAULT_FRAME_INTERVAL`].
-    fn display_frame_interval(&self, x_window: xproto::Window) -> Duration {
-        let Some(screen_resources) = get_reply(
-            || "Failed to get screen resources",
-            self.xcb_connection
-                .randr_get_screen_resources_current(x_window),
-        )
-        .log_err() else {
-            return DEFAULT_FRAME_INTERVAL;
-        };
-
-        // Ideally this would be re-queried when the window changes screens, but there
-        // doesn't seem to be an efficient / straightforward way to do this. Should also be
-        // updated when screen configurations change.
-        let mode_info = screen_resources.crtcs.iter().find_map(|crtc| {
-            let crtc_info = self
-                .xcb_connection
-                .randr_get_crtc_info(*crtc, x11rb::CURRENT_TIME)
-                .ok()?
-                .reply()
-                .ok()?;
-
-            screen_resources
-                .modes
-                .iter()
-                .find(|m| m.id == crtc_info.mode)
-        });
-        match mode_info {
-            Some(mode_info) => mode_refresh_rate(mode_info),
-            None => {
-                log::error!(
-                    "Failed to get screen mode info from xrandr, \
-                    defaulting to 60hz refresh rate."
-                );
-                DEFAULT_FRAME_INTERVAL
-            }
+    /// Re-reads the CRTCs after a screen change and paces every window at
+    /// the CRTC that now shows it.
+    fn retime_frame_loops(&mut self) {
+        self.crtc_rates = None;
+        let windows: Vec<_> = self
+            .windows
+            .values()
+            .map(|window_ref| {
+                (
+                    window_ref.window.frame_loop.clone(),
+                    window_ref.window.device_bounds(),
+                )
+            })
+            .collect();
+        for (frame_loop, bounds) in windows {
+            frame_loop.set_interval(self.frame_interval_at(bounds));
         }
+    }
+
+    /// The frame interval of the CRTC that shows the largest part of
+    /// `window`, a rectangle of the root window in device pixels, or
+    /// [`DEFAULT_FRAME_INTERVAL`] when RandR reports no CRTC.
+    fn frame_interval_at(&mut self, window: Bounds<i32>) -> Duration {
+        let root = self.xcb_connection.setup().roots[self.x_root_index].root;
+        let crtcs = self
+            .crtc_rates
+            .get_or_insert_with(|| query_crtc_rates(&self.xcb_connection, root));
+        interval_at(crtcs, window).unwrap_or(DEFAULT_FRAME_INTERVAL)
     }
 
     fn get_cursor_icon(&mut self, style: CursorStyle) -> Option<xproto::Cursor> {
@@ -2241,8 +2253,57 @@ pub fn mode_refresh_rate(mode: &randr::ModeInfo) -> Duration {
 
     let millihertz = mode.dot_clock as u64 * 1_000 / (mode.htotal as u64 * mode.vtotal as u64);
     let micros = 1_000_000_000 / millihertz;
-    log::info!("Refreshing every {}ms", micros / 1_000);
     Duration::from_micros(micros)
+}
+
+/// The CRTCs of the screen of `root` that show a mode, each with the
+/// frame interval of its mode. Logs each, or an error when there are none.
+fn query_crtc_rates(xcb: &XCBConnection, root: xproto::Window) -> Vec<CrtcRate> {
+    let Some(resources) = get_reply(
+        || "Failed to get screen resources",
+        xcb.randr_get_screen_resources_current(root),
+    )
+    .log_err() else {
+        return Vec::new();
+    };
+    // Every request goes out before the first reply is read: one round trip
+    // for all CRTCs.
+    let requests: Vec<_> = resources
+        .crtcs
+        .iter()
+        .filter_map(|crtc| xcb.randr_get_crtc_info(*crtc, x11rb::CURRENT_TIME).ok())
+        .collect();
+    let crtcs: Vec<CrtcRate> = requests
+        .into_iter()
+        .filter_map(|request| {
+            let info = request.reply().ok()?;
+            let mode = resources.modes.iter().find(|mode| mode.id == info.mode)?;
+            Some(CrtcRate {
+                bounds: Bounds {
+                    origin: point(i32::from(info.x), i32::from(info.y)),
+                    size: Size {
+                        width: i32::from(info.width),
+                        height: i32::from(info.height),
+                    },
+                },
+                interval: mode_refresh_rate(mode),
+            })
+        })
+        .collect();
+    if crtcs.is_empty() {
+        log::error!("RandR reports no CRTC that shows a mode; pacing frames at 60 Hz");
+    }
+    for crtc in &crtcs {
+        log::info!(
+            "x11: CRTC {}x{}+{}+{} refreshes every {:?}",
+            crtc.bounds.size.width,
+            crtc.bounds.size.height,
+            crtc.bounds.origin.x,
+            crtc.bounds.origin.y,
+            crtc.interval
+        );
+    }
+    crtcs
 }
 
 fn fp3232_to_f32(value: xinput::Fp3232) -> f32 {
