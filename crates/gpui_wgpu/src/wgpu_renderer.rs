@@ -6,6 +6,8 @@ mod layers;
 mod path_mask_tests;
 mod pipeline_cache;
 mod pipelines;
+#[cfg(test)]
+mod present_mode_tests;
 mod trial;
 
 #[cfg(not(target_family = "wasm"))]
@@ -156,9 +158,32 @@ pub struct WgpuSurfaceConfig {
     /// mode if supported by the surface, falling back to `Fifo`.
     /// When `None`, defaults to `Fifo` (VSync).
     ///
-    /// Mobile platforms may prefer `Mailbox` (triple-buffering) to avoid
-    /// blocking in `get_current_texture()` during lifecycle transitions.
+    /// `Mailbox` (triple-buffering) never blocks in `get_current_texture()`
+    /// waiting for the display. Linux windows prefer it; mobile platforms
+    /// may prefer it to avoid blocking during lifecycle transitions.
     pub preferred_present_mode: Option<wgpu::PresentMode>,
+}
+
+/// The present mode of a window surface: `preferred` when `supported`
+/// contains it, else `Fifo`, which every surface supports. Logs the mode a
+/// preference resolves to, and the supported modes when it falls back.
+fn present_mode(
+    preferred: Option<wgpu::PresentMode>,
+    supported: &[wgpu::PresentMode],
+) -> wgpu::PresentMode {
+    match preferred {
+        Some(mode) if supported.contains(&mode) => {
+            log::info!("present mode: {mode:?}");
+            mode
+        }
+        Some(mode) => {
+            warn!(
+                "present mode {mode:?} is unsupported by the surface, which offers {supported:?}; presenting with Fifo"
+            );
+            wgpu::PresentMode::Fifo
+        }
+        None => wgpu::PresentMode::Fifo,
+    }
 }
 
 /// One frame allocation of instance data, ready to bind.
@@ -610,10 +635,9 @@ impl WgpuRenderer {
             width: clamped_width.max(1),
             height: clamped_height.max(1),
             present_mode: match &surface_caps {
-                Some(surface_caps) => config
-                    .preferred_present_mode
-                    .filter(|mode| surface_caps.present_modes.contains(mode))
-                    .unwrap_or(wgpu::PresentMode::Fifo),
+                Some(surface_caps) => {
+                    present_mode(config.preferred_present_mode, &surface_caps.present_modes)
+                }
                 None => wgpu::PresentMode::Fifo,
             },
             desired_maximum_frame_latency: 2,

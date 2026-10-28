@@ -9,7 +9,7 @@ use gpui::{
     Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowDecorations, WindowKind, WindowParams, popup::PopupNotSupportedError, px,
 };
-use gpui_wgpu::{WgpuRenderer, WgpuSurfaceConfig};
+use gpui_wgpu::{WgpuRenderer, WgpuSurfaceConfig, wgpu};
 
 use collections::FxHashSet;
 use gpui_util::{ResultExt, maybe};
@@ -794,7 +794,15 @@ impl X11WindowState {
                     // then no change, where a mismatch reconfigures the
                     // surface and rebuilds every pipeline.
                     transparent,
-                    preferred_present_mode: None,
+                    // Fifo blocks the thread that draws in
+                    // `get_current_texture` until the display releases a
+                    // swapchain image. The frame loop runs at the first
+                    // CRTC's refresh rate; under a compositor that presents
+                    // at a lower rate, every frame then waits up to one
+                    // compositor period with input queued behind it.
+                    // Mailbox replaces the queued image instead. Falls back
+                    // to Fifo where the surface lacks Mailbox.
+                    preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
                 };
                 gpu.renderer(&raw_window, config)?
             };
