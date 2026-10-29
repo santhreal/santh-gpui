@@ -2301,10 +2301,18 @@ impl Interactivity {
                         let clicked_state = clicked_state.borrow();
                         self.active = Some(clicked_state.element);
                     }
+                    // A hover style that drops out for a frame (a selected
+                    // tab, a pressed toggle) stops the mouse-move listener
+                    // that keeps the remembered hover current, so the value
+                    // is forgotten rather than frozen. Laid out from a frozen
+                    // value, the style's return showed the element hovered
+                    // after the pointer had left it.
                     if self.hover_style.is_some() || self.group_hover_style.is_some() {
                         element_state
                             .hover_state
                             .get_or_insert_with(Default::default);
+                    } else {
+                        element_state.hover_state = None;
                     }
                     if let Some(active_tooltip) = element_state.active_tooltip.as_ref() {
                         if self.tooltip_builder.is_some() {
@@ -2800,6 +2808,20 @@ impl Interactivity {
             });
             let current_view = window.current_view();
 
+            // Layout reads the remembered hover, since no hitbox exists
+            // before paint, and mouse moves alone update it. An element that
+            // moves under a pointer at rest (a resized window, a reflowed
+            // pane) is corrected here against this frame's hit test, and
+            // one more frame lays it out with the corrected value.
+            if let Some(state) = &hover_state {
+                let hovered = hitbox.is_hovered(window);
+                let mut state = state.borrow_mut();
+                if state.element != hovered {
+                    state.element = hovered;
+                    window.defer(cx, move |_, cx| cx.notify(current_view));
+                }
+            }
+
             window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                 let hovered = hitbox.is_hovered(window);
                 let was_hovered = hover_state
@@ -2821,6 +2843,15 @@ impl Interactivity {
                     .and_then(|element| element.hover_state.as_ref())
                     .cloned();
                 let current_view = window.current_view();
+
+                if let Some(state) = &hover_state {
+                    let group_hovered = group_hitbox_id.is_hovered(window);
+                    let mut state = state.borrow_mut();
+                    if state.group != group_hovered {
+                        state.group = group_hovered;
+                        window.defer(cx, move |_, cx| cx.notify(current_view));
+                    }
+                }
 
                 window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, cx| {
                     let group_hovered = group_hitbox_id.is_hovered(window);
@@ -4855,6 +4886,157 @@ mod tests {
                 *hover_transitions.borrow(),
                 [true, false, true],
                 "exit at {exit_at:?}"
+            );
+        }
+    }
+
+    /// A target whose hover style widens it, so the width it is laid out
+    /// at shows the hover state layout read. `group` moves the style to a
+    /// `group_hover` on a 30px group around the target.
+    struct RememberedHoverTestView {
+        left: Pixels,
+        hoverable: bool,
+        group: bool,
+        width: Rc<Cell<Pixels>>,
+        render_count: Rc<Cell<usize>>,
+    }
+
+    impl Render for RememberedHoverTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            self.render_count.set(self.render_count.get() + 1);
+            let width = self.width.clone();
+            let target = div()
+                .id("remembered-hover-target")
+                .size(px(10.))
+                .child(canvas(
+                    move |bounds, _, _| width.set(bounds.size.width),
+                    |_, _, _, _| {},
+                ))
+                .when(self.hoverable && !self.group, |d| {
+                    d.hover(|style| style.w(px(20.)))
+                })
+                .when(self.hoverable && self.group, |d| {
+                    d.group_hover("remembered-hover-group", |style| style.w(px(20.)))
+                });
+            div().relative().size_full().child(
+                div()
+                    .id("remembered-hover-group")
+                    .group("remembered-hover-group")
+                    .absolute()
+                    .left(self.left)
+                    .top_0()
+                    .size(px(30.))
+                    .child(target),
+            )
+        }
+    }
+
+    struct RememberedHoverRig {
+        window: crate::WindowHandle<RememberedHoverTestView>,
+        width: Rc<Cell<Pixels>>,
+        render_count: Rc<Cell<usize>>,
+    }
+
+    impl RememberedHoverRig {
+        fn new(cx: &mut TestAppContext, left: Pixels, group: bool) -> Self {
+            let width = Rc::new(Cell::new(px(0.)));
+            let render_count = Rc::new(Cell::new(0));
+            let window = cx.add_window({
+                let width = width.clone();
+                let render_count = render_count.clone();
+                move |_, _| RememberedHoverTestView {
+                    left,
+                    hoverable: true,
+                    group,
+                    width,
+                    render_count,
+                }
+            });
+            cx.update_window(window.into(), |_, window, cx| window.draw(cx).clear(cx))
+                .unwrap();
+            Self {
+                window,
+                width,
+                render_count,
+            }
+        }
+
+        fn move_mouse(&self, cx: &mut TestAppContext, position: Point<Pixels>) {
+            cx.update_window(self.window.into(), |_, window, cx| {
+                window.simulate_mouse_move(position, cx)
+            })
+            .unwrap();
+        }
+
+        /// Changes the view and lets the frames it causes draw.
+        fn set(&self, cx: &mut TestAppContext, f: impl FnOnce(&mut RememberedHoverTestView)) {
+            self.window
+                .update(cx, |view, _, cx| {
+                    f(view);
+                    cx.notify();
+                })
+                .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
+    // WHY: the class closed here is "a hover style laid out from a stale
+    // remembered hover". Layout runs before this frame's hitboxes exist, so
+    // it reads a hover flag that only mouse moves updated: a hover style
+    // absent for a while (a selected tab) returned with the hover it had
+    // when it left, and an element moved under or out from a pointer at
+    // rest kept its old hover, each until the pointer moved again. A
+    // settings tab clicked away from stayed lit as if hovered. Covers the
+    // element and group hover flags, both directions of a move under a
+    // resting pointer, and the number of extra frames a correction costs.
+    // Not covered: a hover style that moves its own element off the
+    // pointer, which alternates every frame by construction.
+
+    #[gpui::test]
+    fn a_returning_hover_style_reads_where_the_pointer_is_now(cx: &mut TestAppContext) {
+        for group in [false, true] {
+            let rig = RememberedHoverRig::new(cx, px(0.), group);
+            rig.move_mouse(cx, point(px(5.), px(5.)));
+            assert_eq!(rig.width.get(), px(20.), "group {group}: hovered");
+
+            rig.set(cx, |view| view.hoverable = false);
+            assert_eq!(rig.width.get(), px(10.), "group {group}: no style");
+            rig.move_mouse(cx, point(px(100.), px(100.)));
+
+            let renders = rig.render_count.get();
+            rig.set(cx, |view| view.hoverable = true);
+            assert_eq!(rig.width.get(), px(10.), "group {group}: pointer gone");
+            assert_eq!(
+                rig.render_count.get(),
+                renders + 1,
+                "group {group}: one frame, nothing to correct"
+            );
+        }
+    }
+
+    #[gpui::test]
+    fn a_hover_style_follows_an_element_moved_under_a_resting_pointer(cx: &mut TestAppContext) {
+        for group in [false, true] {
+            let rig = RememberedHoverRig::new(cx, px(40.), group);
+            rig.move_mouse(cx, point(px(5.), px(5.)));
+            assert_eq!(rig.width.get(), px(10.), "group {group}: pointer off");
+
+            let renders = rig.render_count.get();
+            rig.set(cx, |view| view.left = px(0.));
+            assert_eq!(rig.width.get(), px(20.), "group {group}: moved under");
+            assert_eq!(
+                rig.render_count.get(),
+                renders + 2,
+                "group {group}: one frame to move, one to correct"
+            );
+
+            let renders = rig.render_count.get();
+            rig.set(cx, |view| view.left = px(40.));
+            assert_eq!(rig.width.get(), px(10.), "group {group}: moved away");
+            assert_eq!(
+                rig.render_count.get(),
+                renders + 2,
+                "group {group}: one frame to move, one to correct"
             );
         }
     }
