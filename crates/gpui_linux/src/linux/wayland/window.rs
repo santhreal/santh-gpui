@@ -565,8 +565,9 @@ impl WaylandWindowState {
                     height: DevicePixels(f32::from(options.bounds.size.height) as i32),
                 },
                 transparent: true,
-                // Prefer Mailbox to avoid blocking. Falls back to FIFO if Mailbox is unsupported.
-                preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+                // Mailbox never blocks the drawing thread waiting for the
+                // display. Falls back to Fifo where the surface lacks it.
+                present_modes: &[wgpu::PresentMode::Mailbox],
             };
             gpu.renderer(&raw_window, config)?
         };

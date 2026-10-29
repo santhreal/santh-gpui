@@ -11,4 +11,4 @@ pub use wgpu_atlas::*;
 pub use wgpu_context::*;
 #[cfg(not(target_family = "wasm"))]
 pub use wgpu_renderer::WgpuHeadlessRenderer;
-pub use wgpu_renderer::{WgpuRenderer, WgpuSurfaceConfig};
+pub use wgpu_renderer::{WgpuRenderer, WgpuSurfaceConfig, select_present_mode};

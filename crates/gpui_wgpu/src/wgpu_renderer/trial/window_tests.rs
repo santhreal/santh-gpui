@@ -136,7 +136,7 @@ fn renderer(display: &GpuContext, window: &XcbWindow) -> WgpuRenderer {
             height: DevicePixels(i32::from(SIDE)),
         },
         transparent: false,
-        preferred_present_mode: None,
+        present_modes: &[],
     };
     let mut renderer =
         WgpuRenderer::new(display.clone(), window, config, None).expect("a window renderer");

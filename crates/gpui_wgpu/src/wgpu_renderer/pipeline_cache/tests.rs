@@ -72,7 +72,7 @@ fn renderer_with_format(context: &WgpuContext, format: wgpu::TextureFormat) -> W
         WgpuSurfaceConfig {
             size: extent(),
             transparent: true,
-            preferred_present_mode: None,
+            present_modes: &[],
         },
         None,
         Arc::new(WgpuAtlas::from_context(context)),

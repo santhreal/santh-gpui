@@ -9,7 +9,7 @@ use gpui::{
     Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
     WindowDecorations, WindowKind, WindowParams, popup::PopupNotSupportedError, px,
 };
-use gpui_wgpu::{WgpuRenderer, WgpuSurfaceConfig, wgpu};
+use gpui_wgpu::{WgpuRenderer, WgpuSurfaceConfig};
 
 use collections::FxHashSet;
 use gpui_util::{ResultExt, maybe};
@@ -39,12 +39,14 @@ use super::{
 
 mod open_state;
 mod placement;
+mod presentation;
 use open_state::{OpenState, WmState};
 use placement::{
     ConfigureChange, configure_change, creation_background_pixel, map_waits_for_configure,
     normal_hints,
 };
 pub(crate) use placement::{configure_origin, xi_root_position};
+use presentation::{bypass_compositor, present_modes};
 
 x11rb::atom_manager! {
     pub XcbAtoms: AtomsCookie {
@@ -410,6 +412,33 @@ where
         .map_err(handle_connection_error)
         .and_then(|response| response.check().map_err(|reply_error| anyhow!(reply_error)))
         .with_context(failure_context)
+}
+
+/// Sets the `_NET_WM_BYPASS_COMPOSITOR` hint of `x_window` to `value`, or
+/// deletes the hint for `None`.
+fn set_bypass_compositor(
+    xcb: &XCBConnection,
+    x_window: xproto::Window,
+    atoms: &XcbAtoms,
+    value: Option<u32>,
+) -> anyhow::Result<()> {
+    let property = atoms._NET_WM_BYPASS_COMPOSITOR;
+    match value {
+        Some(value) => check_reply(
+            || "X11 ChangeProperty32 setting _NET_WM_BYPASS_COMPOSITOR failed.",
+            xcb.change_property32(
+                xproto::PropMode::REPLACE,
+                x_window,
+                property,
+                xproto::AtomEnum::CARDINAL,
+                &[value],
+            ),
+        ),
+        None => check_reply(
+            || "X11 DeleteProperty of _NET_WM_BYPASS_COMPOSITOR failed.",
+            xcb.delete_property(x_window, property),
+        ),
+    }
 }
 
 pub(crate) fn get_reply<E, F, C, O>(
@@ -794,18 +823,14 @@ impl X11WindowState {
                     // then no change, where a mismatch reconfigures the
                     // surface and rebuilds every pipeline.
                     transparent,
-                    // Fifo blocks the thread that draws in
-                    // `get_current_texture` until the display releases a
-                    // swapchain image, with input queued behind it, whenever
-                    // frames outpace the display, as under a compositor that
-                    // presents at a lower rate than the window's CRTC.
-                    // Mailbox replaces the queued image instead. Falls back
-                    // to Fifo where the surface lacks Mailbox, as NVIDIA's
-                    // X11 surfaces do.
-                    preferred_present_mode: Some(wgpu::PresentMode::Mailbox),
+                    present_modes: present_modes(compositor_present),
                 };
                 gpu.renderer(&raw_window, config)?
             };
+            // Before the map, where a compositor reads it.
+            if let Some(value) = bypass_compositor(renderer.present_mode()) {
+                set_bypass_compositor(xcb, x_window, atoms, Some(value))?;
+            }
 
             renderer.set_subpixel_layout(is_bgr);
 
@@ -1503,6 +1528,23 @@ impl X11WindowStatePtr {
         if let Some(mut fun) = callback {
             fun();
             self.callbacks.borrow_mut().appearance_changed = Some(fun);
+        }
+    }
+
+    /// Presents with the modes the window prefers while a compositing
+    /// manager runs, or while none does, and sets or deletes the compositor
+    /// hint when the resolved mode changes whether the window needs it.
+    pub(crate) fn set_compositor_present(&self, compositor_present: bool) {
+        let mut state = self.state.borrow_mut();
+        let hint = bypass_compositor(state.renderer.present_mode());
+        state
+            .renderer
+            .update_present_modes(present_modes(compositor_present));
+        let new_hint = bypass_compositor(state.renderer.present_mode());
+        let atoms = state.atoms;
+        drop(state);
+        if new_hint != hint {
+            set_bypass_compositor(&self.xcb, self.x_window, &atoms, new_hint).log_err();
         }
     }
 

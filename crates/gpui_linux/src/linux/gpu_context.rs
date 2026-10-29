@@ -192,7 +192,7 @@ where
     let config = WgpuSurfaceConfig {
         size: config.size,
         transparent: config.transparent,
-        preferred_present_mode: config.preferred_present_mode,
+        present_modes: config.present_modes,
     };
     let renderer = WgpuRenderer::new(context.clone(), window, config, compositor_gpu);
     let result = adopted(renderer, gpui::block_on(scope.pop()));

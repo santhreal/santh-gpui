@@ -154,35 +154,37 @@ struct PathRasterizationVertex {
 pub struct WgpuSurfaceConfig {
     pub size: Size<DevicePixels>,
     pub transparent: bool,
-    /// Preferred presentation mode. When `Some`, the renderer will use this
-    /// mode if supported by the surface, falling back to `Fifo`.
-    /// When `None`, defaults to `Fifo` (VSync).
+    /// Present modes in order of preference. The surface presents with the
+    /// first one it offers, and with `Fifo` (VSync), which every surface
+    /// offers, when it offers none of them or the list is empty.
     ///
-    /// `Mailbox` (triple-buffering) never blocks in `get_current_texture()`
-    /// waiting for the display. Linux windows prefer it; mobile platforms
-    /// may prefer it to avoid blocking during lifecycle transitions.
-    pub preferred_present_mode: Option<wgpu::PresentMode>,
+    /// `Fifo` blocks `get_current_texture()` until the display releases a
+    /// swapchain image whenever frames outpace the display; `Mailbox` and
+    /// `Immediate` never block there.
+    pub present_modes: &'static [wgpu::PresentMode],
 }
 
-/// The present mode of a window surface: `preferred` when `supported`
-/// contains it, else `Fifo`, which every surface supports. Logs the mode a
-/// preference resolves to, and the supported modes when it falls back.
-fn present_mode(
-    preferred: Option<wgpu::PresentMode>,
-    supported: &[wgpu::PresentMode],
+/// The present mode of a surface that offers `offered`: the first of
+/// `preferred` it offers, else `Fifo`, which every surface offers. Logs the
+/// mode a non-empty preference resolves to, and the offered modes when it
+/// falls back.
+pub fn select_present_mode(
+    preferred: &[wgpu::PresentMode],
+    offered: &[wgpu::PresentMode],
 ) -> wgpu::PresentMode {
-    match preferred {
-        Some(mode) if supported.contains(&mode) => {
+    match preferred.iter().find(|mode| offered.contains(mode)) {
+        Some(&mode) => {
             log::info!("present mode: {mode:?}");
             mode
         }
-        Some(mode) => {
-            log::info!(
-                "present mode {mode:?} is unsupported by the surface, which offers {supported:?}; presenting with Fifo"
-            );
+        None => {
+            if !preferred.is_empty() {
+                log::info!(
+                    "present modes {preferred:?} are unsupported by the surface, which offers {offered:?}; presenting with Fifo"
+                );
+            }
             wgpu::PresentMode::Fifo
         }
-        None => wgpu::PresentMode::Fifo,
     }
 }
 
@@ -362,6 +364,11 @@ pub struct WgpuRenderer {
     adapter_info: wgpu::AdapterInfo,
     transparent_alpha_mode: wgpu::CompositeAlphaMode,
     opaque_alpha_mode: wgpu::CompositeAlphaMode,
+    /// The present modes the window prefers, first preferred first.
+    present_modes: &'static [wgpu::PresentMode],
+    /// The present modes the surface offers; none for an offscreen target,
+    /// which presents nothing.
+    offered_present_modes: Vec<wgpu::PresentMode>,
     max_texture_size: u32,
     last_error: Arc<Mutex<Option<String>>>,
     failed_frame_count: u32,
@@ -509,7 +516,7 @@ impl WgpuRenderer {
         let config = WgpuSurfaceConfig {
             size,
             transparent: true,
-            preferred_present_mode: None,
+            present_modes: &[],
         };
 
         let atlas = Arc::new(WgpuAtlas::from_context(context));
@@ -617,29 +624,28 @@ impl WgpuRenderer {
 
         // Prefer texture copies for presentation when supported; otherwise
         // a fullscreen pass presents the retained frame.
+        let usage = match &surface_caps {
+            Some(surface_caps) => {
+                let copyable = surface_caps
+                    .usages
+                    .intersection(wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST);
+                wgpu::TextureUsages::RENDER_ATTACHMENT | copyable
+            }
+            None => {
+                wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::COPY_SRC
+                    | wgpu::TextureUsages::COPY_DST
+            }
+        };
+        let offered_present_modes = surface_caps
+            .map(|surface_caps| surface_caps.present_modes)
+            .unwrap_or_default();
         let surface_config = wgpu::SurfaceConfiguration {
-            usage: match &surface_caps {
-                Some(surface_caps) => {
-                    let copyable = surface_caps.usages.intersection(
-                        wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
-                    );
-                    wgpu::TextureUsages::RENDER_ATTACHMENT | copyable
-                }
-                None => {
-                    wgpu::TextureUsages::RENDER_ATTACHMENT
-                        | wgpu::TextureUsages::COPY_SRC
-                        | wgpu::TextureUsages::COPY_DST
-                }
-            },
+            usage,
             format: surface_format,
             width: clamped_width.max(1),
             height: clamped_height.max(1),
-            present_mode: match &surface_caps {
-                Some(surface_caps) => {
-                    present_mode(config.preferred_present_mode, &surface_caps.present_modes)
-                }
-                None => wgpu::PresentMode::Fifo,
-            },
+            present_mode: select_present_mode(config.present_modes, &offered_present_modes),
             desired_maximum_frame_latency: 2,
             alpha_mode,
             view_formats: vec![],
@@ -859,6 +865,8 @@ impl WgpuRenderer {
             trial,
             needs_redraw: false,
             last_frame_extent: FrameExtent::Whole,
+            present_modes: config.present_modes,
+            offered_present_modes,
         })
     }
 
@@ -1278,6 +1286,28 @@ impl WgpuRenderer {
             resources.select_pipelines(&surface_config, path_sample_count);
             resources.invalidate_intermediate_textures();
         }
+    }
+
+    /// Presents with the first of `preferred` the surface offers, else
+    /// `Fifo`, reconfiguring the surface when that changes its mode.
+    pub fn update_present_modes(&mut self, preferred: &'static [wgpu::PresentMode]) {
+        self.present_modes = preferred;
+        let mode = select_present_mode(self.present_modes, &self.offered_present_modes);
+        if mode != self.surface_config.present_mode {
+            self.configuring.finish();
+            self.surface_config.present_mode = mode;
+            let Some(resources) = self.resources.as_ref() else {
+                return;
+            };
+            if let WgpuRenderTarget::Surface(surface) = &resources.target {
+                surface.configure(&resources.device, &self.surface_config);
+            }
+        }
+    }
+
+    /// The mode the surface presents with.
+    pub fn present_mode(&self) -> wgpu::PresentMode {
+        self.surface_config.present_mode
     }
 
     #[allow(dead_code)]
@@ -2500,9 +2530,11 @@ impl WgpuRenderer {
         self.surface_config.width = width;
         self.surface_config.height = height;
         self.surface_config.alpha_mode = alpha_mode;
-        if let Some(mode) = config.preferred_present_mode {
-            self.surface_config.present_mode = mode;
-        }
+        self.present_modes = config.present_modes;
+        // The replacement surface shows the same window system on the same
+        // adapter, so it offers the modes its predecessor did.
+        self.surface_config.present_mode =
+            select_present_mode(self.present_modes, &self.offered_present_modes);
 
         {
             let res = self
@@ -2674,7 +2706,7 @@ impl WgpuRenderer {
                 height: gpui::DevicePixels(self.surface_config.height as i32),
             },
             transparent: self.surface_config.alpha_mode != wgpu::CompositeAlphaMode::Opaque,
-            preferred_present_mode: Some(self.surface_config.present_mode),
+            present_modes: self.present_modes,
         };
         let gpu_context = gpu_context.clone();
         let ctx_ref = gpu_context.borrow();

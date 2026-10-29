@@ -46,7 +46,7 @@ use super::{
     X11WindowStatePtr, XcbAtoms, XimCallbackEvent, XimHandler, button_or_scroll_from_event_detail,
     check_reply,
     clipboard::{self, Clipboard},
-    compositor::compositor_present,
+    compositor::{compositor_present, watch_compositor},
     configure_origin, get_reply, get_valuator_axis_index,
     gpu_context::{self, WindowGpu},
     interval_at, modifiers_from_state, pressed_button_from_mask, xcb_flush, xi_root_position,
@@ -200,8 +200,12 @@ pub struct X11ClientState {
     xkb_context: xkbc::Context,
     pub(crate) xcb_connection: Rc<XCBConnection>,
     xkb_device_id: i32,
-    /// Whether a compositing manager ran when the last window opened.
+    /// Whether a compositing manager runs: read as the client connects, as
+    /// each window opens, and as `compositor_selection` changes owner.
     compositor_present: bool,
+    /// The `_NET_WM_CM_S<screen>` selection, whose changes of owner the
+    /// server reports; `None` when the server refused to report them.
+    compositor_selection: Option<xproto::Atom>,
     /// Whether an EWMH window manager ran when the client connected.
     window_manager_present: bool,
     pub(crate) x_root_index: usize,
@@ -419,6 +423,9 @@ impl X11Client {
             .context("Failed to get XCB atoms")?;
 
         let root = xcb_connection.setup().roots[x_root_index].root;
+        // Watched before it is read, so a compositing manager that starts
+        // in between is reported.
+        let compositor_selection = watch_compositor(&xcb_connection, x_root_index, root).log_err();
         let compositor_present = compositor_present(&xcb_connection, x_root_index, root);
         let window_manager_present = check_window_manager_present(&xcb_connection, &atoms, root);
         log::info!(
@@ -599,6 +606,7 @@ impl X11Client {
             xcb_connection,
             xkb_device_id,
             compositor_present,
+            compositor_selection,
             window_manager_present,
             x_root_index,
             crtc_rates: None,
@@ -1068,6 +1076,12 @@ impl X11Client {
             }
             Event::RandrScreenChangeNotify(_) | Event::RandrNotify(_) => {
                 self.0.borrow_mut().retime_frame_loops();
+            }
+            Event::XfixesSelectionNotify(event) => {
+                let mut state = self.0.borrow_mut();
+                if state.compositor_selection == Some(event.selection) {
+                    state.refresh_compositor();
+                }
             }
             Event::PropertyNotify(event) => {
                 let window = self.get_window(event.window)?;
@@ -1773,14 +1787,10 @@ impl LinuxClient for X11Client {
 
         let xcb_connection = state.xcb_connection.clone();
         // A compositing manager can start after the client connects, as one
-        // started beside an application at login does, so every window
+        // started beside an application at login does, and one that only
+        // sets `_NET_WM_CM_OWNER` changes no selection, so every window
         // looks for one as it opens.
-        let root = xcb_connection.setup().roots[state.x_root_index].root;
-        let compositor_present = compositor_present(&xcb_connection, state.x_root_index, root);
-        if compositor_present != state.compositor_present {
-            log::info!("x11: compositor present: {compositor_present}");
-            state.compositor_present = compositor_present;
-        }
+        let compositor_present = state.refresh_compositor();
         let x_root_index = state.x_root_index;
         let atoms = state.atoms;
         let scale_factor = state.scale_factor;
@@ -2080,6 +2090,25 @@ impl X11ClientState {
         } else {
             frame_loop.hide();
         }
+    }
+
+    /// Reads whether a compositing manager runs and, when that changed,
+    /// presents every window with the modes it prefers under the new state.
+    /// Returns whether one runs.
+    fn refresh_compositor(&mut self) -> bool {
+        let root = self.xcb_connection.setup().roots[self.x_root_index].root;
+        let present = compositor_present(&self.xcb_connection, self.x_root_index, root);
+        if present != self.compositor_present {
+            log::info!("x11: compositor present: {present}");
+            self.compositor_present = present;
+            for window_ref in self.windows.values() {
+                let window = &window_ref.window;
+                if !window.state.borrow().destroyed {
+                    window.set_compositor_present(present);
+                }
+            }
+        }
+        present
     }
 
     /// Re-reads the CRTCs after a screen change and paces every window at

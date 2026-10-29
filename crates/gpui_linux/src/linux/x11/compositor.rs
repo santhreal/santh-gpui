@@ -3,11 +3,14 @@
 use gpui_util::ResultExt as _;
 use log::Level;
 use x11rb::{
-    protocol::xproto::{self, ConnectionExt as _},
+    protocol::{
+        xfixes::{self, ConnectionExt as _},
+        xproto::{self, ConnectionExt as _},
+    },
     xcb_ffi::XCBConnection,
 };
 
-use super::get_reply;
+use super::{check_reply, get_reply};
 
 /// The root window property some older compositing managers set in place of
 /// owning the EWMH selection.
@@ -19,7 +22,7 @@ const OWNER_PROPERTY: &str = "_NET_WM_CM_OWNER";
 /// alone (`_NET_SUPPORTING_WM_CHECK`) composites nothing and does not count:
 /// the alpha in a window's pixels blends only under a compositing manager.
 pub(crate) fn compositor_present(xcb: &XCBConnection, screen: usize, root: xproto::Window) -> bool {
-    let selection = format!("_NET_WM_CM_S{screen}");
+    let selection = selection_name(screen);
     let owned = existing_atom(xcb, &selection).is_some_and(|atom| {
         get_reply(
             || format!("Failed to get the {selection} owner"),
@@ -42,6 +45,39 @@ pub(crate) fn compositor_present(xcb: &XCBConnection, screen: usize, root: xprot
         "x11: compositor detection: {selection} owned: {owned}, {OWNER_PROPERTY} set: {announced}"
     );
     owned || announced
+}
+
+/// Has the server report each change of owner of the `_NET_WM_CM_S<screen>`
+/// selection as an XFixes `SelectionNotify` on `root`, and returns the
+/// selection's atom, which the events carry. A compositing manager owns the
+/// selection while it runs, so the events mark each start and stop of one.
+pub(crate) fn watch_compositor(
+    xcb: &XCBConnection,
+    screen: usize,
+    root: xproto::Window,
+) -> anyhow::Result<xproto::Atom> {
+    let name = selection_name(screen);
+    let selection = get_reply(
+        || format!("Failed to intern the atom {name}"),
+        xcb.intern_atom(false, name.as_bytes()),
+    )?
+    .atom;
+    check_reply(
+        || format!("XFixes SelectSelectionInput on {name} failed"),
+        xcb.xfixes_select_selection_input(
+            root,
+            selection,
+            xfixes::SelectionEventMask::SET_SELECTION_OWNER
+                | xfixes::SelectionEventMask::SELECTION_WINDOW_DESTROY
+                | xfixes::SelectionEventMask::SELECTION_CLIENT_CLOSE,
+        ),
+    )?;
+    Ok(selection)
+}
+
+/// The EWMH selection a compositing manager of screen `screen` owns.
+fn selection_name(screen: usize) -> String {
+    format!("_NET_WM_CM_S{screen}")
 }
 
 /// The atom named `name`, or `None` when no client interned it. An atom no
