@@ -63,7 +63,14 @@ pub fn windowed_platform() -> anyhow::Result<Rc<dyn gpui::Platform>> {
 
         #[cfg(feature = "x11")]
         "X11" => Ok(Rc::new(LinuxPlatform {
-            inner: X11Client::new().context("cannot connect to the X server at DISPLAY")?,
+            inner: X11Client::new().with_context(|| {
+                format!(
+                    "cannot connect to the X server at DISPLAY={}",
+                    std::env::var_os("DISPLAY")
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                )
+            })?,
         })),
 
         "Headless" if std::env::var_os("ZED_HEADLESS").is_some() => {

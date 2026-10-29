@@ -879,8 +879,14 @@ impl WaylandClient {
     /// or when the compositor offers no seat.
     pub(crate) fn new() -> anyhow::Result<Self> {
         let startup_activation_token = take_startup_activation_token_from_environment();
-        let conn = Connection::connect_to_env()
-            .context("cannot connect to the Wayland compositor at WAYLAND_DISPLAY")?;
+        let conn = Connection::connect_to_env().with_context(|| {
+            format!(
+                "cannot connect to the Wayland compositor at WAYLAND_DISPLAY={}",
+                std::env::var_os("WAYLAND_DISPLAY")
+                    .unwrap_or_default()
+                    .to_string_lossy()
+            )
+        })?;
 
         let (globals, event_queue) = registry_queue_init::<WaylandClientStatePtr>(&conn)
             .context("cannot read the Wayland compositor's registry")?;
