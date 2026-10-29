@@ -2900,6 +2900,14 @@ impl Window {
         self.rendered_frame.scene.quads.clone()
     }
 
+    /// Returns the cursor the most recently rendered frame sets for the pointer where it last
+    /// moved: a window-wide style if one was painted, else the topmost style whose hitbox the
+    /// pointer is over. `None` means the platform shows the arrow.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn rendered_cursor_style(&self) -> Option<CursorStyle> {
+        self.rendered_frame.cursor_style(self)
+    }
+
     /// Set the content size of the window.
     pub fn resize(&mut self, size: Size<Pixels>) {
         self.platform_window.resize(size);
@@ -9824,5 +9832,58 @@ mod tests {
             recorded[1].urls(),
             &[SharedString::from("https://example.com/extra.mp4")]
         );
+    }
+
+    /// WHY: tests read the cursor through `rendered_cursor_style`, so it reports the style the
+    /// platform is sent: a hitbox's style only while the pointer is over that hitbox, the arrow
+    /// elsewhere, and a window-wide style over every hitbox's. Not caught: a platform backend
+    /// that ignores the style it is sent.
+    #[gpui::test]
+    fn rendered_cursor_style_reports_the_style_under_the_pointer(cx: &mut TestAppContext) {
+        struct CursorView {
+            window_wide: Rc<Cell<Option<crate::CursorStyle>>>,
+        }
+
+        impl Render for CursorView {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let window_wide = self.window_wide.get();
+                div()
+                    .size_full()
+                    .child(div().size(px(50.)).cursor(crate::CursorStyle::PointingHand))
+                    .child(
+                        canvas(
+                            |_, _, _| {},
+                            move |_, _, window, _| {
+                                if let Some(style) = window_wide {
+                                    window.set_window_cursor_style(style);
+                                }
+                            },
+                        )
+                        .size(px(1.)),
+                    )
+            }
+        }
+
+        let window_wide = Rc::new(Cell::new(None));
+        let (view, cx) = cx.add_window_view(|_, _| CursorView {
+            window_wide: window_wide.clone(),
+        });
+        let over = point(px(10.), px(10.));
+        let below = point(px(10.), px(80.));
+        let cursor = |cx: &mut crate::VisualTestContext| {
+            cx.update(|window, _| window.rendered_cursor_style())
+        };
+
+        cx.simulate_mouse_move(over, None, Modifiers::none());
+        assert_eq!(cursor(cx), Some(crate::CursorStyle::PointingHand));
+        cx.simulate_mouse_move(below, None, Modifiers::none());
+        assert_eq!(cursor(cx), None);
+
+        window_wide.set(Some(crate::CursorStyle::ResizeLeftRight));
+        view.update(cx, |_, cx| cx.notify());
+        cx.simulate_mouse_move(over, None, Modifiers::none());
+        assert_eq!(cursor(cx), Some(crate::CursorStyle::ResizeLeftRight));
+        cx.simulate_mouse_move(below, None, Modifiers::none());
+        assert_eq!(cursor(cx), Some(crate::CursorStyle::ResizeLeftRight));
     }
 }
