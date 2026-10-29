@@ -80,6 +80,8 @@ fn connect_in_child() {
 /// Every case ends within [`DEADLINE`] with an error that states its reason,
 /// and none panics.
 #[test]
+// A test thread waits on its child by design; there is no executor to block.
+#[allow(clippy::disallowed_methods)]
 fn windowed_platform_reports_every_unreachable_display() {
     assert!(
         !Path::new(ABSENT_X_SOCKET).exists(),
