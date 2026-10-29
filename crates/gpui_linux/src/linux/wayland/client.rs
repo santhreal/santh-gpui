@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::Context as _;
 use ashpd::WindowIdentifier;
 use calloop::{
     EventLoop, LoopHandle,
@@ -873,11 +874,16 @@ fn wl_output_version(version: u32) -> u32 {
 }
 
 impl WaylandClient {
-    pub(crate) fn new() -> Self {
+    /// Connect to the compositor at `WAYLAND_DISPLAY`. Fails when no
+    /// compositor accepts the connection, when the registry cannot be read,
+    /// or when the compositor offers no seat.
+    pub(crate) fn new() -> anyhow::Result<Self> {
         let startup_activation_token = take_startup_activation_token_from_environment();
-        let conn = Connection::connect_to_env().unwrap();
+        let conn = Connection::connect_to_env()
+            .context("cannot connect to the Wayland compositor at WAYLAND_DISPLAY")?;
 
-        let (globals, event_queue) = registry_queue_init::<WaylandClientStatePtr>(&conn).unwrap();
+        let (globals, event_queue) = registry_queue_init::<WaylandClientStatePtr>(&conn)
+            .context("cannot read the Wayland compositor's registry")?;
         let qh = event_queue.handle();
 
         let mut seat: Option<wl_seat::WlSeat> = None;
@@ -968,7 +974,7 @@ impl WaylandClient {
             })
             .unwrap();
 
-        let seat = seat.unwrap();
+        let seat = seat.context("the Wayland compositor offers no seat")?;
         let globals = Globals::new(
             globals,
             common.foreground_executor.clone(),
@@ -1114,7 +1120,7 @@ impl WaylandClient {
             .insert(handle)
             .unwrap();
 
-        Self(state)
+        Ok(Self(state))
     }
 }
 

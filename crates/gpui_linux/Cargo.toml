@@ -43,6 +43,7 @@ x11 = [
     "filedescriptor",
     "open",
     "scap?/x11",
+    "gpui/x11",
 ]
 screen-capture = [
     "gpui/screen-capture",

@@ -24,6 +24,36 @@ pub fn headless() -> gpui::Application {
     gpui::Application::with_platform(current_platform(true))
 }
 
+/// Returns an application connected to the platform's display server, or the
+/// reason it cannot connect: no display server is set, or the one set does
+/// not accept the connection. Unlike [`application`], it never runs headless
+/// and never panics on that failure, so an editor reports why it has no
+/// window and exits.
+#[cfg(not(target_family = "wasm"))]
+pub fn windowed_application() -> anyhow::Result<gpui::Application> {
+    Ok(gpui::Application::with_platform(windowed_platform()?))
+}
+
+/// Returns the [`Platform`] for the current OS connected to its display
+/// server, or the reason it cannot connect. See [`windowed_application`].
+#[cfg(not(target_family = "wasm"))]
+pub fn windowed_platform() -> anyhow::Result<Rc<dyn Platform>> {
+    #[cfg(target_os = "macos")]
+    {
+        Ok(Rc::new(gpui_macos::MacPlatform::new(false)))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        Ok(Rc::new(gpui_windows::WindowsPlatform::new(false)?))
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+    {
+        gpui_linux::windowed_platform()
+    }
+}
+
 #[cfg(target_family = "wasm")]
 pub use gpui_web::WebBackendPreference;
 

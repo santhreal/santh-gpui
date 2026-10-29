@@ -22,6 +22,7 @@ wayland = ["gpui_linux/wayland"]
 x11 = ["gpui_linux/x11"]
 
 [dependencies]
+anyhow.workspace = true
 gpui.workspace = true
 log.workspace = true
 
