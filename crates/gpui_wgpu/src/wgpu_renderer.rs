@@ -1983,7 +1983,11 @@ impl WgpuRenderer {
         if range.is_empty() {
             return;
         }
-        let texture_info = self.atlas.get_texture_info(texture_id);
+        // A scene presented again after its image was dropped references a
+        // freed texture; the window refreshes, so skip the stale batch.
+        let Some(texture_info) = self.atlas.get_texture_info(texture_id) else {
+            return;
+        };
         let texture =
             self.create_texture_bind_group("atlas_texture_bind_group", &texture_info.view);
         pass.set_pipeline(pipeline);

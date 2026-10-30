@@ -71,12 +71,13 @@ impl WgpuAtlas {
         )
     }
 
-    pub fn get_texture_info(&self, id: AtlasTextureId) -> WgpuTextureInfo {
+    /// Returns the view of texture `id`, or `None` once the atlas freed it.
+    pub fn get_texture_info(&self, id: AtlasTextureId) -> Option<WgpuTextureInfo> {
         let lock = self.0.lock();
-        let texture = &lock.storage[id];
-        WgpuTextureInfo {
+        let texture = lock.storage.get(id)?;
+        Some(WgpuTextureInfo {
             view: texture.view.clone(),
-        }
+        })
     }
 
     /// Clears all cached textures and tiles, forcing them to be recreated.
@@ -122,16 +123,16 @@ impl PlatformAtlas for WgpuAtlas {
         }
     }
 
-    fn remove(&self, key: &AtlasKey) {
+    fn remove(&self, key: &AtlasKey) -> bool {
         let mut lock = self.0.lock();
 
         let Some(tile) = lock.tiles_by_key.remove(key) else {
-            return;
+            return false;
         };
         let id = tile.texture_id;
 
         let Some(texture_slot) = lock.storage[id.kind].textures.get_mut(id.index as usize) else {
-            return;
+            return true;
         };
 
         if let Some(mut texture) = texture_slot.take() {
@@ -145,6 +146,7 @@ impl PlatformAtlas for WgpuAtlas {
                 *texture_slot = Some(texture);
             }
         }
+        true
     }
 }
 

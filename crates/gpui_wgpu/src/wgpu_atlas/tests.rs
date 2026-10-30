@@ -198,6 +198,24 @@ fn a_tile_removed_right_after_its_insert_leaves_the_atlas_usable() -> anyhow::Re
     Ok(())
 }
 
+/// A scene rendered before an image was dropped still names the image's
+/// texture. Looking that texture up once the atlas freed it must report
+/// nothing for the renderer to skip, not panic mid-frame; and `remove`
+/// reports whether it freed anything, which is what makes the window
+/// refresh. Not caught: a freed slot the atlas already reused.
+#[test]
+fn a_freed_texture_has_no_view_and_a_second_remove_reports_nothing() -> anyhow::Result<()> {
+    let (device, queue) = test_device_and_queue()?;
+    let atlas = WgpuAtlas::new(device, queue, wgpu::TextureFormat::Bgra8Unorm);
+    let tile = insert(&atlas, &image_key(1), size(2, 2), &pattern(5, 2 * 2 * 4));
+    assert!(atlas.get_texture_info(tile.texture_id).is_some());
+
+    assert!(atlas.remove(&image_key(1)));
+    assert!(atlas.get_texture_info(tile.texture_id).is_none());
+    assert!(!atlas.remove(&image_key(1)));
+    Ok(())
+}
+
 #[test]
 fn remove_deallocates_tile_space_for_reuse() -> anyhow::Result<()> {
     let (device, queue) = test_device_and_queue()?;

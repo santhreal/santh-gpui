@@ -5332,14 +5332,23 @@ impl Window {
     }
 
     /// Removes an image from the sprite atlas.
+    ///
+    /// When the atlas held the image, the window refreshes: the scene it
+    /// last rendered, and any view cached from it, still reference the
+    /// freed tiles, and presenting that scene again would sample a texture
+    /// that no longer exists.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
+        let mut removed = false;
         for frame_index in 0..data.frame_count() {
             let params = RenderImageParams {
                 image_id: data.id,
                 frame_index,
             };
 
-            self.sprite_atlas.remove(&params.clone().into());
+            removed |= self.sprite_atlas.remove(&params.into());
+        }
+        if removed {
+            self.refresh();
         }
 
         Ok(())
@@ -9894,5 +9903,134 @@ mod tests {
         assert_eq!(cursor(cx), Some(crate::CursorStyle::ResizeLeftRight));
         cx.simulate_mouse_move(below, None, Modifiers::none());
         assert_eq!(cursor(cx), Some(crate::CursorStyle::ResizeLeftRight));
+    }
+
+    /// WHY: dropping an image frees its atlas tiles while the scene the
+    /// window last rendered still samples them. A window that presented
+    /// that scene again, with nothing else invalidated, drew from a freed
+    /// texture and the wgpu renderer panicked. A window whose atlas held a
+    /// dropped image paints afresh, a cached view included, so its next
+    /// scene samples a live tile; a window that never painted the image
+    /// does not re-render. Not caught: an image dropped while a frame is
+    /// drawn, which the renderer skips instead of sampling.
+    mod dropped_images {
+        use std::sync::Arc;
+
+        use image::{Frame, ImageBuffer, Rgba};
+
+        use crate::{
+            AppContext as _, AtlasTextureId, Context, Entity, IntoElement, ParentElement, Render,
+            RenderImage, StyleRefinement, Styled, TestAppContext, Window, WindowHandle, div, img,
+            px,
+        };
+
+        fn picture() -> Arc<RenderImage> {
+            let frame = Frame::new(ImageBuffer::from_pixel(4, 4, Rgba([255, 0, 0, 255])));
+            Arc::new(RenderImage::new([frame]))
+        }
+
+        struct Picture {
+            image: Arc<RenderImage>,
+            renders: usize,
+        }
+
+        impl Render for Picture {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders += 1;
+                img(self.image.clone()).w(px(4.)).h(px(4.))
+            }
+        }
+
+        struct Stage {
+            picture: Entity<Picture>,
+            cached: bool,
+        }
+
+        impl Render for Stage {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                let stage = div().size_full();
+                if self.cached {
+                    stage.child(
+                        self.picture
+                            .clone()
+                            .cached(StyleRefinement::default().size_full()),
+                    )
+                } else {
+                    stage.child(self.picture.clone())
+                }
+            }
+        }
+
+        fn open(
+            cx: &mut TestAppContext,
+            image: Arc<RenderImage>,
+            cached: bool,
+        ) -> WindowHandle<Stage> {
+            let window = cx.add_window(|_, cx| Stage {
+                picture: cx.new(|_| Picture { image, renders: 0 }),
+                cached,
+            });
+            cx.run_until_parked();
+            window
+        }
+
+        /// The atlas texture of each image the window's last frame painted.
+        fn textures(cx: &mut TestAppContext, window: WindowHandle<Stage>) -> Vec<AtlasTextureId> {
+            window
+                .update(cx, |_, window, _| {
+                    window
+                        .painted_images()
+                        .iter()
+                        .map(|sprite| sprite.tile.texture_id)
+                        .collect()
+                })
+                .unwrap()
+        }
+
+        fn renders(cx: &mut TestAppContext, window: WindowHandle<Stage>) -> usize {
+            window
+                .update(cx, |stage, _, cx| stage.picture.read(cx).renders)
+                .unwrap()
+        }
+
+        fn repaints_after_its_image_is_dropped(cached: bool, cx: &mut TestAppContext) {
+            let image = picture();
+            let window = open(cx, image.clone(), cached);
+            let bystander = open(cx, picture(), cached);
+            let before = textures(cx, window);
+            assert_eq!(before.len(), 1, "the window paints its picture");
+            let bystander_renders = renders(cx, bystander);
+
+            cx.update(|cx| cx.drop_image(image.clone(), None));
+            cx.run_until_parked();
+
+            let after = textures(cx, window);
+            assert_eq!(after.len(), 1, "the window still paints its picture");
+            assert_ne!(
+                after, before,
+                "the next frame samples a re-uploaded tile, not the freed one"
+            );
+            assert!(
+                window
+                    .update(cx, |_, window, _| window.has_image_atlas_entry(&image))
+                    .unwrap()
+            );
+            assert_eq!(
+                renders(cx, bystander),
+                bystander_renders,
+                "a window that never painted the image does not re-render"
+            );
+        }
+
+        #[gpui::test]
+        fn a_window_repaints_an_image_dropped_from_its_atlas(cx: &mut TestAppContext) {
+            repaints_after_its_image_is_dropped(false, cx);
+        }
+
+        /// See [`a_window_repaints_an_image_dropped_from_its_atlas`].
+        #[gpui::test]
+        fn a_cached_view_repaints_an_image_dropped_from_its_atlas(cx: &mut TestAppContext) {
+            repaints_after_its_image_is_dropped(true, cx);
+        }
     }
 }
