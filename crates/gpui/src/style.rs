@@ -831,6 +831,12 @@ impl Style {
 
     /// Get the content mask for this element style, based on the given bounds.
     /// If the element does not hide its overflow, this will return `None`.
+    ///
+    /// The mask is the padding box: the bounds inset by the border widths,
+    /// whatever the border color. The element's own hitbox is inserted inside
+    /// this mask, so a mask that followed the color would let a border that
+    /// fades in on hover shrink the hit region under the pointer, and a
+    /// pointer on the border ring would flip hover on every frame.
     pub fn overflow_mask(
         &self,
         bounds: Bounds<Pixels>,
@@ -842,18 +848,14 @@ impl Style {
                 y: Overflow::Visible,
             } => None,
             _ => {
-                let mut min = bounds.origin;
-                let mut max = bounds.bottom_right();
-
-                if self
-                    .border_color
-                    .is_some_and(|color| !color.is_transparent())
-                {
-                    min.x += self.border_widths.left.to_pixels(rem_size);
-                    max.x -= self.border_widths.right.to_pixels(rem_size);
-                    min.y += self.border_widths.top.to_pixels(rem_size);
-                    max.y -= self.border_widths.bottom.to_pixels(rem_size);
-                }
+                let min = point(
+                    bounds.origin.x + self.border_widths.left.to_pixels(rem_size),
+                    bounds.origin.y + self.border_widths.top.to_pixels(rem_size),
+                );
+                let max = point(
+                    bounds.right() - self.border_widths.right.to_pixels(rem_size),
+                    bounds.bottom() - self.border_widths.bottom.to_pixels(rem_size),
+                );
 
                 let bounds = match (
                     self.overflow.x == Overflow::Visible,
@@ -1549,6 +1551,27 @@ pub enum Overflow {
     Scroll,
 }
 
+#[cfg(test)]
+impl Overflow {
+    /// Every variant, for tests that enumerate overflow modes.
+    pub(crate) fn all() -> [Overflow; 4] {
+        let all = [
+            Overflow::Visible,
+            Overflow::Clip,
+            Overflow::Hidden,
+            Overflow::Scroll,
+        ];
+        // A new variant has no arm here and fails to compile until it
+        // joins `all`.
+        for overflow in all {
+            match overflow {
+                Overflow::Visible | Overflow::Clip | Overflow::Hidden | Overflow::Scroll => {}
+            }
+        }
+        all
+    }
+}
+
 /// The positioning strategy for this item.
 ///
 /// This controls both how the origin is determined for the [`Style::position`] field,
@@ -1872,5 +1895,51 @@ mod tests {
         assert_eq!(style.backdrop_blur, Some(px(15.0)));
         assert_eq!(style.backdrop_saturation, Some(1.25));
         assert_eq!(style.backdrop_tint, Some(red()));
+    }
+
+    /// The overflow mask is the padding box whatever the border color. The
+    /// element's own hitbox is inserted inside its mask, so a mask that grew
+    /// when the border turned transparent let a border fading in on hover
+    /// move the hit region under a pointer at rest. Covers every overflow
+    /// pair and a distinct width per side. The hover the mask drives is
+    /// covered in `div::tests::hover_settles_on_the_border_ring_of_a_clipping_element`.
+    #[test]
+    fn overflow_mask_is_the_padding_box_whatever_the_border_color() {
+        let bounds = Bounds::new(point(px(10.), px(20.)), size(px(100.), px(50.)));
+        let padding_box = Bounds::from_corners(point(px(11.), px(22.)), point(px(107.), px(66.)));
+        for x in Overflow::all() {
+            for y in Overflow::all() {
+                let mut style = Style {
+                    overflow: point(x, y),
+                    border_widths: Edges {
+                        top: px(2.).into(),
+                        right: px(3.).into(),
+                        bottom: px(4.).into(),
+                        left: px(1.).into(),
+                    },
+                    ..Style::default()
+                };
+                let masks = [None, Some(crate::transparent_black()), Some(red())].map(|color| {
+                    style.border_color = color;
+                    style.overflow_mask(bounds, px(16.))
+                });
+                assert_eq!(
+                    masks[0], masks[2],
+                    "overflow ({x:?}, {y:?}): no border color vs an opaque one"
+                );
+                assert_eq!(
+                    masks[1], masks[2],
+                    "overflow ({x:?}, {y:?}): a transparent border vs an opaque one"
+                );
+                let both_clip = x != Overflow::Visible && y != Overflow::Visible;
+                if both_clip {
+                    assert_eq!(
+                        masks[2].map(|mask| mask.bounds),
+                        Some(padding_box),
+                        "overflow ({x:?}, {y:?})"
+                    );
+                }
+            }
+        }
     }
 }

@@ -4758,6 +4758,122 @@ mod tests {
         assert_eq!(*hover_transitions.borrow(), [true, false]);
     }
 
+    /// How the border-ring test restyles its element under the pointer.
+    #[derive(Clone, Copy, Debug)]
+    enum RingRestyle {
+        /// A `.hover(..)` style fades the border in.
+        HoverStyle,
+        /// An `on_hover` listener stores the hover and the view fades the
+        /// border in.
+        HoverListener,
+    }
+
+    /// Renders after which the border-ring view stops restyling on hover,
+    /// so a hover that flips on every frame fails the test instead of
+    /// redrawing forever.
+    const RING_RENDER_CAP: usize = 16;
+
+    struct BorderRingTestView {
+        overflow: Point<Overflow>,
+        restyle: RingRestyle,
+        hovered: bool,
+        transitions: usize,
+        renders: Rc<Cell<usize>>,
+    }
+
+    impl Render for BorderRingTestView {
+        fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            self.renders.set(self.renders.get() + 1);
+            let restyles = self.renders.get() <= RING_RENDER_CAP;
+            let mut ring = div()
+                .id("ring")
+                .absolute()
+                .left(px(20.))
+                .top(px(20.))
+                .size(px(40.))
+                .border_1()
+                .border_color(crate::transparent_black());
+            ring.style().overflow.x = Some(self.overflow.x);
+            ring.style().overflow.y = Some(self.overflow.y);
+            let ring = match self.restyle {
+                RingRestyle::HoverStyle => ring.when(restyles, |ring| {
+                    ring.hover(|style| style.border_color(crate::red()))
+                }),
+                RingRestyle::HoverListener => ring
+                    .when(self.hovered, |ring| ring.border_color(crate::red()))
+                    .when(restyles, |ring| {
+                        ring.on_hover(cx.listener(|view, hovered: &bool, _, cx| {
+                            view.hovered = *hovered;
+                            view.transitions += 1;
+                            cx.notify();
+                        }))
+                    }),
+            };
+            div().relative().size_full().child(ring)
+        }
+    }
+
+    /// A pointer at rest on the border ring of an element that clips its
+    /// overflow and fades its border in under the pointer settles in one
+    /// hover state. The element's hitbox is inserted inside its own overflow
+    /// mask, and a mask that followed the border color shrank the hovered
+    /// hit region off the pointer, so hover flipped and the window redrew on
+    /// every frame. Covers a hover style and a hover listener, every
+    /// clipping overflow pair, and every edge of the ring. Does not cover a
+    /// hover style that changes the border widths or corner radii, which
+    /// moves the hit region itself.
+    #[gpui::test]
+    fn hover_settles_on_the_border_ring_of_a_clipping_element(cx: &mut TestAppContext) {
+        let ring_edges = [
+            ("left", point(px(20.5), px(40.))),
+            ("right", point(px(59.5), px(40.))),
+            ("top", point(px(40.), px(20.5))),
+            ("bottom", point(px(40.), px(59.5))),
+        ];
+        let mut flips = Vec::new();
+        for x in Overflow::all() {
+            for y in Overflow::all() {
+                if x == Overflow::Visible && y == Overflow::Visible {
+                    continue;
+                }
+                for restyle in [RingRestyle::HoverStyle, RingRestyle::HoverListener] {
+                    for (edge, position) in ring_edges {
+                        let renders = Rc::new(Cell::new(0));
+                        let window = cx.add_window({
+                            let renders = renders.clone();
+                            move |_, _| BorderRingTestView {
+                                overflow: point(x, y),
+                                restyle,
+                                hovered: false,
+                                transitions: 0,
+                                renders,
+                            }
+                        });
+                        let any_window = AnyWindowHandle::from(window);
+                        cx.update_window(any_window, |_, window, cx| window.draw(cx).clear(cx))
+                            .unwrap();
+                        let at_rest = renders.get();
+
+                        cx.update_window(any_window, |_, window, cx| {
+                            window.simulate_mouse_move(position, cx)
+                        })
+                        .unwrap();
+                        let moved = renders.get() - at_rest;
+                        let transitions = window.update(cx, |view, _, _| view.transitions).unwrap();
+                        if moved > 2 || transitions > 1 {
+                            flips.push(format!(
+                                "overflow ({x:?}, {y:?}), {restyle:?}, pointer on the {edge} \
+                                 edge: {moved} renders and {transitions} hover transitions \
+                                 after one move"
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        assert!(flips.is_empty(), "{}", flips.join("\n"));
+    }
+
     #[gpui::test]
     fn hover_listeners_remain_hovered_during_stationary_mouse_press(cx: &mut TestAppContext) {
         let hover_transitions = Rc::new(RefCell::new(Vec::new()));
