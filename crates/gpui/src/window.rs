@@ -2900,6 +2900,15 @@ impl Window {
         self.rendered_frame.scene.quads.clone()
     }
 
+    /// Returns the image sprites in the most recently rendered frame's scene, so tests can
+    /// assert on painted images without rasterizing the frame. Bounds are in scaled pixels and
+    /// each sprite carries the atlas tile it samples, so a frame that paints another image, or
+    /// the same image elsewhere, returns different sprites.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn painted_images(&self) -> Vec<PolychromeSprite> {
+        self.rendered_frame.scene.polychrome_sprites.clone()
+    }
+
     /// Returns the cursor the most recently rendered frame sets for the pointer where it last
     /// moved: a window-wide style if one was painted, else the topmost style whose hitbox the
     /// pointer is over. `None` means the platform shows the arrow.

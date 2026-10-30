@@ -961,6 +961,41 @@ mod tests {
         assert_eq!(corner_radius, Some(expected_corner_radius));
     }
 
+    /// `Window::painted_images` reports each painted image where it was painted and with the
+    /// tile it samples: the same image moved keeps its tile at new bounds, and another image
+    /// at the same bounds samples another tile.
+    #[gpui::test]
+    fn painted_images_reports_each_image_at_its_bounds_and_tile(cx: &mut TestAppContext) {
+        let window = cx.add_empty_window();
+        let first = test_image_with_size(4, 4);
+        let second = test_image_with_size(4, 4);
+        let mut painted = |image: &Arc<RenderImage>, x: f32| {
+            let image = image.clone();
+            window.draw(point(px(x), px(0.)), size(px(10.), px(10.)), |_, _| {
+                img(ImageSource::Render(image))
+                    .size_full()
+                    .into_any_element()
+            });
+            window.update(|window, _| {
+                let scale = window.scale_factor();
+                let sprites = window.painted_images();
+                assert_eq!(sprites.len(), 1, "one image paints one sprite");
+                let sprite = sprites[0];
+                (sprite.bounds.origin.x, px(x).scale(scale), sprite.tile)
+            })
+        };
+        let (at, expected, tile) = painted(&first, 0.);
+        assert_eq!(at, expected);
+        let (moved, expected, moved_tile) = painted(&first, 20.);
+        assert_eq!(
+            moved, expected,
+            "the moved image is reported where it was painted"
+        );
+        assert_eq!(moved_tile, tile, "the same image samples the same tile");
+        let (_, _, other) = painted(&second, 20.);
+        assert_ne!(other, tile, "another image samples another tile");
+    }
+
     #[gpui::test]
     fn stale_frame_index_is_clamped_when_image_changes(cx: &mut TestAppContext) {
         let window = cx.add_empty_window();
