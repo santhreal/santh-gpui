@@ -8,9 +8,11 @@ use block::ConcreteBlock;
 use cocoa::{
     appkit::{
         NSAppearanceNameVibrantDark, NSAppearanceNameVibrantLight, NSApplication,
-        NSApplicationActivationPolicy::NSApplicationActivationPolicyRegular, NSControl as _,
-        NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel, NSSavePanel,
-        NSVisualEffectState, NSVisualEffectView, NSWindow,
+        NSApplicationActivationPolicy::{
+            NSApplicationActivationPolicyAccessory, NSApplicationActivationPolicyRegular,
+        },
+        NSControl as _, NSEventModifierFlags, NSMenu, NSMenuItem, NSModalResponse, NSOpenPanel,
+        NSSavePanel, NSVisualEffectState, NSVisualEffectView, NSWindow,
     },
     base::{BOOL, NO, YES, id, nil, selector},
     foundation::{
@@ -29,9 +31,9 @@ use ctor::ctor;
 use dispatch2::DispatchQueue;
 use futures::channel::oneshot;
 use gpui::{
-    Action, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle, ForegroundExecutor,
-    KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions, Platform,
-    PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
+    Action, ActivationPolicy, AnyWindowHandle, BackgroundExecutor, ClipboardItem, CursorStyle,
+    ForegroundExecutor, KeyContext, Keymap, Menu, MenuItem, OsMenu, OwnedMenu, PathPromptOptions,
+    Platform, PlatformDisplay, PlatformKeyboardLayout, PlatformKeyboardMapper, PlatformTextSystem,
     PlatformWindow, Result, SystemMenuType, Task, ThermalState, WindowAppearance, WindowKind,
     WindowParams, popup::PopupNotSupportedError,
 };
@@ -191,6 +193,10 @@ pub(crate) struct MacPlatformState {
     menu_actions: Vec<Box<dyn Action>>,
     open_urls: Option<Box<dyn FnMut(Vec<String>)>>,
     finish_launching: Option<Box<dyn FnOnce()>>,
+    /// The policy `did_finish_launching` applies, and whether it has run:
+    /// a policy set before then waits for it.
+    activation_policy: ActivationPolicy,
+    launched: bool,
     dock_menu: Option<id>,
     menus: Option<Vec<OwnedMenu>>,
     keyboard_mapper: Rc<MacKeyboardMapper>,
@@ -235,6 +241,8 @@ impl MacPlatform {
             menu_actions: Default::default(),
             open_urls: None,
             finish_launching: None,
+            activation_policy: ActivationPolicy::Regular,
+            launched: false,
             dock_menu: None,
             on_keyboard_layout_change: None,
             on_thermal_state_change: None,
@@ -603,6 +611,17 @@ impl Platform for MacPlatform {
         unsafe {
             let app = NSApplication::sharedApplication(nil);
             let _: () = msg_send![app, hide: nil];
+        }
+    }
+
+    fn set_activation_policy(&self, policy: ActivationPolicy) {
+        let launched = {
+            let mut state = self.0.lock();
+            state.activation_policy = policy;
+            state.launched
+        };
+        if launched {
+            unsafe { apply_activation_policy(policy) };
         }
     }
 
@@ -1302,8 +1321,12 @@ extern "C" fn will_finish_launching(_this: &mut Object, _: Sel, _: id) {
 
 extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
     unsafe {
-        let app: id = msg_send![APP_CLASS, sharedApplication];
-        app.setActivationPolicy_(NSApplicationActivationPolicyRegular);
+        let policy = {
+            let mut state = get_mac_platform(this).0.lock();
+            state.launched = true;
+            state.activation_policy
+        };
+        apply_activation_policy(policy);
 
         let notification_center: *mut Object =
             msg_send![class!(NSNotificationCenter), defaultCenter];
@@ -1345,6 +1368,17 @@ extern "C" fn did_finish_launching(this: &mut Object, _: Sel, _: id) {
         if let Some(callback) = callback {
             callback();
         }
+    }
+}
+
+/// Sets the shared application's activation policy to `policy`.
+unsafe fn apply_activation_policy(policy: ActivationPolicy) {
+    unsafe {
+        let app: id = msg_send![APP_CLASS, sharedApplication];
+        app.setActivationPolicy_(match policy {
+            ActivationPolicy::Regular => NSApplicationActivationPolicyRegular,
+            ActivationPolicy::Accessory => NSApplicationActivationPolicyAccessory,
+        });
     }
 }
 

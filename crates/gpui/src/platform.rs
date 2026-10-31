@@ -120,6 +120,20 @@ pub fn guess_compositor() -> &'static str {
     }
 }
 
+/// Whether a desktop app shows in the Dock and owns the menu bar while it
+/// is active. macOS reads it; other platforms show each window in their
+/// taskbar or window list and ignore it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ActivationPolicy {
+    /// The app has a Dock icon, appears in the application switcher, and
+    /// shows its menus in the menu bar while it is active.
+    #[default]
+    Regular,
+    /// The app has no Dock icon and no menu bar. Its windows still show
+    /// and take focus.
+    Accessory,
+}
+
 #[expect(missing_docs)]
 pub trait Platform: 'static {
     fn background_executor(&self) -> BackgroundExecutor;
@@ -131,6 +145,10 @@ pub trait Platform: 'static {
     fn restart(&self, binary_path: Option<PathBuf>, arguments: Vec<OsString>);
     fn activate(&self, ignoring_other_apps: bool);
     fn hide(&self);
+    /// Sets whether the app shows in the Dock and the menu bar. A call
+    /// before launch finishes sets the policy the app launches with. Only
+    /// macOS implements it.
+    fn set_activation_policy(&self, _policy: ActivationPolicy) {}
     fn hide_other_apps(&self);
     fn unhide_other_apps(&self);
 
