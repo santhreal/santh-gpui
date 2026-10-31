@@ -660,6 +660,11 @@ impl WindowsWindow {
         register_drag_drop(&this)?;
         set_non_rude_hwnd(hwnd, true);
         configure_dwm_dark_mode(hwnd, appearance);
+        // A window the app places itself, such as a full-screen overlay
+        // or an image pinned over its source, keeps its own shape.
+        if params.is_movable && matches!(params.kind, WindowKind::Normal | WindowKind::Dialog) {
+            round_window_corners(hwnd);
+        }
         this.state.border_offset.update(hwnd)?;
         let placement =
             retrieve_window_placement(hwnd, display, params.bounds, &this.state.border_offset)?;
@@ -1693,6 +1698,28 @@ fn retrieve_window_placement(
     let bounds = bounds.to_device_pixels(display.scale_factor());
     placement.rcNormalPosition = calculate_window_rect(bounds, border_offset);
     Ok(placement)
+}
+
+/// Ask DWM for the system's round corners. Windows 11 rounds a window
+/// with a caption or a sizing frame by itself, and leaves a window with
+/// neither, a fixed-size one here, square. Earlier builds have square
+/// corners and no such attribute.
+fn round_window_corners(hwnd: HWND) {
+    let mut version = unsafe { std::mem::zeroed() };
+    let status = unsafe { windows::Wdk::System::SystemServices::RtlGetVersion(&mut version) };
+    if !status.is_ok() || version.dwBuildNumber < 22000 {
+        return;
+    }
+    let preference = DWMWCP_ROUND;
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &preference as *const _ as *const _,
+            std::mem::size_of_val(&preference) as u32,
+        )
+        .log_err();
+    }
 }
 
 fn dwm_set_window_composition_attribute(hwnd: HWND, backdrop_type: u32) {
