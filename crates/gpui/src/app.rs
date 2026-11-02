@@ -1054,6 +1054,14 @@ impl App {
         self.cursor_hide_mode = mode;
     }
 
+    /// Hides the cursor until the mouse next moves, as a text field does
+    /// while it takes a typed key. Under [`CursorHideMode::Never`] this
+    /// is the one hide, so an app can hide the cursor for the keys that
+    /// type into a field and keep it for the keys that run a command.
+    pub fn hide_cursor_until_mouse_moves(&self) {
+        self.platform.hide_cursor_until_mouse_moves();
+    }
+
     /// Returns whether the cursor is currently visible according to the
     /// platform. This will report `false` after a keyboard input has hidden
     /// the cursor and the user has not yet moved the mouse to restore it.
