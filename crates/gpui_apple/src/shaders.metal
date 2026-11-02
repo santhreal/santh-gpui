@@ -16,7 +16,6 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bo
 
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size);
-float2 clamp_to_tile(float2 position, AtlasTile tile, float2 atlas_size);
 float4 sample_tile(texture2d<float> atlas_texture, sampler atlas_sampler,
                    float2 position, float2 dx, float2 dy, AtlasTile tile,
                    float2 atlas_size);
@@ -1201,44 +1200,75 @@ float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
          float2((float)atlas_size->width, (float)atlas_size->height);
 }
 
-// `position` held half a texel inside `tile`. The atlas packs tiles with no
-// gutter, so a linear sample nearer a tile's edge than half a texel takes in
-// the neighboring tile's texels: a sprite drawn at any scale but its tile's
-// would show them along its edges.
-float2 clamp_to_tile(float2 position, AtlasTile tile, float2 atlas_size) {
-  float2 origin = float2(tile.bounds.origin.x, tile.bounds.origin.y);
-  float2 size = float2(tile.bounds.size.width, tile.bounds.size.height);
-  return clamp(position, (origin + 0.5) / atlas_size,
-               (origin + size - 0.5) / atlas_size);
+// One axis of a pixel's footprint in a tile, in texels: the interval
+// [lo, hi] it covers, and the `count` texels from `first` that interval
+// touches.
+struct Footprint {
+  float lo;
+  float hi;
+  float first;
+  uint count;
+};
+
+// The footprint `width` texels wide around `center`, cut to the `span`
+// texels of the tile from `origin`.
+Footprint footprint(float center, float width, float origin, float span) {
+  float lo = max(center - width / 2.0, origin);
+  float hi = min(center + width / 2.0, origin + span);
+  float first = floor(lo);
+  return Footprint{lo, hi, first, uint(max(ceil(hi) - first, 1.0))};
 }
 
-// `tile` over the screen pixel whose center maps to `position`, with `dx`
-// and `dy` the change in `position` from one pixel to the next along x and
-// y. The atlas has no mip levels, so one linear sample of a sprite drawn
-// smaller than its tile reads only the 2x2 texels nearest the pixel's center
-// and skips the texels between pixels: fine detail aliases. This averages
-// one linear sample per texel the footprint spans along each axis, up to 8,
-// spread evenly over it, which is one sample for a sprite drawn at or above
-// its tile's size.
+// How much of texel `first + k` the footprint covers.
+float coverage(Footprint f, uint k) {
+  float j = f.first + float(k);
+  return max(min(f.hi, j + 1.0) - max(f.lo, j), 0.0);
+}
+
+// Texels `2k` and `2k + 1` of the footprint as one linear sample: the
+// position between their centers whose linear weights are their coverages,
+// and the coverages' sum. An unpaired last texel samples at its center.
+float2 footprint_pair(Footprint f, uint k) {
+  float a = coverage(f, 2 * k);
+  float b = 2 * k + 1 < f.count ? coverage(f, 2 * k + 1) : 0.0;
+  float w = a + b;
+  return float2(f.first + float(2 * k) + 0.5 + (w > 0.0 ? b / w : 0.0), w);
+}
+
+// The mean of `tile` over the screen pixel whose center maps to `position`,
+// with `dx` and `dy` the change in `position` from one pixel to the next
+// along x and y. Each texel weighs by how much of it the pixel's footprint
+// covers, the footprint at least one texel wide and at most 31: a sprite
+// drawn at or above its tile's size samples as one linear sample would, and
+// one drawn smaller averages every texel under the pixel. The atlas has no
+// mip levels, so one linear sample of a minified sprite would read only the
+// 2x2 texels nearest the pixel's center and alias. The atlas also packs
+// tiles with no gutter, so the footprint stops at the tile's edge: past it
+// are the neighboring tile's texels.
 float4 sample_tile(texture2d<float> atlas_texture, sampler atlas_sampler,
                    float2 position, float2 dx, float2 dy, AtlasTile tile,
                    float2 atlas_size) {
-  // 1/64 texel of slack: a sprite drawn at its tile's size spans one texel
-  // per pixel up to rounding.
-  float2 span = float2(length(dx * atlas_size), length(dy * atlas_size));
-  uint2 taps = uint2(clamp(ceil(span - 1.0 / 64.0), 1.0, 8.0));
+  float2 center = position * atlas_size;
+  float2 extent = clamp(abs(dx * atlas_size) + abs(dy * atlas_size),
+                        float2(1.0), float2(31.0));
+  Footprint fx = footprint(center.x, extent.x, tile.bounds.origin.x,
+                           tile.bounds.size.width);
+  Footprint fy = footprint(center.y, extent.y, tile.bounds.origin.y,
+                           tile.bounds.size.height);
   float4 sum = float4(0.0);
-  for (uint j = 0; j < taps.y; j++) {
-    float v = (float(j) + 0.5) / float(taps.y) - 0.5;
-    for (uint i = 0; i < taps.x; i++) {
-      float u = (float(i) + 0.5) / float(taps.x) - 0.5;
-      sum += atlas_texture.sample(
-          atlas_sampler,
-          clamp_to_tile(position + u * dx + v * dy, tile, atlas_size),
-          level(0));
+  float total = 0.0;
+  for (uint j = 0; j < (fy.count + 1) / 2; j++) {
+    float2 y = footprint_pair(fy, j);
+    for (uint i = 0; i < (fx.count + 1) / 2; i++) {
+      float2 x = footprint_pair(fx, i);
+      float weight = x.y * y.y;
+      sum += weight * atlas_texture.sample(atlas_sampler,
+                                           float2(x.x, y.x) / atlas_size,
+                                           level(0));
+      total += weight;
     }
   }
-  return sum / float(taps.x * taps.y);
+  return sum / max(total, 1e-6);
 }
 
 // Selects corner radius based on quadrant.

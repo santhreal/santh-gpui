@@ -195,44 +195,74 @@ fn to_tile_position(unit_vertex: vec2<f32>, tile: AtlasTile) -> vec2<f32> {
   return (vec2<f32>(tile.bounds.origin) + unit_vertex * vec2<f32>(tile.bounds.size)) / atlas_size;
 }
 
-// `position` held half a texel inside `tile`. The atlas packs tiles with no
-// gutter, so a linear sample nearer a tile's edge than half a texel takes in
-// the neighboring tile's texels: a sprite drawn at any scale but its tile's
-// would show them along its edges.
-fn clamp_to_tile(position: vec2<f32>, tile: AtlasTile) -> vec2<f32> {
-  let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
-  let origin = vec2<f32>(tile.bounds.origin);
-  let lo = (origin + 0.5) / atlas_size;
-  let hi = (origin + vec2<f32>(tile.bounds.size) - 0.5) / atlas_size;
-  return clamp(position, lo, hi);
+// The widest footprint `sample_tile` averages along an axis, in texels.
+const MAX_FOOTPRINT: f32 = 31.0;
+
+// One axis of a pixel's footprint in a tile, in texels: the interval
+// [lo, hi] it covers, and the `count` texels from `first` that interval
+// touches.
+struct Footprint {
+  lo: f32,
+  hi: f32,
+  first: f32,
+  count: u32,
 }
 
-// The most linear samples `sample_tile` takes along each axis of a pixel's
-// footprint.
-const MAX_FOOTPRINT_TAPS: f32 = 8.0;
+// The footprint `width` texels wide around `center`, cut to the `span`
+// texels of the tile from `origin`.
+fn footprint(center: f32, width: f32, origin: f32, span: f32) -> Footprint {
+  let lo = max(center - width / 2.0, origin);
+  let hi = min(center + width / 2.0, origin + span);
+  let first = floor(lo);
+  return Footprint(lo, hi, first, u32(max(ceil(hi) - first, 1.0)));
+}
 
-// `tile` over the screen pixel whose center maps to `position`, with `dx` and
-// `dy` the change in `position` from one pixel to the next along x and y.
-// The atlas has no mip levels, so one linear sample of a sprite drawn smaller
-// than its tile reads only the 2x2 texels nearest the pixel's center and
-// skips the texels between pixels: fine detail aliases. This averages one
-// linear sample per texel the footprint spans along each axis, spread evenly
-// over it, which is one sample for a sprite drawn at or above its tile's size.
+// How much of texel `first + k` the footprint covers.
+fn coverage(f: Footprint, k: u32) -> f32 {
+  let j = f.first + f32(k);
+  return max(min(f.hi, j + 1.0) - max(f.lo, j), 0.0);
+}
+
+// Texels `2k` and `2k + 1` of the footprint as one linear sample: the
+// position between their centers whose linear weights are their coverages,
+// and the coverages' sum. An unpaired last texel samples at its center.
+fn footprint_pair(f: Footprint, k: u32) -> vec2<f32> {
+  let a = coverage(f, 2u * k);
+  let b = select(0.0, coverage(f, 2u * k + 1u), 2u * k + 1u < f.count);
+  let w = a + b;
+  return vec2<f32>(f.first + f32(2u * k) + 0.5 + select(0.0, b / w, w > 0.0), w);
+}
+
+// The mean of `tile` over the screen pixel whose center maps to `position`,
+// with `dx` and `dy` the change in `position` from one pixel to the next
+// along x and y. Each texel weighs by how much of it the pixel's footprint
+// covers, the footprint at least one texel wide: a sprite drawn at or above
+// its tile's size samples as one linear sample would, and one drawn smaller
+// averages every texel under the pixel. The atlas has no mip levels, so one
+// linear sample of a minified sprite would read only the 2x2 texels nearest
+// the pixel's center and alias. The atlas also packs tiles with no gutter,
+// so the footprint stops at the tile's edge: past it are the neighboring
+// tile's texels.
 fn sample_tile(position: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, tile: AtlasTile) -> vec4<f32> {
   let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
-  // 1/64 texel of slack: a sprite drawn at its tile's size spans one texel
-  // per pixel up to rounding.
-  let span = vec2<f32>(length(dx * atlas_size), length(dy * atlas_size));
-  let taps = vec2<u32>(clamp(ceil(span - 1.0 / 64.0), vec2<f32>(1.0), vec2<f32>(MAX_FOOTPRINT_TAPS)));
+  let center = position * atlas_size;
+  let extent = clamp(abs(dx * atlas_size) + abs(dy * atlas_size), vec2<f32>(1.0), vec2<f32>(MAX_FOOTPRINT));
+  let origin = vec2<f32>(tile.bounds.origin);
+  let span = vec2<f32>(tile.bounds.size);
+  let fx = footprint(center.x, extent.x, origin.x, span.x);
+  let fy = footprint(center.y, extent.y, origin.y, span.y);
   var sum = vec4<f32>(0.0);
-  for (var j = 0u; j < taps.y; j += 1u) {
-    let v = (f32(j) + 0.5) / f32(taps.y) - 0.5;
-    for (var i = 0u; i < taps.x; i += 1u) {
-      let u = (f32(i) + 0.5) / f32(taps.x) - 0.5;
-      sum += textureSampleLevel(t_sprite, s_sprite, clamp_to_tile(position + u * dx + v * dy, tile), 0.0);
+  var total = 0.0;
+  for (var j = 0u; j < (fy.count + 1u) / 2u; j += 1u) {
+    let y = footprint_pair(fy, j);
+    for (var i = 0u; i < (fx.count + 1u) / 2u; i += 1u) {
+      let x = footprint_pair(fx, i);
+      let weight = x.y * y.y;
+      sum += weight * textureSampleLevel(t_sprite, s_sprite, vec2<f32>(x.x, y.x) / atlas_size, 0.0);
+      total += weight;
     }
   }
-  return sum / f32(taps.x * taps.y);
+  return sum / max(total, 1e-6);
 }
 
 fn distance_from_clip_rect_impl(position: vec2<f32>, clip_bounds: Bounds) -> vec4<f32> {
