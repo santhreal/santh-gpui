@@ -195,6 +195,18 @@ fn to_tile_position(unit_vertex: vec2<f32>, tile: AtlasTile) -> vec2<f32> {
   return (vec2<f32>(tile.bounds.origin) + unit_vertex * vec2<f32>(tile.bounds.size)) / atlas_size;
 }
 
+// `position` held half a texel inside `tile`. The atlas packs tiles with no
+// gutter, so a linear sample nearer a tile's edge than half a texel takes in
+// the neighboring tile's texels: a sprite drawn at any scale but its tile's
+// would show them along its edges.
+fn clamp_to_tile(position: vec2<f32>, tile: AtlasTile) -> vec2<f32> {
+  let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+  let origin = vec2<f32>(tile.bounds.origin);
+  let lo = (origin + 0.5) / atlas_size;
+  let hi = (origin + vec2<f32>(tile.bounds.size) - 0.5) / atlas_size;
+  return clamp(position, lo, hi);
+}
+
 fn distance_from_clip_rect_impl(position: vec2<f32>, clip_bounds: Bounds) -> vec4<f32> {
     let tl = position - clip_bounds.origin;
     let br = clip_bounds.origin + clip_bounds.size - position;
@@ -1426,13 +1438,13 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
-    let sample = textureSample(t_sprite, s_sprite, input.tile_position);
+    let sprite = load_poly_sprite(input.sprite_id);
+    let sample = textureSample(t_sprite, s_sprite, clamp_to_tile(input.tile_position, sprite.tile));
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
     }
 
-    let sprite = load_poly_sprite(input.sprite_id);
     let mask_sdf = quad_sdf(input.window_position, sprite.content_mask.bounds, sprite.content_mask.corner_radii);
     if (mask_sdf >= 0.5) {
         return vec4<f32>(0.0);

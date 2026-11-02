@@ -266,6 +266,17 @@ float2 to_tile_position(float2 unit_vertex, AtlasTile tile) {
     return (float2(tile.bounds.origin) + unit_vertex * float2(tile.bounds.size)) / atlas_size;
 }
 
+// `position` held half a texel inside `tile`. The atlas packs tiles with no
+// gutter, so a linear sample nearer a tile's edge than half a texel takes in
+// the neighboring tile's texels: a sprite drawn at any scale but its tile's
+// would show them along its edges.
+float2 clamp_to_tile(float2 position, AtlasTile tile) {
+    float2 atlas_size;
+    t_sprite.GetDimensions(atlas_size.x, atlas_size.y);
+    float2 origin = float2(tile.bounds.origin);
+    return clamp(position, (origin + 0.5) / atlas_size, (origin + float2(tile.bounds.size) - 0.5) / atlas_size);
+}
+
 // Selects corner radius based on quadrant.
 float pick_corner_radius(float2 center_to_point, Corners corner_radii) {
     if (center_to_point.x < 0.) {
@@ -1305,7 +1316,7 @@ PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexI
 
 float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Target {
     PolychromeSprite sprite = poly_sprites[input.sprite_id];
-    float4 sample = t_sprite.Sample(s_sprite, input.tile_position);
+    float4 sample = t_sprite.Sample(s_sprite, clamp_to_tile(input.tile_position, sprite.tile));
     float distance = quad_sdf(input.local_position, sprite.bounds, sprite.corner_radii);
 
     float4 color = sample;

@@ -8,6 +8,8 @@ mod pipeline_cache;
 mod pipelines;
 #[cfg(test)]
 mod present_mode_tests;
+#[cfg(test)]
+mod sprite_edge_tests;
 mod trial;
 
 #[cfg(not(target_family = "wasm"))]

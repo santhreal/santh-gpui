@@ -16,6 +16,7 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bo
 
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size);
+float2 clamp_to_tile(float2 position, AtlasTile tile, float2 atlas_size);
 float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds);
 float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
@@ -715,8 +716,11 @@ fragment float4 polychrome_sprite_fragment(
   PolychromeSprite sprite = sprites[input.sprite_id];
   constexpr sampler atlas_texture_sampler(mag_filter::linear,
                                           min_filter::linear);
-  float4 sample =
-      atlas_texture.sample(atlas_texture_sampler, input.tile_position);
+  float2 atlas_size = float2((float)atlas_texture.get_width(),
+                             (float)atlas_texture.get_height());
+  float4 sample = atlas_texture.sample(
+      atlas_texture_sampler,
+      clamp_to_tile(input.tile_position, sprite.tile, atlas_size));
   float distance =
       quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
@@ -1191,6 +1195,17 @@ float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
   float2 tile_size = float2(tile.bounds.size.width, tile.bounds.size.height);
   return (tile_origin + unit_vertex * tile_size) /
          float2((float)atlas_size->width, (float)atlas_size->height);
+}
+
+// `position` held half a texel inside `tile`. The atlas packs tiles with no
+// gutter, so a linear sample nearer a tile's edge than half a texel takes in
+// the neighboring tile's texels: a sprite drawn at any scale but its tile's
+// would show them along its edges.
+float2 clamp_to_tile(float2 position, AtlasTile tile, float2 atlas_size) {
+  float2 origin = float2(tile.bounds.origin.x, tile.bounds.origin.y);
+  float2 size = float2(tile.bounds.size.width, tile.bounds.size.height);
+  return clamp(position, (origin + 0.5) / atlas_size,
+               (origin + size - 0.5) / atlas_size);
 }
 
 // Selects corner radius based on quadrant.
