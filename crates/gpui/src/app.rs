@@ -3024,6 +3024,10 @@ pub struct AnyTooltip {
     /// The absolute position of the mouse when the tooltip was deployed.
     pub mouse_position: Point<Pixels>,
 
+    /// The absolute bounds of the element the tooltip describes. A tooltip that does not fit
+    /// below the pointer goes above this element instead of over it.
+    pub anchor: Bounds<Pixels>,
+
     /// Given the bounds of the tooltip, checks whether the tooltip should still be visible and
     /// updates its state accordingly. This is needed atop the hovered element's mouse move handler
     /// to handle the case where the element is not painted (e.g. via use of `visible_on_hover`).

@@ -3702,39 +3702,16 @@ impl Window {
                 continue;
             };
             let mut element = tooltip_request.tooltip.view.clone().into_any_element();
-            let mouse_position = tooltip_request.tooltip.mouse_position;
             let tooltip_size = element.layout_as_root(AvailableSpace::min_size(), self, cx);
-
-            let mut tooltip_bounds =
-                Bounds::new(mouse_position + point(px(1.), px(1.)), tooltip_size);
-            let window_bounds = Bounds {
-                origin: Point::default(),
-                size: self.viewport_size(),
-            };
-
-            if tooltip_bounds.right() > window_bounds.right() {
-                let new_x = mouse_position.x - tooltip_bounds.size.width - px(1.);
-                if new_x >= Pixels::ZERO {
-                    tooltip_bounds.origin.x = new_x;
-                } else {
-                    tooltip_bounds.origin.x = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.x - tooltip_bounds.right() - window_bounds.right(),
-                    );
-                }
-            }
-
-            if tooltip_bounds.bottom() > window_bounds.bottom() {
-                let new_y = mouse_position.y - tooltip_bounds.size.height - px(1.);
-                if new_y >= Pixels::ZERO {
-                    tooltip_bounds.origin.y = new_y;
-                } else {
-                    tooltip_bounds.origin.y = cmp::max(
-                        Pixels::ZERO,
-                        tooltip_bounds.origin.y - tooltip_bounds.bottom() - window_bounds.bottom(),
-                    );
-                }
-            }
+            let tooltip_bounds = Bounds::new(
+                tooltip_origin(
+                    tooltip_request.tooltip.mouse_position,
+                    tooltip_request.tooltip.anchor,
+                    tooltip_size,
+                    self.viewport_size(),
+                ),
+                tooltip_size,
+            );
 
             // It's possible for an element to have an active tooltip while not being painted (e.g.
             // via the `visible_on_hover` method). Since mouse listeners are not active in this
@@ -7792,6 +7769,45 @@ pub fn outline(
     }
 }
 
+/// The space between a tooltip placed above its element and the element.
+const TOOLTIP_ANCHOR_GAP: Pixels = px(4.);
+
+/// Where a tooltip of `size` goes in a viewport of `viewport`, for a pointer at `mouse` over the
+/// element at `anchor`. The tooltip goes below and right of the pointer. Past the right edge, it
+/// goes left of the pointer, or against the right edge when the left has no room either. Past the
+/// bottom, it goes TOOLTIP_ANCHOR_GAP above the element when the element's top is within the
+/// tooltip's height of the pointer and the space above holds it, so it does not cover the element;
+/// above the pointer when only that space holds it; against the bottom edge otherwise. Neither
+/// coordinate goes below zero.
+fn tooltip_origin(
+    mouse: Point<Pixels>,
+    anchor: Bounds<Pixels>,
+    size: Size<Pixels>,
+    viewport: Size<Pixels>,
+) -> Point<Pixels> {
+    let mut origin = mouse + point(px(1.), px(1.));
+    if origin.x + size.width > viewport.width {
+        let left = mouse.x - size.width - px(1.);
+        origin.x = if left >= Pixels::ZERO {
+            left
+        } else {
+            cmp::max(Pixels::ZERO, viewport.width - size.width)
+        };
+    }
+    if origin.y + size.height > viewport.height {
+        let over_anchor = anchor.top() - TOOLTIP_ANCHOR_GAP - size.height;
+        let over_mouse = mouse.y - size.height - px(1.);
+        origin.y = if mouse.y - anchor.top() <= size.height && over_anchor >= Pixels::ZERO {
+            over_anchor
+        } else if over_mouse >= Pixels::ZERO {
+            over_mouse
+        } else {
+            cmp::max(Pixels::ZERO, viewport.height - size.height)
+        };
+    }
+    origin
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -7813,6 +7829,72 @@ mod tests {
         Background, BorderStyle, ContentMask, Corners, Edges, Hsla, Quad, ScaledPixels,
         TransformationMatrix,
     };
+
+    // WHY: a tooltip that does not fit below the pointer goes above its element, not over it:
+    // placed above the pointer, it covered the top of a small button near a window's bottom
+    // edge. Every placement of a tooltip that fits the viewport stays inside it. A tall element
+    // keeps the tooltip above the pointer, and a viewport with no room above pins the tooltip to
+    // the edge. Not covered: the paint of the tooltip's view.
+    #[test]
+    fn a_tooltip_goes_above_its_element_when_it_does_not_fit_below() {
+        use super::{TOOLTIP_ANCHOR_GAP, tooltip_origin};
+        let viewport = size(px(280.), px(165.));
+        let tip = size(px(100.), px(41.));
+        let disc = |x: f32, y: f32| Bounds::new(point(px(x), px(y)), size(px(22.), px(22.)));
+        for x in (0..=258).step_by(6) {
+            for y in (0..=143).step_by(6) {
+                let anchor = disc(x as f32, y as f32);
+                let mouse = anchor.center();
+                let placed = Bounds::new(tooltip_origin(mouse, anchor, tip, viewport), tip);
+                assert!(
+                    placed.left() >= Pixels::ZERO
+                        && placed.top() >= Pixels::ZERO
+                        && placed.right() <= viewport.width
+                        && placed.bottom() <= viewport.height,
+                    "{anchor:?} {placed:?}"
+                );
+                if anchor.top() >= tip.height + TOOLTIP_ANCHOR_GAP {
+                    assert!(
+                        placed.top() > mouse.y
+                            || placed.bottom() + TOOLTIP_ANCHOR_GAP <= anchor.top(),
+                        "the tooltip covers its element: {anchor:?} {placed:?}"
+                    );
+                }
+            }
+        }
+        let cases = [
+            // Below and right of the pointer.
+            (viewport, tip, disc(0., 0.), (12., 12.)),
+            // Left of the pointer past the right edge.
+            (viewport, tip, disc(244., 0.), (154., 12.)),
+            // Against the right edge when the left has no room either.
+            (
+                size(px(150.), px(165.)),
+                size(px(120.), px(41.)),
+                disc(50., 0.),
+                (30., 12.),
+            ),
+            // Above the element past the bottom edge.
+            (viewport, tip, disc(20., 120.), (32., 75.)),
+            // Against the bottom edge when nothing above holds the tooltip.
+            (size(px(280.), px(60.)), tip, disc(10., 20.), (22., 19.)),
+        ];
+        for (viewport, tip, anchor, (x, y)) in cases {
+            let mouse = anchor.center();
+            assert_eq!(
+                tooltip_origin(mouse, anchor, tip, viewport),
+                point(px(x), px(y)),
+                "{anchor:?} in {viewport:?}"
+            );
+        }
+        // A tall element keeps the tooltip above the pointer, though the space above the element
+        // holds it.
+        let tall = Bounds::new(point(px(0.), px(60.)), size(px(100.), px(100.)));
+        assert_eq!(
+            tooltip_origin(point(px(50.), px(150.)), tall, tip, viewport),
+            point(px(51.), px(108.))
+        );
+    }
 
     /// A 240x48 outline of one pixel, rounded by eight, under `mask`.
     fn outline_under(mask: ContentMask<ScaledPixels>) -> Quad {

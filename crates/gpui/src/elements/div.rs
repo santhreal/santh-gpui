@@ -3197,6 +3197,7 @@ impl Interactivity {
                     check_is_hovered,
                     check_is_hovered_during_prepaint,
                     self.tooltip_show_delay,
+                    hitbox.bounds,
                     window,
                 );
             }
@@ -3843,6 +3844,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
     check_is_hovered: Rc<dyn Fn(&Window) -> bool>,
     check_is_hovered_during_prepaint: Rc<dyn Fn(&Window) -> bool>,
     show_delay: Option<Duration>,
+    anchor: Bounds<Pixels>,
     window: &mut Window,
 ) {
     let current_view = window.current_view();
@@ -3866,6 +3868,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
                 current_view,
                 phase,
                 show_delay,
+                anchor,
                 window,
                 cx,
             )
@@ -3952,6 +3955,7 @@ fn handle_tooltip_mouse_move(
     current_view: EntityId,
     phase: DispatchPhase,
     show_delay: Duration,
+    anchor: Bounds<Pixels>,
     window: &mut Window,
     cx: &mut App,
 ) {
@@ -4030,6 +4034,7 @@ fn handle_tooltip_mouse_move(
                                     tooltip: AnyTooltip {
                                         view,
                                         mouse_position: window.mouse_position(),
+                                        anchor,
                                         check_visible_and_update: Rc::new(
                                             move |tooltip_bounds, window, cx| {
                                                 let Some(active_tooltip) =
