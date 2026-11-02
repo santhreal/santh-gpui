@@ -10,6 +10,8 @@ mod pipelines;
 mod present_mode_tests;
 #[cfg(test)]
 mod sprite_edge_tests;
+#[cfg(test)]
+mod sprite_filter_tests;
 mod trial;
 
 #[cfg(not(target_family = "wasm"))]

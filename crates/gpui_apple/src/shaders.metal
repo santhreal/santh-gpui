@@ -17,6 +17,9 @@ float4 to_device_position_transformed(float2 unit_vertex, Bounds_ScaledPixels bo
 float2 to_tile_position(float2 unit_vertex, AtlasTile tile,
                         constant Size_DevicePixels *atlas_size);
 float2 clamp_to_tile(float2 position, AtlasTile tile, float2 atlas_size);
+float4 sample_tile(texture2d<float> atlas_texture, sampler atlas_sampler,
+                   float2 position, float2 dx, float2 dy, AtlasTile tile,
+                   float2 atlas_size);
 float4 distance_from_clip_rect(float2 unit_vertex, Bounds_ScaledPixels bounds,
                                Bounds_ScaledPixels clip_bounds);
 float4 distance_from_clip_rect_transformed(float2 unit_vertex, Bounds_ScaledPixels bounds,
@@ -718,9 +721,10 @@ fragment float4 polychrome_sprite_fragment(
                                           min_filter::linear);
   float2 atlas_size = float2((float)atlas_texture.get_width(),
                              (float)atlas_texture.get_height());
-  float4 sample = atlas_texture.sample(
-      atlas_texture_sampler,
-      clamp_to_tile(input.tile_position, sprite.tile, atlas_size));
+  float4 sample = sample_tile(atlas_texture, atlas_texture_sampler,
+                              input.tile_position, dfdx(input.tile_position),
+                              dfdy(input.tile_position), sprite.tile,
+                              atlas_size);
   float distance =
       quad_sdf(input.position.xy, sprite.bounds, sprite.corner_radii);
 
@@ -1206,6 +1210,35 @@ float2 clamp_to_tile(float2 position, AtlasTile tile, float2 atlas_size) {
   float2 size = float2(tile.bounds.size.width, tile.bounds.size.height);
   return clamp(position, (origin + 0.5) / atlas_size,
                (origin + size - 0.5) / atlas_size);
+}
+
+// `tile` over the screen pixel whose center maps to `position`, with `dx`
+// and `dy` the change in `position` from one pixel to the next along x and
+// y. The atlas has no mip levels, so one linear sample of a sprite drawn
+// smaller than its tile reads only the 2x2 texels nearest the pixel's center
+// and skips the texels between pixels: fine detail aliases. This averages
+// one linear sample per texel the footprint spans along each axis, up to 8,
+// spread evenly over it, which is one sample for a sprite drawn at or above
+// its tile's size.
+float4 sample_tile(texture2d<float> atlas_texture, sampler atlas_sampler,
+                   float2 position, float2 dx, float2 dy, AtlasTile tile,
+                   float2 atlas_size) {
+  // 1/64 texel of slack: a sprite drawn at its tile's size spans one texel
+  // per pixel up to rounding.
+  float2 span = float2(length(dx * atlas_size), length(dy * atlas_size));
+  uint2 taps = uint2(clamp(ceil(span - 1.0 / 64.0), 1.0, 8.0));
+  float4 sum = float4(0.0);
+  for (uint j = 0; j < taps.y; j++) {
+    float v = (float(j) + 0.5) / float(taps.y) - 0.5;
+    for (uint i = 0; i < taps.x; i++) {
+      float u = (float(i) + 0.5) / float(taps.x) - 0.5;
+      sum += atlas_texture.sample(
+          atlas_sampler,
+          clamp_to_tile(position + u * dx + v * dy, tile, atlas_size),
+          level(0));
+    }
+  }
+  return sum / float(taps.x * taps.y);
 }
 
 // Selects corner radius based on quadrant.

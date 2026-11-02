@@ -277,6 +277,34 @@ float2 clamp_to_tile(float2 position, AtlasTile tile) {
     return clamp(position, (origin + 0.5) / atlas_size, (origin + float2(tile.bounds.size) - 0.5) / atlas_size);
 }
 
+// `tile` over the screen pixel whose center maps to `position`, with `dx`
+// and `dy` the change in `position` from one pixel to the next along x and
+// y. The atlas has no mip levels, so one linear sample of a sprite drawn
+// smaller than its tile reads only the 2x2 texels nearest the pixel's center
+// and skips the texels between pixels: fine detail aliases. This averages
+// one linear sample per texel the footprint spans along each axis, up to 8,
+// spread evenly over it, which is one sample for a sprite drawn at or above
+// its tile's size.
+float4 sample_tile(float2 position, float2 dx, float2 dy, AtlasTile tile) {
+    float2 atlas_size;
+    t_sprite.GetDimensions(atlas_size.x, atlas_size.y);
+    // 1/64 texel of slack: a sprite drawn at its tile's size spans one texel
+    // per pixel up to rounding.
+    float2 span = float2(length(dx * atlas_size), length(dy * atlas_size));
+    uint2 taps = (uint2)clamp(ceil(span - 1.0 / 64.0), 1.0, 8.0);
+    float4 sum = float4(0.0, 0.0, 0.0, 0.0);
+    [loop]
+    for (uint j = 0; j < taps.y; j++) {
+        float v = (float(j) + 0.5) / float(taps.y) - 0.5;
+        [loop]
+        for (uint i = 0; i < taps.x; i++) {
+            float u = (float(i) + 0.5) / float(taps.x) - 0.5;
+            sum += t_sprite.SampleLevel(s_sprite, clamp_to_tile(position + u * dx + v * dy, tile), 0);
+        }
+    }
+    return sum / float(taps.x * taps.y);
+}
+
 // Selects corner radius based on quadrant.
 float pick_corner_radius(float2 center_to_point, Corners corner_radii) {
     if (center_to_point.x < 0.) {
@@ -1316,7 +1344,7 @@ PolychromeSpriteVertexOutput polychrome_sprite_vertex(uint vertex_id: SV_VertexI
 
 float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Target {
     PolychromeSprite sprite = poly_sprites[input.sprite_id];
-    float4 sample = t_sprite.Sample(s_sprite, clamp_to_tile(input.tile_position, sprite.tile));
+    float4 sample = sample_tile(input.tile_position, ddx(input.tile_position), ddy(input.tile_position), sprite.tile);
     float distance = quad_sdf(input.local_position, sprite.bounds, sprite.corner_radii);
 
     float4 color = sample;

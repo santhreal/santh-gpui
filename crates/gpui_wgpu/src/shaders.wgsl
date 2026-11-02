@@ -207,6 +207,34 @@ fn clamp_to_tile(position: vec2<f32>, tile: AtlasTile) -> vec2<f32> {
   return clamp(position, lo, hi);
 }
 
+// The most linear samples `sample_tile` takes along each axis of a pixel's
+// footprint.
+const MAX_FOOTPRINT_TAPS: f32 = 8.0;
+
+// `tile` over the screen pixel whose center maps to `position`, with `dx` and
+// `dy` the change in `position` from one pixel to the next along x and y.
+// The atlas has no mip levels, so one linear sample of a sprite drawn smaller
+// than its tile reads only the 2x2 texels nearest the pixel's center and
+// skips the texels between pixels: fine detail aliases. This averages one
+// linear sample per texel the footprint spans along each axis, spread evenly
+// over it, which is one sample for a sprite drawn at or above its tile's size.
+fn sample_tile(position: vec2<f32>, dx: vec2<f32>, dy: vec2<f32>, tile: AtlasTile) -> vec4<f32> {
+  let atlas_size = vec2<f32>(textureDimensions(t_sprite, 0));
+  // 1/64 texel of slack: a sprite drawn at its tile's size spans one texel
+  // per pixel up to rounding.
+  let span = vec2<f32>(length(dx * atlas_size), length(dy * atlas_size));
+  let taps = vec2<u32>(clamp(ceil(span - 1.0 / 64.0), vec2<f32>(1.0), vec2<f32>(MAX_FOOTPRINT_TAPS)));
+  var sum = vec4<f32>(0.0);
+  for (var j = 0u; j < taps.y; j += 1u) {
+    let v = (f32(j) + 0.5) / f32(taps.y) - 0.5;
+    for (var i = 0u; i < taps.x; i += 1u) {
+      let u = (f32(i) + 0.5) / f32(taps.x) - 0.5;
+      sum += textureSampleLevel(t_sprite, s_sprite, clamp_to_tile(position + u * dx + v * dy, tile), 0.0);
+    }
+  }
+  return sum / f32(taps.x * taps.y);
+}
+
 fn distance_from_clip_rect_impl(position: vec2<f32>, clip_bounds: Bounds) -> vec4<f32> {
     let tl = position - clip_bounds.origin;
     let br = clip_bounds.origin + clip_bounds.size - position;
@@ -1439,7 +1467,7 @@ fn vs_poly_sprite(@builtin(vertex_index) vertex_id: u32, @builtin(instance_index
 @fragment
 fn fs_poly_sprite(input: PolySpriteVarying) -> @location(0) vec4<f32> {
     let sprite = load_poly_sprite(input.sprite_id);
-    let sample = textureSample(t_sprite, s_sprite, clamp_to_tile(input.tile_position, sprite.tile));
+    let sample = sample_tile(input.tile_position, dpdx(input.tile_position), dpdy(input.tile_position), sprite.tile);
     // Alpha clip after using the derivatives.
     if (any(input.clip_distances < vec4<f32>(0.0))) {
         return vec4<f32>(0.0);
