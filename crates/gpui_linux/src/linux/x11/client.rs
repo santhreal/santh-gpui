@@ -1374,11 +1374,9 @@ impl X11Client {
                     // when the window is blocked
                     let style = CursorStyle::Arrow;
 
-                    let current_style = state
-                        .cursor_styles
-                        .get(&window.x_window)
-                        .unwrap_or(&CursorStyle::Arrow);
-                    if *current_style != style
+                    // A window whose cursor was never set shows its
+                    // parent's, so the arrow is set, not assumed.
+                    if state.cursor_styles.get(&window.x_window) != Some(&style)
                         && let Some(cursor) = state.get_cursor_icon(style)
                     {
                         state.cursor_styles.insert(window.x_window, style);
@@ -1852,16 +1850,13 @@ impl LinuxClient for X11Client {
         let Some(focused_window) = state.mouse_focused_window else {
             return;
         };
-        let current_style = state
-            .cursor_styles
-            .get(&focused_window)
-            .unwrap_or(&CursorStyle::Arrow);
-
         let window = state
             .mouse_focused_window
             .and_then(|w| state.windows.get(&w));
 
-        let should_change = *current_style != style
+        // A window whose cursor was never set shows its parent's, the
+        // root's or a frame's, so the arrow is set, not assumed.
+        let should_change = state.cursor_styles.get(&focused_window) != Some(&style)
             && (window.is_none() || window.is_some_and(|w| !w.is_blocked()));
 
         if !should_change {
