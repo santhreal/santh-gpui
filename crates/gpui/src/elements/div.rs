@@ -2357,6 +2357,8 @@ impl Interactivity {
             || self.tracked_focus_handle.is_some()
             || self.hover_style.is_some()
             || self.group_hover_style.is_some()
+            || self.active_style.is_some()
+            || self.group_active_style.is_some()
             || self.hover_listener.is_some()
             || !self.mouse_up_listeners.is_empty()
             || !self.mouse_pressure_listeners.is_empty()
@@ -4592,7 +4594,7 @@ mod tests {
     use super::*;
     use crate::{
         AnyWindowHandle, AppContext as _, Context, InputEvent, Keystroke, MouseMoveEvent,
-        TestAppContext, canvas, util::FluentBuilder as _,
+        PlatformInput, TestAppContext, canvas, util::FluentBuilder as _,
     };
     use std::{cell::Cell, rc::Weak};
 
@@ -4926,6 +4928,131 @@ mod tests {
         })
         .unwrap();
         assert_eq!(*hover_transitions.borrow(), [true]);
+    }
+
+    /// A state style an element can carry with no other interactivity.
+    #[derive(Clone, Copy, Debug)]
+    enum StateStyle {
+        Hover,
+        GroupHover,
+        Active,
+        GroupActive,
+    }
+
+    impl StateStyle {
+        const ALL: [StateStyle; 4] = [
+            StateStyle::Hover,
+            StateStyle::GroupHover,
+            StateStyle::Active,
+            StateStyle::GroupActive,
+        ];
+    }
+
+    struct StateStyleTestView {
+        style: StateStyle,
+        width: Rc<Cell<Pixels>>,
+    }
+
+    impl Render for StateStyleTestView {
+        fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+            let width = self.width.clone();
+            let target = div().id("state-style-target").size(px(10.)).child(
+                canvas(
+                    move |bounds, _, _| width.set(bounds.size.width),
+                    |_, _, _, _| {},
+                )
+                .size_full(),
+            );
+            let grow = |style: StyleRefinement| style.size(px(20.));
+            let target = match self.style {
+                StateStyle::Hover => target.hover(grow),
+                StateStyle::GroupHover => target.group_hover("state-group", grow),
+                StateStyle::Active => target.active(grow),
+                StateStyle::GroupActive => target.group_active("state-group", grow),
+            };
+            div()
+                .size_full()
+                .child(div().group("state-group").size(px(50.)).child(target))
+        }
+    }
+
+    // WHY: the class closed here is "a state style that is the element's
+    // only interactivity never applies". An element with nothing but an
+    // active or group-active style got no hitbox, so no press reached
+    // it: a switch whose knob grays while its group is pressed stayed
+    // white. Every state style is enumerated, each alone on its element.
+    // Not covered: a state style on an element that is never painted.
+    #[gpui::test]
+    fn every_state_style_applies_when_it_is_the_only_interactivity(cx: &mut TestAppContext) {
+        let inside = point(px(5.), px(5.));
+        let mut missed = Vec::new();
+        for style in StateStyle::ALL {
+            let width = Rc::new(Cell::new(px(0.)));
+            let window = cx.add_window({
+                let width = width.clone();
+                move |_, _| StateStyleTestView { style, width }
+            });
+            let window = AnyWindowHandle::from(window);
+            let draw = |cx: &mut TestAppContext, input: Option<PlatformInput>| {
+                cx.update_window(window, |_, window, cx| {
+                    if let Some(input) = input {
+                        window.dispatch_event(input, cx);
+                    }
+                    window.draw(cx).clear(cx);
+                })
+                .unwrap();
+            };
+            draw(cx, None);
+            cx.update_window(window, |_, window, cx| {
+                window.simulate_mouse_move(inside, cx);
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            let pressed = match style {
+                StateStyle::Hover | StateStyle::GroupHover => None,
+                StateStyle::Active | StateStyle::GroupActive => {
+                    let at_rest = width.get();
+                    draw(
+                        cx,
+                        Some(
+                            MouseDownEvent {
+                                position: inside,
+                                button: MouseButton::Left,
+                                modifiers: Default::default(),
+                                click_count: 1,
+                                first_mouse: false,
+                            }
+                            .to_platform_input(),
+                        ),
+                    );
+                    Some(at_rest)
+                }
+            };
+            let applied = width.get();
+            if pressed.is_some_and(|at_rest| at_rest != px(10.)) || applied != px(20.) {
+                missed.push(format!(
+                    "{style:?}: {pressed:?} before the press, {applied:?} with the style in effect"
+                ));
+            }
+            if pressed.is_some() {
+                draw(
+                    cx,
+                    Some(
+                        MouseUpEvent {
+                            position: inside,
+                            button: MouseButton::Left,
+                            modifiers: Default::default(),
+                            click_count: 1,
+                        }
+                        .to_platform_input(),
+                    ),
+                );
+                if width.get() != px(10.) {
+                    missed.push(format!("{style:?}: {:?} after the release", width.get()));
+                }
+            }
+        }
+        assert!(missed.is_empty(), "{}", missed.join("\n"));
     }
 
     /// A pointer that leaves the window with no final move inside it (an
