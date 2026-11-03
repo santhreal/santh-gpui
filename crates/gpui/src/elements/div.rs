@@ -3219,11 +3219,13 @@ impl Interactivity {
                 });
             }
 
+            let active_group_hitbox = self
+                .group_active_style
+                .as_ref()
+                .and_then(|group_active| GroupHitboxes::get(&group_active.group, cx));
+            let has_active_style = self.active_style.is_some();
             {
-                let active_group_hitbox = self
-                    .group_active_style
-                    .as_ref()
-                    .and_then(|group_active| GroupHitboxes::get(&group_active.group, cx));
+                let active_state = active_state.clone();
                 let hitbox = hitbox.clone();
                 window.on_mouse_event(move |_: &MouseDownEvent, phase, window, _cx| {
                     if phase == DispatchPhase::Bubble && !window.default_prevented() {
@@ -3234,9 +3236,40 @@ impl Interactivity {
                             *active_state.borrow_mut() = ElementClickedState {
                                 group: group_hovered,
                                 element: element_hovered,
+                                group_over: group_hovered,
+                                element_over: element_hovered && has_active_style,
                             };
                             window.refresh();
                         }
+                    }
+                });
+            }
+
+            // A press shows its active style only while the pointer is
+            // over what it pressed, as a native button does: dragged off,
+            // the control shows at rest, and back on it, pressed again. A
+            // release off it clicks nothing, so a pressed look there would
+            // promise a click the release does not make.
+            if has_active_style || active_group_hitbox.is_some() {
+                {
+                    let active_state = active_state.clone();
+                    let hitbox = hitbox.clone();
+                    window.on_mouse_event(move |_: &MouseMoveEvent, phase, window, _cx| {
+                        if phase == DispatchPhase::Capture {
+                            let group_over =
+                                active_group_hitbox.is_some_and(|id| id.is_hovered(window));
+                            track_press_over(
+                                &active_state,
+                                has_active_style && hitbox.is_hovered(window),
+                                group_over,
+                                window,
+                            );
+                        }
+                    });
+                }
+                window.on_mouse_event(move |_: &MouseExitEvent, phase, window, _cx| {
+                    if phase == DispatchPhase::Capture {
+                        track_press_over(&active_state, false, false, window);
                     }
                 });
             }
@@ -3504,6 +3537,7 @@ impl Interactivity {
                 .get_or_insert_with(Default::default)
                 .borrow();
             if clicked_state.group
+                && clicked_state.group_over
                 && let Some(group) = self.group_active_style.as_ref()
             {
                 style.refine(&group.style)
@@ -3511,6 +3545,7 @@ impl Interactivity {
 
             if let Some(active_style) = self.active_style.as_ref()
                 && clicked_state.element
+                && clicked_state.element_over
             {
                 style.refine(active_style)
             }
@@ -3709,7 +3744,8 @@ pub struct InteractiveElementState {
     pub(crate) transition_state: Option<Rc<RefCell<Option<StyleTransitionState>>>>,
 }
 
-/// Whether or not the element or a group that contains it is clicked by the mouse.
+/// Whether or not the element or a group that contains it is clicked by the mouse,
+/// and whether the pointer of the press is still over what it pressed.
 #[derive(Copy, Clone, Default, Eq, PartialEq)]
 pub struct ElementClickedState {
     /// True if this element's group has been clicked, false otherwise
@@ -3717,11 +3753,39 @@ pub struct ElementClickedState {
 
     /// True if this element has been clicked, false otherwise
     pub element: bool,
+
+    /// True while the group is clicked and the pointer is over its hitbox.
+    /// The group's active style applies only then.
+    pub group_over: bool,
+
+    /// True while the element is clicked and the pointer is over its
+    /// hitbox. The element's active style applies only then; false for
+    /// an element with no active style.
+    pub element_over: bool,
 }
 
 impl ElementClickedState {
     fn is_clicked(&self) -> bool {
         self.group || self.element
+    }
+}
+
+/// Record whether the pointer of a press in `state` is over the pressed
+/// element (`element_over`) and group (`group_over`), and redraw when
+/// either changes, so the active style follows the pointer off the
+/// control and back.
+fn track_press_over(
+    state: &RefCell<ElementClickedState>,
+    element_over: bool,
+    group_over: bool,
+    window: &mut Window,
+) {
+    let mut s = state.borrow_mut();
+    let over = (s.element && element_over, s.group && group_over);
+    if s.is_clicked() && over != (s.element_over, s.group_over) {
+        (s.element_over, s.group_over) = over;
+        drop(s);
+        window.refresh();
     }
 }
 
@@ -5058,6 +5122,127 @@ mod tests {
             }
         }
         assert!(missed.is_empty(), "{}", missed.join("\n"));
+    }
+
+    // WHY: the class closed here is "a press that looks held where its
+    // release clicks nothing". A press dragged off its control kept the
+    // active style until the release, which off the control runs no
+    // click; a native button shows its rest state there and its pressed
+    // state again on return. Both active styles are enumerated, each read
+    // with the pointer on the element, on the group beside it and back,
+    // outside both, back on the element, and gone from the window. A move that
+    // changes what the press is over must leave a frame pending, and one
+    // that changes nothing must not. Not covered: whether the release
+    // clicks, which the click listener reads from the release position.
+    #[gpui::test]
+    fn an_active_style_shows_only_while_the_press_is_over_it(cx: &mut TestAppContext) {
+        let on = point(px(5.), px(5.));
+        let beside = point(px(30.), px(30.));
+        let away = point(px(80.), px(80.));
+        let held = Some(MouseButton::Left);
+        let mut wrong = Vec::new();
+        for style in [StateStyle::Active, StateStyle::GroupActive] {
+            let width = Rc::new(Cell::new(px(0.)));
+            let window = cx.add_window({
+                let width = width.clone();
+                move |_, _| StateStyleTestView { style, width }
+            });
+            let window = AnyWindowHandle::from(window);
+            // Dispatch `input`, then draw; whether it left a frame pending.
+            let send = |cx: &mut TestAppContext, input: PlatformInput| {
+                cx.update_window(window, |_, window, cx| {
+                    window.dispatch_event(input, cx);
+                    let pending = window.invalidator.is_dirty();
+                    window.draw(cx).clear(cx);
+                    pending
+                })
+                .unwrap()
+            };
+            cx.update_window(window, |_, window, cx| {
+                window.draw(cx).clear(cx);
+                window.simulate_mouse_move(on, cx);
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            send(
+                cx,
+                MouseDownEvent {
+                    position: on,
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+            );
+            let group = matches!(style, StateStyle::GroupActive);
+            // A step's pointer, whether the style applies after it, and
+            // whether the step changes that.
+            let steps = [
+                ("pressed on the element", None, true, false),
+                (
+                    "dragged beside it, on the group",
+                    Some(beside),
+                    group,
+                    !group,
+                ),
+                ("back on the element, in the group", Some(on), true, !group),
+                ("dragged outside both", Some(away), false, true),
+                ("moved outside both again", Some(away), false, false),
+                ("back on the element", Some(on), true, true),
+            ];
+            for (step, to, applies, changes) in steps {
+                let pending = to.map(|position| {
+                    send(
+                        cx,
+                        MouseMoveEvent {
+                            position,
+                            delta: Default::default(),
+                            modifiers: Default::default(),
+                            pressed_button: held,
+                        }
+                        .to_platform_input(),
+                    )
+                });
+                let expected = if applies { px(20.) } else { px(10.) };
+                if width.get() != expected || pending.is_some_and(|p| p != changes) {
+                    wrong.push(format!(
+                        "{style:?} {step}: width {:?}, expected {expected:?}; frame pending \
+                         {pending:?}, expected {changes}",
+                        width.get()
+                    ));
+                }
+            }
+            let pending = send(
+                cx,
+                MouseExitEvent {
+                    position: on,
+                    pressed_button: held,
+                    modifiers: Default::default(),
+                }
+                .to_platform_input(),
+            );
+            if width.get() != px(10.) || !pending {
+                wrong.push(format!(
+                    "{style:?} gone from the window: width {:?}, frame pending {pending}",
+                    width.get()
+                ));
+            }
+            send(
+                cx,
+                MouseUpEvent {
+                    position: away,
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+            );
+            if width.get() != px(10.) {
+                wrong.push(format!("{style:?}: {:?} after the release", width.get()));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// A pointer that leaves the window with no final move inside it (an
