@@ -1478,6 +1478,36 @@ impl X11Client {
                 let mut state = self.0.borrow_mut();
                 state.mouse_focused_window = Some(event.event);
                 state.restore_cursor_after_hide();
+                let position = point(
+                    px(event.event_x as f32 / u16::MAX as f32 / state.scale_factor),
+                    px(event.event_y as f32 / u16::MAX as f32 / state.scale_factor),
+                );
+                let pressed_button =
+                    pressed_button_from_mask(event.buttons.first().copied().unwrap_or_default());
+                let modifiers = modifiers_from_xinput_info(event.mods);
+                state.modifiers = modifiers;
+                drop(state);
+                // No motion follows an enter under a pointer at rest: a
+                // window mapped above this one and gone again sends a leave
+                // and an enter at one spot. The move sets hover at the
+                // entry position, as a Wayland enter does.
+                let delta = {
+                    let mut win_state = window.state.borrow_mut();
+                    if win_state.pointer_lock.is_some() {
+                        None
+                    } else {
+                        let prev = win_state.last_mouse_position.replace(position);
+                        Some(prev.map_or(Point::default(), |prev| position - prev))
+                    }
+                };
+                if let Some(delta) = delta {
+                    window.handle_input(PlatformInput::MouseMove(gpui::MouseMoveEvent {
+                        position,
+                        delta,
+                        pressed_button,
+                        modifiers,
+                    }));
+                }
             }
             Event::XinputLeave(event) if event.mode == xinput::NotifyMode::NORMAL => {
                 let mut state = self.0.borrow_mut();
