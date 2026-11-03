@@ -37,6 +37,7 @@ use super::{
     FrameLoop, X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES, gpu_context::WindowGpu,
 };
 
+mod frame_extents;
 mod open_state;
 mod placement;
 mod presentation;
@@ -311,7 +312,11 @@ pub struct X11WindowState {
     decorations: WindowDecorations,
     edge_constraints: Option<EdgeConstraints>,
     pub handle: AnyWindowHandle,
-    last_insets: [u32; 4],
+    /// The client inset last set; see `frame_extents`.
+    client_inset: Option<Pixels>,
+    /// The `_GTK_FRAME_EXTENTS` the window carries, `None` while it carries
+    /// none.
+    frame_extents: Option<[u32; 4]>,
     accesskit_adapter: Option<accesskit_unix::Adapter>,
     /// Root position of the button press the pointer is held from, the
     /// anchor a window manager measures a `_NET_WM_MOVERESIZE` drag from.
@@ -331,6 +336,25 @@ pub(crate) struct X11PointerLock {
 impl X11WindowState {
     fn is_transparent(&self) -> bool {
         self.background_appearance != WindowBackgroundAppearance::Opaque
+    }
+
+    /// The window's frame: the window manager's, or the window's own when
+    /// it asked for one and a compositor blends the frame's transparent
+    /// corners.
+    fn frame(&self) -> Decorations {
+        if !self.compositor_present || matches!(self.decorations, WindowDecorations::Server) {
+            return Decorations::Server;
+        }
+        Decorations::Client {
+            tiling: frame_extents::tiling(
+                self.fullscreen,
+                self.edge_constraints
+                    .as_ref()
+                    .map(EdgeConstraints::to_tiling),
+                self.maximized_horizontal,
+                self.maximized_vertical,
+            ),
+        }
     }
 }
 
@@ -909,7 +933,8 @@ impl X11WindowState {
                 compositor_present,
                 map_waits_for_configure,
                 decorations: WindowDecorations::Server,
-                last_insets: [0, 0, 0, 0],
+                client_inset: None,
+                frame_extents: None,
                 edge_constraints: None,
                 accesskit_adapter: None,
                 press_root: None,
@@ -1173,6 +1198,7 @@ impl X11WindowStatePtr {
             }
         }
 
+        self.update_frame_extents(&mut state);
         Ok(())
     }
 
@@ -1224,7 +1250,42 @@ impl X11WindowStatePtr {
             set_wm_hints_urgency(&self.xcb, self.x_window, false);
         }
 
+        self.update_frame_extents(&mut state);
         Ok(())
+    }
+
+    /// Writes the `_GTK_FRAME_EXTENTS` the window's frame, tiling and client
+    /// inset call for, or deletes the property when they call for none. A
+    /// window manager reads the property on every change.
+    fn update_frame_extents(&self, state: &mut X11WindowState) {
+        let inset = state
+            .client_inset
+            .map(|inset| (f32::from(inset) * state.scale_factor).round() as u32);
+        let extents = frame_extents::frame_extents(state.frame(), inset);
+        if state.frame_extents == extents {
+            return;
+        }
+        state.frame_extents = extents;
+        let atom = state.atoms._GTK_FRAME_EXTENTS;
+        match extents {
+            Some(extents) => check_reply(
+                || "X11 ChangeProperty for _GTK_FRAME_EXTENTS failed.",
+                self.xcb.change_property(
+                    xproto::PropMode::REPLACE,
+                    self.x_window,
+                    atom,
+                    xproto::AtomEnum::CARDINAL,
+                    size_of::<u32>() as u8 * 8,
+                    4,
+                    bytemuck::cast_slice::<u32, u8>(&extents),
+                ),
+            ),
+            None => check_reply(
+                || "X11 DeleteProperty for _GTK_FRAME_EXTENTS failed.",
+                self.xcb.delete_property(self.x_window, atom),
+            ),
+        }
+        .log_err();
     }
 
     pub fn add_child(&self, child: xproto::Window) {
@@ -1584,7 +1645,7 @@ impl PlatformWindow for X11Window {
             WindowBounds::Maximized(state.bounds)
         } else {
             let mut bounds = state.bounds;
-            let [left, right, top, bottom] = state.last_insets;
+            let [left, right, top, bottom] = state.frame_extents.unwrap_or_default();
 
             let [left, right, top, bottom] = [
                 px((left as f32) / state.scale_factor),
@@ -2127,80 +2188,13 @@ impl PlatformWindow for X11Window {
     }
 
     fn window_decorations(&self) -> gpui::Decorations {
-        let state = self.0.state.borrow();
-
-        // A frame the window draws itself needs a compositor to blend its
-        // transparent corners.
-        if !state.compositor_present {
-            return Decorations::Server;
-        }
-
-        match state.decorations {
-            WindowDecorations::Server => Decorations::Server,
-            WindowDecorations::Client => {
-                let tiling = if state.fullscreen {
-                    Tiling::tiled()
-                } else if let Some(edge_constraints) = &state.edge_constraints {
-                    edge_constraints.to_tiling()
-                } else {
-                    // https://source.chromium.org/chromium/chromium/src/+/main:ui/ozone/platform/x11/x11_window.cc;l=2519;drc=1f14cc876cc5bf899d13284a12c451498219bb2d
-                    Tiling {
-                        top: state.maximized_vertical,
-                        bottom: state.maximized_vertical,
-                        left: state.maximized_horizontal,
-                        right: state.maximized_horizontal,
-                    }
-                };
-                Decorations::Client { tiling }
-            }
-        }
+        self.0.state.borrow().frame()
     }
 
     fn set_client_inset(&self, inset: Pixels) {
         let mut state = self.0.state.borrow_mut();
-
-        let dp = (f32::from(inset) * state.scale_factor) as u32;
-
-        let insets = if state.fullscreen {
-            [0, 0, 0, 0]
-        } else if let Some(edge_constraints) = &state.edge_constraints {
-            let left = if edge_constraints.left_tiled { 0 } else { dp };
-            let top = if edge_constraints.top_tiled { 0 } else { dp };
-            let right = if edge_constraints.right_tiled { 0 } else { dp };
-            let bottom = if edge_constraints.bottom_tiled { 0 } else { dp };
-
-            [left, right, top, bottom]
-        } else {
-            let (left, right) = if state.maximized_horizontal {
-                (0, 0)
-            } else {
-                (dp, dp)
-            };
-            let (top, bottom) = if state.maximized_vertical {
-                (0, 0)
-            } else {
-                (dp, dp)
-            };
-            [left, right, top, bottom]
-        };
-
-        if state.last_insets != insets {
-            state.last_insets = insets;
-
-            check_reply(
-                || "X11 ChangeProperty for _GTK_FRAME_EXTENTS failed.",
-                self.0.xcb.change_property(
-                    xproto::PropMode::REPLACE,
-                    self.0.x_window,
-                    state.atoms._GTK_FRAME_EXTENTS,
-                    xproto::AtomEnum::CARDINAL,
-                    size_of::<u32>() as u8 * 8,
-                    4,
-                    bytemuck::cast_slice::<u32, u8>(&insets),
-                ),
-            )
-            .log_err();
-        }
+        state.client_inset = Some(inset);
+        self.0.update_frame_extents(&mut state);
     }
 
     fn request_decorations(&self, mut decorations: gpui::WindowDecorations) {
@@ -2242,18 +2236,10 @@ impl PlatformWindow for X11Window {
             return;
         };
 
-        match decorations {
-            WindowDecorations::Server => {
-                state.decorations = WindowDecorations::Server;
-                let is_transparent = state.is_transparent();
-                state.renderer.update_transparency(is_transparent);
-            }
-            WindowDecorations::Client => {
-                state.decorations = WindowDecorations::Client;
-                let is_transparent = state.is_transparent();
-                state.renderer.update_transparency(is_transparent);
-            }
-        }
+        state.decorations = decorations;
+        let is_transparent = state.is_transparent();
+        state.renderer.update_transparency(is_transparent);
+        self.0.update_frame_extents(&mut state);
 
         drop(state);
         let mut callbacks = self.0.callbacks.borrow_mut();
@@ -2308,7 +2294,7 @@ impl PlatformWindow for X11Window {
         let mut state = self.0.state.borrow_mut();
         let scale = state.scale_factor;
         let bounds = state.bounds;
-        let [left, right, top, bottom] = state.last_insets;
+        let [left, right, top, bottom] = state.frame_extents.unwrap_or_default();
 
         let x = f32::from(bounds.origin.x);
         let y = f32::from(bounds.origin.y);

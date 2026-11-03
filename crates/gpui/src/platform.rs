@@ -2177,6 +2177,14 @@ pub struct WindowOptions {
     /// The platform may ignore requests it cannot satisfy.
     pub window_decorations: Option<WindowDecorations>,
 
+    /// The invisible room, logical pixels, that a window drawing its own
+    /// decorations keeps on each side of its frame for a shadow and resize
+    /// handles, on X11 and Wayland. The window opens with it set, so the
+    /// window manager or compositor places, tiles, and maximizes the frame
+    /// inside it from the first map. `window_bounds` include it. `None`
+    /// keeps no room. See [`crate::Window::client_area`].
+    pub client_inset: Option<Pixels>,
+
     /// Icon image (X11 only)
     pub icon: Option<Arc<image::RgbaImage>>,
 
@@ -2317,6 +2325,7 @@ impl Default for WindowOptions {
             app_id: None,
             window_min_size: None,
             window_decorations: None,
+            client_inset: None,
             tabbing_identifier: None,
         }
     }

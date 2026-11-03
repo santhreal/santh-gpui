@@ -1,10 +1,10 @@
 use crate::{
-    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, DevicePixels,
+    AnyWindowHandle, AtlasKey, AtlasTextureId, AtlasTile, Bounds, Decorations, DevicePixels,
     DispatchEventResult, GpuSpecs, Pixels, PlatformAtlas, PlatformDisplay,
     PlatformHeadlessRenderer, PlatformInput, PlatformInputHandler, PlatformWindow, Point,
     PromptButton, RequestFrameOptions, Scene, SharedString, Size, TestPlatform,
-    TextInputConfiguration, TileId, WindowAppearance, WindowBackgroundAppearance, WindowBounds,
-    WindowControlArea, WindowParams,
+    TextInputConfiguration, TileId, Tiling, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowDecorations, WindowParams,
 };
 use collections::HashMap;
 use gpui_util::ResultExt as _;
@@ -53,6 +53,15 @@ pub(crate) struct TestWindowState {
     /// What [`PlatformWindow::is_subpixel_rendering_supported`] reports.
     /// `false` unless a test sets it.
     pub(crate) subpixel_rendering_supported: bool,
+    /// What [`PlatformWindow::window_decorations`] reports: the platform's
+    /// frame until the window asks for client decorations, untiled until a
+    /// test tiles it.
+    decorations: Decorations,
+    /// The client inset last set.
+    client_inset: Option<Pixels>,
+    /// Whether [`PlatformWindow::map_window`] ran, and the client inset in
+    /// effect when it did.
+    mapped: Option<Option<Pixels>>,
 }
 
 #[derive(Clone)]
@@ -120,6 +129,9 @@ impl TestWindow {
             mouse_position: Point::default(),
             locked_mouse_position: None,
             subpixel_rendering_supported: false,
+            decorations: Decorations::Server,
+            client_inset: None,
+            mapped: None,
         })))
     }
     pub fn simulate_scheduled_frame(&self) -> bool {
@@ -161,6 +173,21 @@ impl TestWindow {
         drop(lock);
         callback(size, scale_factor);
         self.0.lock().resize_callback = Some(callback);
+    }
+
+    /// The client inset the window had when it was mapped: `None` before the
+    /// map, `Some(None)` for a window mapped without one.
+    pub fn client_inset_at_map(&self) -> Option<Option<Pixels>> {
+        self.0.lock().mapped
+    }
+
+    /// Report the client decorations the window asked for as tiled on
+    /// `tiling`'s sides. A window the platform frames stays framed.
+    pub fn simulate_tiling(&self, tiling: Tiling) {
+        let mut state = self.0.lock();
+        if let Decorations::Client { .. } = state.decorations {
+            state.decorations = Decorations::Client { tiling };
+        }
     }
 
     pub(crate) fn simulate_active_status_change(&self, active: bool) {
@@ -617,6 +644,29 @@ impl PlatformWindow for TestWindow {
     }
 
     fn update_ime_position(&self, _bounds: Bounds<Pixels>) {}
+
+    fn request_decorations(&self, decorations: WindowDecorations) {
+        self.0.lock().decorations = match decorations {
+            WindowDecorations::Server => Decorations::Server,
+            WindowDecorations::Client => Decorations::Client {
+                tiling: Tiling::default(),
+            },
+        };
+    }
+
+    fn window_decorations(&self) -> Decorations {
+        self.0.lock().decorations
+    }
+
+    fn set_client_inset(&self, inset: Pixels) {
+        self.0.lock().client_inset = Some(inset);
+    }
+
+    fn map_window(&mut self) -> anyhow::Result<()> {
+        let mut state = self.0.lock();
+        state.mapped = Some(state.client_inset);
+        Ok(())
+    }
 
     fn gpu_specs(&self) -> Option<GpuSpecs> {
         None

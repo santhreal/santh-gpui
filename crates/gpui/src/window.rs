@@ -20,7 +20,7 @@ use crate::{
     ScaledPixels, Scene, Shadow, SharedString, Size, StrikethroughStyle, Style, SubpixelSprite,
     SubscriberSet, Subscription, SystemWindowTab, SystemWindowTabController, TabStopMap,
     TaffyLayoutEngine, Task, TextInputConfiguration, TextRenderingMode, TextStyle,
-    TextStyleRefinement, ThermalState, TransformationMatrix, Underline, UnderlineStyle,
+    TextStyleRefinement, ThermalState, Tiling, TransformationMatrix, Underline, UnderlineStyle,
     WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControls, WindowDecorations,
     WindowOptions, WindowParams, WindowTextSystem, point, prelude::*, px, rems, size,
     transparent_black,
@@ -1566,6 +1566,7 @@ impl Window {
             app_id,
             window_min_size,
             window_decorations,
+            client_inset,
             #[cfg_attr(
                 not(any(target_os = "linux", target_os = "freebsd")),
                 allow(unused_variables)
@@ -1627,6 +1628,11 @@ impl Window {
 
         platform_window
             .request_decorations(window_decorations.unwrap_or(WindowDecorations::Server));
+        // Before the map: a window manager places the window by the frame
+        // inside the room it reads at the map.
+        if let Some(inset) = client_inset {
+            platform_window.set_client_inset(inset);
+        }
         platform_window.set_background_appearance(window_background);
 
         match window_bounds {
@@ -2098,7 +2104,7 @@ impl Window {
             pending_modifier: ModifierState::default(),
             pending_input_observers: SubscriberSet::new(),
             prompt: None,
-            client_inset: None,
+            client_inset,
             image_cache_stack: Vec::new(),
             captured_hitbox: None,
             pointer_locked: None,
@@ -2996,7 +3002,9 @@ impl Window {
         self.platform_window.start_window_move()
     }
 
-    /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11)
+    /// When using client side decorations, set this to the width of the invisible decorations (Wayland and X11).
+    /// A window that opens with a room sets it in [`WindowOptions::client_inset`] instead, so the
+    /// window manager has it from the first map.
     pub fn set_client_inset(&mut self, inset: Pixels) {
         self.client_inset = Some(inset);
         self.platform_window.set_client_inset(inset);
@@ -3005,6 +3013,18 @@ impl Window {
     /// Returns the client_inset value by [`Self::set_client_inset`].
     pub fn client_inset(&self) -> Option<Pixels> {
         self.client_inset
+    }
+
+    /// The window's frame, window-local: the viewport less the client inset on every side the
+    /// window keeps room on. A side tiled against a screen edge or a neighbor keeps none, and
+    /// neither does a window the platform frames ([`Decorations::Server`]) or one with no client
+    /// inset. Tooltips and [`crate::anchored`] elements stay inside it.
+    pub fn client_area(&self) -> Bounds<Pixels> {
+        let viewport = Bounds::new(Point::default(), self.viewport_size);
+        match (self.client_inset, self.window_decorations()) {
+            (Some(inset), Decorations::Client { tiling }) => inset_untiled(viewport, inset, tiling),
+            _ => viewport,
+        }
     }
 
     /// Returns whether the title bar window controls need to be rendered by the application (Wayland and X11)
@@ -3708,7 +3728,7 @@ impl Window {
                     tooltip_request.tooltip.mouse_position,
                     tooltip_request.tooltip.anchor,
                     tooltip_size,
-                    self.viewport_size(),
+                    self.client_area(),
                 ),
                 tooltip_size,
             );
@@ -7772,37 +7792,51 @@ pub fn outline(
 /// The space between a tooltip placed above its element and the element.
 const TOOLTIP_ANCHOR_GAP: Pixels = px(4.);
 
-/// Where a tooltip of `size` goes in a viewport of `viewport`, for a pointer at `mouse` over the
-/// element at `anchor`. The tooltip goes below and right of the pointer. Past the right edge, it
-/// goes left of the pointer, or against the right edge when the left has no room either. Past the
-/// bottom, it goes TOOLTIP_ANCHOR_GAP above the element when the element's top is within the
-/// tooltip's height of the pointer and the space above holds it, so it does not cover the element;
-/// above the pointer when only that space holds it; against the bottom edge otherwise. Neither
-/// coordinate goes below zero.
+/// `bounds` less `inset` on each side `tiling` leaves free.
+fn inset_untiled(bounds: Bounds<Pixels>, inset: Pixels, tiling: Tiling) -> Bounds<Pixels> {
+    let side = |tiled: bool| if tiled { Pixels::ZERO } else { inset };
+    let (left, top) = (side(tiling.left), side(tiling.top));
+    let (right, bottom) = (side(tiling.right), side(tiling.bottom));
+    Bounds::new(
+        point(bounds.origin.x + left, bounds.origin.y + top),
+        size(
+            cmp::max(Pixels::ZERO, bounds.size.width - left - right),
+            cmp::max(Pixels::ZERO, bounds.size.height - top - bottom),
+        ),
+    )
+}
+
+/// Where a tooltip of `size` goes in `area`, the window's client area, for a pointer at `mouse`
+/// over the element at `anchor`. The tooltip goes below and right of the pointer. Past the right
+/// edge, it goes left of the pointer, or against the right edge when the left has no room either.
+/// Past the bottom, it goes TOOLTIP_ANCHOR_GAP above the element when the element's top is within
+/// the tooltip's height of the pointer and the space above holds it, so it does not cover the
+/// element; above the pointer when only that space holds it; against the bottom edge otherwise.
+/// Neither coordinate goes above or left of the area.
 fn tooltip_origin(
     mouse: Point<Pixels>,
     anchor: Bounds<Pixels>,
     size: Size<Pixels>,
-    viewport: Size<Pixels>,
+    area: Bounds<Pixels>,
 ) -> Point<Pixels> {
     let mut origin = mouse + point(px(1.), px(1.));
-    if origin.x + size.width > viewport.width {
+    if origin.x + size.width > area.right() {
         let left = mouse.x - size.width - px(1.);
-        origin.x = if left >= Pixels::ZERO {
+        origin.x = if left >= area.left() {
             left
         } else {
-            cmp::max(Pixels::ZERO, viewport.width - size.width)
+            cmp::max(area.left(), area.right() - size.width)
         };
     }
-    if origin.y + size.height > viewport.height {
+    if origin.y + size.height > area.bottom() {
         let over_anchor = anchor.top() - TOOLTIP_ANCHOR_GAP - size.height;
         let over_mouse = mouse.y - size.height - px(1.);
-        origin.y = if mouse.y - anchor.top() <= size.height && over_anchor >= Pixels::ZERO {
+        origin.y = if mouse.y - anchor.top() <= size.height && over_anchor >= area.top() {
             over_anchor
-        } else if over_mouse >= Pixels::ZERO {
+        } else if over_mouse >= area.top() {
             over_mouse
         } else {
-            cmp::max(Pixels::ZERO, viewport.height - size.height)
+            cmp::max(area.top(), area.bottom() - size.height)
         };
     }
     origin
@@ -7832,68 +7866,74 @@ mod tests {
 
     // WHY: a tooltip that does not fit below the pointer goes above its element, not over it:
     // placed above the pointer, it covered the top of a small button near a window's bottom
-    // edge. Every placement of a tooltip that fits the viewport stays inside it. A tall element
-    // keeps the tooltip above the pointer, and a viewport with no room above pins the tooltip to
-    // the edge. Not covered: the paint of the tooltip's view.
+    // edge. Every placement of a tooltip that fits the client area stays inside it, including
+    // an area inset from the window's corner by a client inset, where a tooltip placed by the
+    // viewport alone lands on the invisible room around the frame. A tall element keeps the
+    // tooltip above the pointer, and an area with no room above pins the tooltip to the edge.
+    // Every case runs at two area origins. Not covered: the paint of the tooltip's view.
     #[test]
     fn a_tooltip_goes_above_its_element_when_it_does_not_fit_below() {
         use super::{TOOLTIP_ANCHOR_GAP, tooltip_origin};
-        let viewport = size(px(280.), px(165.));
         let tip = size(px(100.), px(41.));
-        let disc = |x: f32, y: f32| Bounds::new(point(px(x), px(y)), size(px(22.), px(22.)));
-        for x in (0..=258).step_by(6) {
-            for y in (0..=143).step_by(6) {
-                let anchor = disc(x as f32, y as f32);
-                let mouse = anchor.center();
-                let placed = Bounds::new(tooltip_origin(mouse, anchor, tip, viewport), tip);
-                assert!(
-                    placed.left() >= Pixels::ZERO
-                        && placed.top() >= Pixels::ZERO
-                        && placed.right() <= viewport.width
-                        && placed.bottom() <= viewport.height,
-                    "{anchor:?} {placed:?}"
-                );
-                if anchor.top() >= tip.height + TOOLTIP_ANCHOR_GAP {
+        for at in [point(px(0.), px(0.)), point(px(30.), px(20.))] {
+            let area = |w: f32, h: f32| Bounds::new(at, size(px(w), px(h)));
+            let viewport = area(280., 165.);
+            let disc =
+                |x: f32, y: f32| Bounds::new(at + point(px(x), px(y)), size(px(22.), px(22.)));
+            for x in (0..=258).step_by(6) {
+                for y in (0..=143).step_by(6) {
+                    let anchor = disc(x as f32, y as f32);
+                    let mouse = anchor.center();
+                    let placed = Bounds::new(tooltip_origin(mouse, anchor, tip, viewport), tip);
                     assert!(
-                        placed.top() > mouse.y
-                            || placed.bottom() + TOOLTIP_ANCHOR_GAP <= anchor.top(),
-                        "the tooltip covers its element: {anchor:?} {placed:?}"
+                        placed.left() >= viewport.left()
+                            && placed.top() >= viewport.top()
+                            && placed.right() <= viewport.right()
+                            && placed.bottom() <= viewport.bottom(),
+                        "{anchor:?} {placed:?} in {viewport:?}"
                     );
+                    if anchor.top() - viewport.top() >= tip.height + TOOLTIP_ANCHOR_GAP {
+                        assert!(
+                            placed.top() > mouse.y
+                                || placed.bottom() + TOOLTIP_ANCHOR_GAP <= anchor.top(),
+                            "the tooltip covers its element: {anchor:?} {placed:?}"
+                        );
+                    }
                 }
             }
-        }
-        let cases = [
-            // Below and right of the pointer.
-            (viewport, tip, disc(0., 0.), (12., 12.)),
-            // Left of the pointer past the right edge.
-            (viewport, tip, disc(244., 0.), (154., 12.)),
-            // Against the right edge when the left has no room either.
-            (
-                size(px(150.), px(165.)),
-                size(px(120.), px(41.)),
-                disc(50., 0.),
-                (30., 12.),
-            ),
-            // Above the element past the bottom edge.
-            (viewport, tip, disc(20., 120.), (32., 75.)),
-            // Against the bottom edge when nothing above holds the tooltip.
-            (size(px(280.), px(60.)), tip, disc(10., 20.), (22., 19.)),
-        ];
-        for (viewport, tip, anchor, (x, y)) in cases {
-            let mouse = anchor.center();
+            let cases = [
+                // Below and right of the pointer.
+                (viewport, tip, disc(0., 0.), (12., 12.)),
+                // Left of the pointer past the right edge.
+                (viewport, tip, disc(244., 0.), (154., 12.)),
+                // Against the right edge when the left has no room either.
+                (
+                    area(150., 165.),
+                    size(px(120.), px(41.)),
+                    disc(50., 0.),
+                    (30., 12.),
+                ),
+                // Above the element past the bottom edge.
+                (viewport, tip, disc(20., 120.), (32., 75.)),
+                // Against the bottom edge when nothing above holds the tooltip.
+                (area(280., 60.), tip, disc(10., 20.), (22., 19.)),
+            ];
+            for (viewport, tip, anchor, (x, y)) in cases {
+                let mouse = anchor.center();
+                assert_eq!(
+                    tooltip_origin(mouse, anchor, tip, viewport),
+                    at + point(px(x), px(y)),
+                    "{anchor:?} in {viewport:?}"
+                );
+            }
+            // A tall element keeps the tooltip above the pointer, though the space above the
+            // element holds it.
+            let tall = Bounds::new(at + point(px(0.), px(60.)), size(px(100.), px(100.)));
             assert_eq!(
-                tooltip_origin(mouse, anchor, tip, viewport),
-                point(px(x), px(y)),
-                "{anchor:?} in {viewport:?}"
+                tooltip_origin(at + point(px(50.), px(150.)), tall, tip, viewport),
+                at + point(px(51.), px(108.))
             );
         }
-        // A tall element keeps the tooltip above the pointer, though the space above the element
-        // holds it.
-        let tall = Bounds::new(point(px(0.), px(60.)), size(px(100.), px(100.)));
-        assert_eq!(
-            tooltip_origin(point(px(50.), px(150.)), tall, tip, viewport),
-            point(px(51.), px(108.))
-        );
     }
 
     /// A 240x48 outline of one pixel, rounded by eight, under `mask`.
@@ -8001,6 +8041,80 @@ mod tests {
         fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
             div()
         }
+    }
+
+    // WHY: a window manager learns a client-decorated window's invisible frame room from the
+    // client inset, and one that reads it only when the window maps (GNOME's Mutter reads
+    // _GTK_FRAME_EXTENTS then) draws no shadow for a window that sets it later. The inset given
+    // in WindowOptions reaches the platform before the map. The client area is the viewport less
+    // that inset on each untiled side, and the whole viewport for a platform-framed window or one
+    // with no inset, at every one of the sixteen tilings. Not covered: what a platform does with
+    // the inset; each platform backend tests its own frame-extents encoding.
+    #[gpui::test]
+    fn a_client_inset_is_set_before_the_map_and_bounds_the_client_area(cx: &mut TestAppContext) {
+        use crate::{Tiling, WindowBounds, WindowDecorations};
+        let open = |cx: &mut TestAppContext, decorations, client_inset| {
+            let window = cx
+                .update(|cx| {
+                    cx.open_window(
+                        WindowOptions {
+                            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                point(px(100.), px(50.)),
+                                size(px(400.), px(300.)),
+                            ))),
+                            window_decorations: Some(decorations),
+                            client_inset,
+                            ..Default::default()
+                        },
+                        |_, cx| cx.new(|_| EmptyView),
+                    )
+                })
+                .unwrap();
+            (window, cx.test_window(window.into()))
+        };
+        let area = |cx: &mut TestAppContext, window: crate::WindowHandle<EmptyView>| {
+            window
+                .update(cx, |_, window, _| window.client_area())
+                .unwrap()
+        };
+        let rect =
+            |x: f32, y: f32, w: f32, h: f32| Bounds::new(point(px(x), px(y)), size(px(w), px(h)));
+
+        let (window, test_window) = open(cx, WindowDecorations::Client, Some(px(20.)));
+        assert_eq!(test_window.client_inset_at_map(), Some(Some(px(20.))));
+        assert_eq!(area(cx, window), rect(20., 20., 360., 260.));
+        for bits in 0..16u8 {
+            let tiling = Tiling {
+                top: bits & 1 != 0,
+                left: bits & 2 != 0,
+                right: bits & 4 != 0,
+                bottom: bits & 8 != 0,
+            };
+            test_window.simulate_tiling(tiling);
+            let room = |tiled: bool| if tiled { 0. } else { 20. };
+            let (left, top) = (room(tiling.left), room(tiling.top));
+            let (right, bottom) = (room(tiling.right), room(tiling.bottom));
+            assert_eq!(
+                area(cx, window),
+                rect(left, top, 400. - left - right, 300. - top - bottom),
+                "{tiling:?}"
+            );
+        }
+        test_window.simulate_tiling(Tiling::tiled());
+        assert_eq!(area(cx, window), rect(0., 0., 400., 300.));
+        test_window.simulate_tiling(Tiling {
+            right: true,
+            ..Tiling::default()
+        });
+        assert_eq!(area(cx, window), rect(20., 20., 380., 260.));
+
+        let (framed, framed_test) = open(cx, WindowDecorations::Server, Some(px(20.)));
+        assert_eq!(framed_test.client_inset_at_map(), Some(Some(px(20.))));
+        assert_eq!(area(cx, framed), rect(0., 0., 400., 300.));
+
+        let (bare, bare_test) = open(cx, WindowDecorations::Client, None);
+        assert_eq!(bare_test.client_inset_at_map(), Some(None));
+        assert_eq!(area(cx, bare), rect(0., 0., 400., 300.));
     }
 
     struct OpensWindowOnPaint {

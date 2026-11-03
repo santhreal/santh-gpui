@@ -3,7 +3,7 @@ use smallvec::SmallVec;
 use crate::{
     Anchor, AnyElement, App, Axis, Bounds, Display, Edges, Element, GlobalElementId,
     InspectorElementId, IntoElement, LayoutId, ParentElement, Pixels, Point, Position, Size, Style,
-    Window, point, px,
+    Window, point,
 };
 
 /// The state that the anchored element element uses to track its children.
@@ -147,10 +147,7 @@ impl Element for Anchored {
             self.offset,
         );
 
-        let limits = Bounds {
-            origin: Point::default(),
-            size: window.viewport_size(),
-        };
+        let limits = window.client_area();
 
         if self.fit_mode == AnchoredFitMode::SwitchAnchor {
             let mut anchor = self.anchor;
@@ -179,12 +176,10 @@ impl Element for Anchored {
             }
         }
 
-        let client_inset = window.client_inset.unwrap_or(px(0.));
         let edges = match self.fit_mode {
             AnchoredFitMode::SnapToWindowWithMargin(edges) => edges,
             _ => Edges::default(),
-        }
-        .map(|edge| *edge + client_inset);
+        };
 
         // Snap the horizontal edges of the anchored element to the horizontal edges of the window if
         // its horizontal bounds overflow, aligning to the left if it is wider than the limits.
@@ -394,5 +389,82 @@ mod tests {
 
         assert_eq!(menu_bounds.origin, point(px(100.), px(300.)));
         assert_eq!(menu_bounds.size, size(px(200.), px(300.)));
+    }
+
+    // WHY: an anchored element in a client-decorated window snaps to the window's frame, not to
+    // the invisible room the client inset keeps around it for the shadow: a menu that ended in
+    // that room was cut off by nothing and floated past the frame. A side tiled against a screen
+    // edge keeps no room, so a menu there snaps to the viewport edge, and so does every side of a
+    // window the platform frames. Not covered: SwitchAnchor, which reads the same limits.
+    #[gpui::test]
+    fn test_anchored_snaps_to_the_client_area(cx: &mut TestAppContext) {
+        use crate::{Bounds, Tiling, WindowBounds, WindowDecorations, WindowOptions};
+        let menu_at = |cx: &mut TestAppContext, decorations, tiling, position| {
+            let window = cx
+                .update(|cx| {
+                    cx.open_window(
+                        WindowOptions {
+                            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                point(px(0.), px(0.)),
+                                size(px(800.), px(600.)),
+                            ))),
+                            window_decorations: Some(decorations),
+                            client_inset: Some(px(20.)),
+                            ..Default::default()
+                        },
+                        |_, cx| cx.new(|_| AnchoredTestView { position }),
+                    )
+                })
+                .unwrap();
+            cx.test_window(window.into()).simulate_tiling(tiling);
+            window.update(cx, |_, window, _| window.refresh()).unwrap();
+            cx.run_until_parked();
+            window
+                .update(cx, |_, window, _| {
+                    window.rendered_frame.debug_bounds.get("MENU").copied()
+                })
+                .unwrap()
+                .expect("MENU debug bounds not found")
+                .origin
+        };
+        let client = WindowDecorations::Client;
+        let untiled = Tiling::default();
+        let below = point(px(100.), px(500.));
+        let in_the_room = point(px(100.), px(290.));
+        let past_the_right = point(px(700.), px(100.));
+
+        assert_eq!(
+            menu_at(cx, client, untiled, below),
+            point(px(100.), px(280.))
+        );
+        assert_eq!(
+            menu_at(cx, client, untiled, in_the_room),
+            point(px(100.), px(280.))
+        );
+        assert_eq!(
+            menu_at(cx, client, untiled, past_the_right),
+            point(px(580.), px(100.))
+        );
+        let bottom = Tiling {
+            bottom: true,
+            ..Tiling::default()
+        };
+        assert_eq!(
+            menu_at(cx, client, bottom, below),
+            point(px(100.), px(300.))
+        );
+        assert_eq!(
+            menu_at(cx, client, bottom, past_the_right),
+            point(px(580.), px(100.))
+        );
+        let framed = WindowDecorations::Server;
+        assert_eq!(
+            menu_at(cx, framed, untiled, below),
+            point(px(100.), px(300.))
+        );
+        assert_eq!(
+            menu_at(cx, framed, untiled, past_the_right),
+            point(px(600.), px(100.))
+        );
     }
 }
