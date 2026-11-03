@@ -651,6 +651,8 @@ impl Interactivity {
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
     /// passed to the callback is true when the hover starts and false when it ends.
     /// Transitions caused by layout changes under a stationary mouse also invoke the callback.
+    /// A press on the element does not end the hover: while the button is held, the callback
+    /// follows the pointer off the element and back, as it does with no button held.
     /// The imperative API equivalent to [`StatefulInteractiveElement::on_hover`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
@@ -1612,6 +1614,8 @@ pub trait StatefulInteractiveElement: InteractiveElement {
     /// Bind the given callback on the hover start and end events of this element. Note that the boolean
     /// passed to the callback is true when the hover starts and false when it ends.
     /// Transitions caused by layout changes under a stationary mouse also invoke the callback.
+    /// A press on the element does not end the hover: while the button is held, the callback
+    /// follows the pointer off the element and back, as it does with no button held.
     /// The fluent API equivalent to [`Interactivity::on_hover`].
     ///
     /// See [`Context::listener`](crate::Context::listener) to get access to a view's state from this callback.
@@ -3138,14 +3142,16 @@ impl Interactivity {
                     }
                 }
 
+                // A press on the element does not end its hover: a held
+                // click moves the pointer a pixel or two, and hover actions
+                // hidden on that move leave the release to land on the
+                // element beneath them.
                 window.on_mouse_event({
                     let update_hover = update_hover.clone();
                     let hitbox = hitbox.clone();
                     move |_: &MouseMoveEvent, phase, window, cx| {
                         if phase == DispatchPhase::Bubble {
-                            let is_hovered = has_mouse_down.borrow().is_none()
-                                && !cx.has_active_drag()
-                                && hitbox.is_hovered(window);
+                            let is_hovered = !cx.has_active_drag() && hitbox.is_hovered(window);
                             update_hover(is_hovered, window, cx);
                         }
                     }
@@ -4997,6 +5003,95 @@ mod tests {
         })
         .unwrap();
         assert_eq!(*hover_transitions.borrow(), [true]);
+    }
+
+    /// WHY: a press on an element with a click listener reported the
+    /// element unhovered on the first move of the held button, however
+    /// small. A hover listener that reveals actions on a card hid them
+    /// under a click held with a pixel of jitter, so the release clicked
+    /// the card instead of the action. The class closed: a held press
+    /// on the element changes what its hover listener reports. Each step
+    /// asserts the whole transition list, so a spurious false on any
+    /// pressed move, or a missing true on the way back on, fails. Not
+    /// covered: a gpui drag (`on_drag`), which reports no hover while it
+    /// runs, and a press on another element.
+    #[gpui::test]
+    fn hover_listeners_follow_the_pointer_during_a_press(cx: &mut TestAppContext) {
+        let hover_transitions = Rc::new(RefCell::new(Vec::new()));
+        let window = cx.add_window({
+            let hover_transitions = hover_transitions.clone();
+            move |_, _| HoverListenerLayoutTestView {
+                target_left: px(0.),
+                hover_transitions,
+            }
+        });
+        let any_window = AnyWindowHandle::from(window);
+        let on = point(px(10.), px(10.));
+        let pressed_move = |position: Point<Pixels>, delta: Point<Pixels>| {
+            MouseMoveEvent {
+                position,
+                delta,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Default::default(),
+            }
+            .to_platform_input()
+        };
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.draw(cx).clear(cx);
+            window.simulate_mouse_move(on, cx);
+            window.draw(cx).clear(cx);
+            window.dispatch_event(
+                MouseDownEvent {
+                    position: on,
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                    first_mouse: false,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        assert_eq!(*hover_transitions.borrow(), [true]);
+
+        let steps = [
+            (point(px(11.), px(10.)), vec![true]),
+            (point(px(40.), px(10.)), vec![true, false]),
+            (point(px(12.), px(11.)), vec![true, false, true]),
+        ];
+        let mut last = on;
+        for (position, want) in steps {
+            cx.update_window(any_window, |_, window, cx| {
+                window.dispatch_event(pressed_move(position, position - last), cx);
+                window.draw(cx).clear(cx);
+            })
+            .unwrap();
+            last = position;
+            assert_eq!(
+                *hover_transitions.borrow(),
+                want,
+                "after a held move to {position:?}"
+            );
+        }
+
+        cx.update_window(any_window, |_, window, cx| {
+            window.dispatch_event(
+                MouseUpEvent {
+                    position: last,
+                    button: MouseButton::Left,
+                    modifiers: Default::default(),
+                    click_count: 1,
+                }
+                .to_platform_input(),
+                cx,
+            );
+            window.draw(cx).clear(cx);
+        })
+        .unwrap();
+        assert_eq!(*hover_transitions.borrow(), [true, false, true]);
     }
 
     /// A state style an element can carry with no other interactivity.
