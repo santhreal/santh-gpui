@@ -1503,8 +1503,8 @@ pub trait PlatformAtlas {
         build: &mut dyn FnMut() -> Result<Option<(Size<DevicePixels>, Cow<'a, [u8]>)>>,
     ) -> Result<Option<AtlasTile>>;
     /// Removes `key`'s tile, freeing its texture once no tile is left in
-    /// it. Returns whether the atlas held `key`.
-    fn remove(&self, key: &AtlasKey) -> bool;
+    /// it. Returns the tile the atlas held for `key`.
+    fn remove(&self, key: &AtlasKey) -> Option<AtlasTile>;
 
     fn contains(&self, _key: &AtlasKey) -> bool {
         false

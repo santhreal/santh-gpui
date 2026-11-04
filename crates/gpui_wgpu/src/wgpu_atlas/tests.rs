@@ -201,8 +201,8 @@ fn a_tile_removed_right_after_its_insert_leaves_the_atlas_usable() -> anyhow::Re
 /// A scene rendered before an image was dropped still names the image's
 /// texture. Looking that texture up once the atlas freed it must report
 /// nothing for the renderer to skip, not panic mid-frame; and `remove`
-/// reports whether it freed anything, which is what makes the window
-/// refresh. Not caught: a freed slot the atlas already reused.
+/// returns the tile it freed, which is how the window finds what its last
+/// scene drew from it. Not caught: a freed slot the atlas already reused.
 #[test]
 fn a_freed_texture_has_no_view_and_a_second_remove_reports_nothing() -> anyhow::Result<()> {
     let (device, queue) = test_device_and_queue()?;
@@ -210,9 +210,9 @@ fn a_freed_texture_has_no_view_and_a_second_remove_reports_nothing() -> anyhow::
     let tile = insert(&atlas, &image_key(1), size(2, 2), &pattern(5, 2 * 2 * 4));
     assert!(atlas.get_texture_info(tile.texture_id).is_some());
 
-    assert!(atlas.remove(&image_key(1)));
+    assert_eq!(atlas.remove(&image_key(1)), Some(tile));
     assert!(atlas.get_texture_info(tile.texture_id).is_none());
-    assert!(!atlas.remove(&image_key(1)));
+    assert_eq!(atlas.remove(&image_key(1)), None);
     Ok(())
 }
 

@@ -740,8 +740,8 @@ impl PlatformAtlas for TestAtlas {
         Ok(Some(state.tiles[key]))
     }
 
-    fn remove(&self, key: &AtlasKey) -> bool {
-        self.0.lock().tiles.remove(key).is_some()
+    fn remove(&self, key: &AtlasKey) -> Option<AtlasTile> {
+        self.0.lock().tiles.remove(key)
     }
 
     fn contains(&self, key: &AtlasKey) -> bool {

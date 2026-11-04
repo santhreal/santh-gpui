@@ -1988,7 +1988,8 @@ impl WgpuRenderer {
             return;
         }
         // A scene presented again after its image was dropped references a
-        // freed texture; the window refreshes, so skip the stale batch.
+        // freed texture; the views that drew it repaint on the next frame, so
+        // skip the stale batch.
         let Some(texture_info) = self.atlas.get_texture_info(texture_id) else {
             return;
         };

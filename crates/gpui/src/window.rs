@@ -1138,6 +1138,10 @@ pub(crate) struct Frame {
     pub(crate) text_runs: Vec<crate::TextRunLayout>,
     pub(crate) window_control_hitboxes: Vec<(WindowControlArea, Hitbox)>,
     pub(crate) deferred_draws: Vec<DeferredDraw>,
+    /// Each cached view painted this frame, rendered afresh or replayed,
+    /// with the range of the scene's paint log its paint covers. A cached
+    /// view inside one that replayed has no entry: the replay covers it.
+    cached_views: Vec<(EntityId, Range<usize>)>,
     pub(crate) input_handlers: Vec<Option<PlatformInputHandler>>,
     pub(crate) tooltip_requests: Vec<Option<TooltipRequest>>,
     pub(crate) cursor_styles: Vec<CursorStyleRequest>,
@@ -1192,6 +1196,7 @@ impl Frame {
             text_runs: Vec::new(),
             window_control_hitboxes: Vec::new(),
             deferred_draws: Vec::new(),
+            cached_views: Vec::new(),
             input_handlers: Vec::new(),
             tooltip_requests: Vec::new(),
             cursor_styles: Vec::new(),
@@ -1222,6 +1227,7 @@ impl Frame {
         self.hitboxes.clear();
         self.text_runs.clear();
         self.deferred_draws.clear();
+        self.cached_views.clear();
         self.tab_stops.clear();
         self.focus = None;
 
@@ -2392,6 +2398,12 @@ impl Window {
         let Some(bounds) = self.next_frame.scene.painted_bounds_since(scene_index) else {
             return;
         };
+        self.declare_scaled_damage(bounds);
+    }
+
+    /// Declares the window region of `bounds`, a region of the scene in
+    /// device pixels, snapped outward to whole device pixels.
+    fn declare_scaled_damage(&mut self, bounds: Bounds<ScaledPixels>) {
         let scale_factor = self.scale_factor();
         let unscale =
             |value: ScaledPixels, round: fn(f32) -> f32| px(round(value.0) / scale_factor);
@@ -3948,6 +3960,14 @@ impl Window {
         }
     }
 
+    /// Records that cached `view` painted `range` of the frame being drawn,
+    /// rendered afresh or replayed.
+    pub(crate) fn record_cached_view(&mut self, view: EntityId, range: &Range<PaintIndex>) {
+        self.next_frame
+            .cached_views
+            .push((view, range.start.scene_index..range.end.scene_index));
+    }
+
     pub(crate) fn reuse_paint(&mut self, range: Range<PaintIndex>) {
         self.next_frame.cursor_styles.extend(
             self.rendered_frame.cursor_styles
@@ -5330,25 +5350,64 @@ impl Window {
 
     /// Removes an image from the sprite atlas.
     ///
-    /// When the atlas held the image, the window refreshes: the scene it
-    /// last rendered, and any view cached from it, still reference the
-    /// freed tiles, and presenting that scene again would sample a texture
-    /// that no longer exists.
+    /// The scene the window last rendered may still draw the image from the
+    /// freed tiles, and a cached view replays its part of that scene into
+    /// the next one. Each view that drew the image renders afresh on the
+    /// next frame, which repaints the region the image covered, so no frame
+    /// samples a freed tile. A view that did not draw it stays cached.
     pub fn drop_image(&mut self, data: Arc<RenderImage>) -> Result<()> {
-        let mut removed = false;
+        let mut freed = SmallVec::<[AtlasTile; 1]>::new();
         for frame_index in 0..data.frame_count() {
             let params = RenderImageParams {
                 image_id: data.id,
                 frame_index,
             };
-
-            removed |= self.sprite_atlas.remove(&params.into());
+            freed.extend(self.sprite_atlas.remove(&params.into()));
         }
-        if removed {
-            self.refresh();
+        if !freed.is_empty() && self.invalidator.not_drawing() {
+            self.repaint_freed(&freed);
         }
 
         Ok(())
+    }
+
+    /// Marks dirty each view whose paint in the last frame drew from
+    /// `freed`, and declares the region drawn from it as damage.
+    fn repaint_freed(&mut self, freed: &[AtlasTile]) {
+        let stale = self.rendered_frame.scene.sprites_drawn_from(freed);
+        let Some(region) = stale
+            .iter()
+            .map(|&(_, bounds)| bounds)
+            .reduce(|union, bounds| union.union(&bounds))
+        else {
+            return;
+        };
+        let drew =
+            |range: &Range<usize>| stale.iter().any(|(position, _)| range.contains(position));
+        // A deferred draw replays apart from the view that deferred it, so
+        // its view is found by its own range.
+        let views: SmallVec<[EntityId; 4]> = self
+            .rendered_frame
+            .cached_views
+            .iter()
+            .filter(|(_, range)| drew(range))
+            .map(|&(view, _)| view)
+            .chain(
+                self.rendered_frame
+                    .deferred_draws
+                    .iter()
+                    .filter(|draw| {
+                        drew(
+                            &(draw.paint_range.start.scene_index..draw.paint_range.end.scene_index),
+                        )
+                    })
+                    .map(|draw| draw.current_view),
+            )
+            .collect();
+        for view in views {
+            self.mark_view_dirty(view);
+        }
+        self.declare_scaled_damage(region);
     }
 
     /// Returns whether every frame of an image is present in the sprite atlas.
@@ -10104,113 +10163,177 @@ mod tests {
     /// WHY: dropping an image frees its atlas tiles while the scene the
     /// window last rendered still samples them. A window that presented
     /// that scene again, with nothing else invalidated, drew from a freed
-    /// texture and the wgpu renderer panicked. A window whose atlas held a
-    /// dropped image paints afresh, a cached view included, so its next
-    /// scene samples a live tile; a window that never painted the image
-    /// does not re-render. Not caught: an image dropped while a frame is
-    /// drawn, which the renderer skips instead of sampling.
+    /// texture and the wgpu renderer panicked; a window that refreshed
+    /// whole on every drop rebuilt every cached view each time a playing
+    /// video replaced its frame. Each view whose last paint drew the image,
+    /// cached or deferred, renders afresh and samples a live tile, and only
+    /// the region the image covered is repainted. A sibling cached view
+    /// replays, an image no frame draws any more costs no frame, and a
+    /// window that never painted the image does not re-render. Not caught:
+    /// an image dropped while a frame is drawn, which the renderer skips
+    /// instead of sampling.
     mod dropped_images {
         use std::sync::Arc;
 
         use image::{Frame, ImageBuffer, Rgba};
 
         use crate::{
-            AppContext as _, AtlasTextureId, Context, Entity, IntoElement, ParentElement, Render,
-            RenderImage, StyleRefinement, Styled, TestAppContext, Window, WindowHandle, div, img,
-            px,
+            AppContext as _, Context, Entity, IntoElement, ParentElement, PolychromeSprite, Render,
+            RenderImage, StyleRefinement, Styled, TestAppContext, Window, WindowHandle, deferred,
+            div, img, point, px, size,
         };
 
-        fn picture() -> Arc<RenderImage> {
-            let frame = Frame::new(ImageBuffer::from_pixel(4, 4, Rgba([255, 0, 0, 255])));
+        /// A picture `width` pixels square. Widths tell the tiles apart.
+        fn picture(width: u32) -> Arc<RenderImage> {
+            let frame = Frame::new(ImageBuffer::from_pixel(
+                width,
+                width,
+                Rgba([255, 0, 0, 255]),
+            ));
             Arc::new(RenderImage::new([frame]))
+        }
+
+        /// How the stage draws each picture.
+        #[derive(Clone, Copy)]
+        enum Draw {
+            /// The picture renders with the stage.
+            Uncached,
+            /// The picture is a cached view.
+            Cached,
+            /// The picture is a cached view that defers its image.
+            Deferred,
         }
 
         struct Picture {
             image: Arc<RenderImage>,
+            deferred: bool,
             renders: usize,
         }
 
         impl Render for Picture {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
                 self.renders += 1;
-                img(self.image.clone()).w(px(4.)).h(px(4.))
+                let image = img(self.image.clone()).w(px(4.)).h(px(4.));
+                if self.deferred {
+                    div()
+                        .w(px(4.))
+                        .h(px(4.))
+                        .child(deferred(image))
+                        .into_any_element()
+                } else {
+                    image.into_any_element()
+                }
             }
         }
 
         struct Stage {
-            picture: Entity<Picture>,
-            cached: bool,
+            pictures: Vec<Entity<Picture>>,
+            draw: Draw,
+            renders: usize,
         }
 
         impl Render for Stage {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                let stage = div().size_full();
-                if self.cached {
-                    stage.child(
-                        self.picture
-                            .clone()
-                            .cached(StyleRefinement::default().size_full()),
-                    )
-                } else {
-                    stage.child(self.picture.clone())
-                }
+                self.renders += 1;
+                let draw = self.draw;
+                div()
+                    .size_full()
+                    .children(self.pictures.iter().map(|picture| {
+                        match draw {
+                            Draw::Uncached => picture.clone().into_any_element(),
+                            Draw::Cached | Draw::Deferred => picture
+                                .clone()
+                                .cached(StyleRefinement::default().w(px(4.)).h(px(4.)))
+                                .into_any_element(),
+                        }
+                    }))
             }
         }
 
         fn open(
             cx: &mut TestAppContext,
-            image: Arc<RenderImage>,
-            cached: bool,
+            images: &[&Arc<RenderImage>],
+            draw: Draw,
         ) -> WindowHandle<Stage> {
             let window = cx.add_window(|_, cx| Stage {
-                picture: cx.new(|_| Picture { image, renders: 0 }),
-                cached,
+                pictures: images
+                    .iter()
+                    .map(|&image| {
+                        cx.new(|_| Picture {
+                            image: image.clone(),
+                            deferred: matches!(draw, Draw::Deferred),
+                            renders: 0,
+                        })
+                    })
+                    .collect(),
+                draw,
+                renders: 0,
             });
             cx.run_until_parked();
             window
         }
 
-        /// The atlas texture of each image the window's last frame painted.
-        fn textures(cx: &mut TestAppContext, window: WindowHandle<Stage>) -> Vec<AtlasTextureId> {
+        fn drop_image(cx: &mut TestAppContext, image: &Arc<RenderImage>) {
+            cx.update(|cx| cx.drop_image(image.clone(), None));
+            cx.run_until_parked();
+        }
+
+        /// The image sprites the window's last frame painted.
+        fn painted(cx: &mut TestAppContext, window: WindowHandle<Stage>) -> Vec<PolychromeSprite> {
             window
-                .update(cx, |_, window, _| {
-                    window
-                        .painted_images()
+                .update(cx, |_, window, _| window.painted_images())
+                .unwrap()
+        }
+
+        /// The sprite drawn from the picture `width` pixels square.
+        fn sprite_of(sprites: &[PolychromeSprite], width: i32) -> PolychromeSprite {
+            let mut drawn = sprites
+                .iter()
+                .filter(|sprite| sprite.tile.bounds.size.width.0 == width);
+            let sprite = *drawn.next().expect("the frame draws the picture");
+            assert!(drawn.next().is_none(), "the frame draws the picture once");
+            sprite
+        }
+
+        /// How many times the stage, then each picture, rendered.
+        fn renders(cx: &mut TestAppContext, window: WindowHandle<Stage>) -> (usize, Vec<usize>) {
+            window
+                .update(cx, |stage, _, cx| {
+                    let pictures = stage
+                        .pictures
                         .iter()
-                        .map(|sprite| sprite.tile.texture_id)
-                        .collect()
+                        .map(|picture| picture.read(cx).renders)
+                        .collect();
+                    (stage.renders, pictures)
                 })
                 .unwrap()
         }
 
-        fn renders(cx: &mut TestAppContext, window: WindowHandle<Stage>) -> usize {
+        fn holds(
+            cx: &mut TestAppContext,
+            window: WindowHandle<Stage>,
+            image: &RenderImage,
+        ) -> bool {
             window
-                .update(cx, |stage, _, cx| stage.picture.read(cx).renders)
+                .update(cx, |_, window, _| window.has_image_atlas_entry(image))
                 .unwrap()
         }
 
-        fn repaints_after_its_image_is_dropped(cached: bool, cx: &mut TestAppContext) {
-            let image = picture();
-            let window = open(cx, image.clone(), cached);
-            let bystander = open(cx, picture(), cached);
-            let before = textures(cx, window);
-            assert_eq!(before.len(), 1, "the window paints its picture");
+        fn repaints_after_its_image_is_dropped(draw: Draw, cx: &mut TestAppContext) {
+            let image = picture(4);
+            let window = open(cx, &[&image], draw);
+            let bystander = open(cx, &[&picture(4)], draw);
+            let before = sprite_of(&painted(cx, window), 4);
             let bystander_renders = renders(cx, bystander);
 
-            cx.update(|cx| cx.drop_image(image.clone(), None));
-            cx.run_until_parked();
+            drop_image(cx, &image);
 
-            let after = textures(cx, window);
-            assert_eq!(after.len(), 1, "the window still paints its picture");
+            let after = sprite_of(&painted(cx, window), 4);
             assert_ne!(
-                after, before,
+                after.tile, before.tile,
                 "the next frame samples a re-uploaded tile, not the freed one"
             );
-            assert!(
-                window
-                    .update(cx, |_, window, _| window.has_image_atlas_entry(&image))
-                    .unwrap()
-            );
+            assert!(holds(cx, window, &image));
             assert_eq!(
                 renders(cx, bystander),
                 bystander_renders,
@@ -10220,13 +10343,82 @@ mod tests {
 
         #[gpui::test]
         fn a_window_repaints_an_image_dropped_from_its_atlas(cx: &mut TestAppContext) {
-            repaints_after_its_image_is_dropped(false, cx);
+            repaints_after_its_image_is_dropped(Draw::Uncached, cx);
         }
 
         /// See [`a_window_repaints_an_image_dropped_from_its_atlas`].
         #[gpui::test]
         fn a_cached_view_repaints_an_image_dropped_from_its_atlas(cx: &mut TestAppContext) {
-            repaints_after_its_image_is_dropped(true, cx);
+            repaints_after_its_image_is_dropped(Draw::Cached, cx);
+        }
+
+        /// A deferred draw replays apart from the cached view that deferred
+        /// it, so the view is found by the deferred draw's own range.
+        #[gpui::test]
+        fn a_deferred_draw_repaints_an_image_dropped_from_its_atlas(cx: &mut TestAppContext) {
+            repaints_after_its_image_is_dropped(Draw::Deferred, cx);
+        }
+
+        #[gpui::test]
+        fn only_the_view_that_drew_a_dropped_image_renders_again(cx: &mut TestAppContext) {
+            let (dropped, kept) = (picture(4), picture(6));
+            let window = open(cx, &[&dropped, &kept], Draw::Cached);
+            let before = painted(cx, window);
+            let (stage, pictures) = renders(cx, window);
+
+            drop_image(cx, &dropped);
+
+            assert_eq!(
+                renders(cx, window),
+                (stage + 1, vec![pictures[0] + 1, pictures[1]]),
+                "the view that drew the image renders again and its sibling replays"
+            );
+            let after = painted(cx, window);
+            assert_ne!(sprite_of(&after, 4).tile, sprite_of(&before, 4).tile);
+            assert_eq!(sprite_of(&after, 6).tile, sprite_of(&before, 6).tile);
+            let drawn = sprite_of(&before, 4).bounds;
+            let (scale, damage) = window
+                .update(cx, |_, window, _| {
+                    (window.scale_factor(), window.last_frame_damage())
+                })
+                .unwrap();
+            assert_eq!(
+                damage,
+                Some(crate::Bounds::new(
+                    point(px(drawn.origin.x.0 / scale), px(drawn.origin.y.0 / scale)),
+                    size(px(4.), px(4.)),
+                )),
+                "the frame repaints the region the image covered, not the window"
+            );
+        }
+
+        #[gpui::test]
+        fn an_image_no_frame_draws_any_more_costs_no_frame(cx: &mut TestAppContext) {
+            let (dropped, shown) = (picture(4), picture(6));
+            let window = open(cx, &[&dropped], Draw::Cached);
+            window
+                .update(cx, |stage, _, cx| {
+                    stage.pictures[0].update(cx, |picture, cx| {
+                        picture.image = shown.clone();
+                        cx.notify();
+                    })
+                })
+                .unwrap();
+            cx.run_until_parked();
+            assert!(
+                holds(cx, window, &dropped),
+                "the atlas still holds the old picture"
+            );
+            let rendered = renders(cx, window);
+
+            drop_image(cx, &dropped);
+
+            assert!(!holds(cx, window, &dropped));
+            assert_eq!(
+                renders(cx, window),
+                rendered,
+                "no frame is drawn for an image the last frame did not draw"
+            );
         }
     }
 }

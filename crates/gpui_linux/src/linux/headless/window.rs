@@ -288,7 +288,7 @@ impl PlatformAtlas for HeadlessAtlas {
         Ok(Some(tile))
     }
 
-    fn remove(&self, key: &AtlasKey) -> bool {
-        self.0.lock().tiles.remove(key).is_some()
+    fn remove(&self, key: &AtlasKey) -> Option<AtlasTile> {
+        self.0.lock().tiles.remove(key)
     }
 }

@@ -477,6 +477,7 @@ impl<V: View> Element for ViewElement<V> {
 
                             let paint_end = window.paint_index();
                             element_state.paint_range = paint_start..paint_end;
+                            window.record_cached_view(entity_id, &element_state.paint_range);
 
                             ((), element_state)
                         },

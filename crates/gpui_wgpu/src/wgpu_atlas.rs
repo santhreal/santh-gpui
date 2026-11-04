@@ -123,16 +123,14 @@ impl PlatformAtlas for WgpuAtlas {
         }
     }
 
-    fn remove(&self, key: &AtlasKey) -> bool {
+    fn remove(&self, key: &AtlasKey) -> Option<AtlasTile> {
         let mut lock = self.0.lock();
 
-        let Some(tile) = lock.tiles_by_key.remove(key) else {
-            return false;
-        };
+        let tile = lock.tiles_by_key.remove(key)?;
         let id = tile.texture_id;
 
         let Some(texture_slot) = lock.storage[id.kind].textures.get_mut(id.index as usize) else {
-            return true;
+            return Some(tile);
         };
 
         if let Some(mut texture) = texture_slot.take() {
@@ -146,7 +144,7 @@ impl PlatformAtlas for WgpuAtlas {
                 *texture_slot = Some(texture);
             }
         }
-        true
+        Some(tile)
     }
 }
 

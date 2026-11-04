@@ -363,6 +363,39 @@ impl Scene {
             .reduce(|union, bounds| union.union(&bounds))
     }
 
+    /// The position in the paint log and the clipped window region of each
+    /// image sprite drawn from one of `tiles`, in paint order.
+    pub(crate) fn sprites_drawn_from(
+        &self,
+        tiles: &[AtlasTile],
+    ) -> SmallVec<[(usize, Bounds<ScaledPixels>); 1]> {
+        // The sprites are far fewer than the log, so a scene that draws
+        // none of `tiles` costs one pass over the sprites alone.
+        if !self
+            .polychrome_sprites
+            .iter()
+            .any(|sprite| tiles.contains(&sprite.tile))
+        {
+            return SmallVec::new();
+        }
+        self.paint_operations
+            .iter()
+            .enumerate()
+            .filter_map(|(position, operation)| match *operation {
+                PaintOperation::Primitive(PrimitiveRef {
+                    kind: PrimitiveKind::PolychromeSprite,
+                    index,
+                }) => {
+                    let sprite = &self.polychrome_sprites[index as usize];
+                    tiles
+                        .contains(&sprite.tile)
+                        .then(|| (position, sprite.clipped_bounds()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// The clipped window region of the primitive of `kind` at `index`, or
     /// `None` for a layer mask marker, which draws nothing itself.
     fn clipped_bounds_of(&self, kind: PrimitiveKind, index: usize) -> Option<Bounds<ScaledPixels>> {
