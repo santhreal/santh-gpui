@@ -3934,6 +3934,7 @@ pub(crate) fn register_tooltip_mouse_handlers(
                 &build_tooltip,
                 &check_is_hovered,
                 &check_is_hovered_during_prepaint,
+                event.pressed_button.is_some(),
                 tooltip_id,
                 current_view,
                 phase,
@@ -4007,6 +4008,9 @@ fn handle_pressed_tooltip_mouse_move(
 
 /// Handles displaying tooltips when an element is hovered.
 ///
+/// A move with a button held schedules no tooltip: a drag that started elsewhere is passing over
+/// the element, and a tooltip opening there would cover the drag's target.
+///
 /// The mouse hovering logic also relies on being called from window prepaint in order to handle the
 /// case where the element the tooltip is on is not rendered - in that case its mouse listeners are
 /// also not registered. During window prepaint, the hitbox information is not available, so
@@ -4021,6 +4025,7 @@ fn handle_tooltip_mouse_move(
     build_tooltip: &Rc<dyn Fn(&mut Window, &mut App) -> Option<(AnyView, bool)>>,
     check_is_hovered: &Rc<dyn Fn(&Window) -> bool>,
     check_is_hovered_during_prepaint: &Rc<dyn Fn(&Window) -> bool>,
+    held: bool,
     tooltip_id: Option<TooltipId>,
     current_view: EntityId,
     phase: DispatchPhase,
@@ -4041,7 +4046,7 @@ fn handle_tooltip_mouse_move(
     let action = match active_tooltip.borrow().as_ref() {
         None => {
             let is_hovered = check_is_hovered(window);
-            if is_hovered && phase.bubble() {
+            if is_hovered && phase.bubble() && !held {
                 Action::ScheduleShow
             } else {
                 Action::None
@@ -6680,5 +6685,54 @@ mod tests {
             "a press during the show delay let the tooltip open after it"
         );
         assert_eq!(built.get(), 2);
+    }
+
+    /// A drag that started elsewhere and passes over an element opens no tooltip there, held or
+    /// released, until a move with no button held: a tooltip opening mid-drag covers the target
+    /// the drag is heading for. Covers a hold that enters and moves within the element and a
+    /// release over it. Does not cover a drag that starts on the element, which
+    /// `a_press_holds_the_tooltip_back_until_the_pointer_leaves` covers.
+    #[gpui::test]
+    fn a_drag_passing_over_an_element_opens_no_tooltip(cx: &mut TestAppContext) {
+        use crate::{Modifiers, VisualTestContext};
+        let executor = cx.executor();
+        let built = Rc::new(Cell::new(0));
+        let (_, cx) = cx.add_window_view({
+            let built = built.clone();
+            move |_, _| PressTipView { built }
+        });
+        cx.run_until_parked();
+        let inside = point(px(20.), px(20.));
+        let inside_again = point(px(30.), px(30.));
+        let outside = point(px(200.), px(200.));
+        let none = Modifiers::none();
+        let rest = |cx: &mut VisualTestContext| {
+            executor.advance_clock(PRESS_TIP_DELAY * 2);
+            cx.run_until_parked();
+            cx.debug_bounds("press-tip").is_some()
+        };
+
+        cx.simulate_mouse_move(outside, None, none);
+        cx.simulate_mouse_down(outside, MouseButton::Left, none);
+        cx.simulate_mouse_move(inside, MouseButton::Left, none);
+        assert!(
+            !rest(cx),
+            "a held drag entering the element opened its tooltip"
+        );
+        cx.simulate_mouse_move(inside_again, MouseButton::Left, none);
+        assert!(
+            !rest(cx),
+            "a held drag moving over the element opened its tooltip"
+        );
+        cx.simulate_mouse_up(inside_again, MouseButton::Left, none);
+        assert!(
+            !rest(cx),
+            "releasing a drag over the element opened its tooltip"
+        );
+        assert_eq!(built.get(), 0);
+
+        cx.simulate_mouse_move(inside, None, none);
+        assert!(rest(cx), "a free move after the drag shows no tooltip");
+        assert_eq!(built.get(), 1);
     }
 }
