@@ -517,59 +517,58 @@ impl CosmicTextSystemState {
         }
     }
 
+    /// Lay out `text` in `font_runs`, shaping it in segments split at
+    /// [`Self::segment_cuts`]. A line with no cut takes one shaping pass.
     #[profiling::function]
     fn layout_line(&mut self, text: &str, font_size: Pixels, font_runs: &[FontRun]) -> LineLayout {
-        if contains_paragraph_separator(text) {
-            self.layout_line_with_separators(text, font_size, font_runs)
-        } else {
-            self.layout_line_no_separators(text, font_size, font_runs)
+        let cuts = self.segment_cuts(text, font_runs);
+        if cuts.is_empty() {
+            return self.layout_line_no_separators(text, font_size, font_runs);
         }
-    }
-
-    fn layout_line_with_separators(
-        &mut self,
-        text: &str,
-        font_size: Pixels,
-        font_runs: &[FontRun],
-    ) -> LineLayout {
         let mut layout = LineLayout {
             font_size,
             len: text.len(),
             ..Default::default()
         };
-        let mut paragraph_start = 0;
-
-        for (separator_start, separator) in text
-            .char_indices()
-            .filter(|(_, character)| is_paragraph_separator(*character))
-        {
-            let separator_end = separator_start + separator.len_utf8();
-            self.shape_segment(
-                text,
-                paragraph_start..separator_start,
-                font_size,
-                font_runs,
-                &mut layout,
-            );
-            self.shape_segment(
-                text,
-                separator_start..separator_end,
-                font_size,
-                font_runs,
-                &mut layout,
-            );
-            paragraph_start = separator_end;
+        let mut start = 0;
+        for end in cuts.into_iter().chain([text.len()]) {
+            self.shape_segment(text, start..end, font_size, font_runs, &mut layout);
+            start = end;
         }
-
-        self.shape_segment(
-            text,
-            paragraph_start..text.len(),
-            font_size,
-            font_runs,
-            &mut layout,
-        );
-
         layout
+    }
+
+    /// The offsets inside `text` where one shaping segment ends and the
+    /// next starts, ascending: each paragraph separator's start and end,
+    /// since a separator starts a new bidi paragraph, and each run
+    /// boundary where the font features change, since cosmic-text shapes
+    /// spans that differ only in features as one run with the first
+    /// span's features (`Attrs::compatible` compares family, stretch,
+    /// style, and weight).
+    fn segment_cuts(&self, text: &str, font_runs: &[FontRun]) -> SmallVec<[usize; 8]> {
+        let mut cuts = SmallVec::new();
+        if contains_paragraph_separator(text) {
+            for (start, separator) in text
+                .char_indices()
+                .filter(|(_, character)| is_paragraph_separator(*character))
+            {
+                cuts.push(start);
+                cuts.push(start + separator.len_utf8());
+            }
+        }
+        let mut end = 0;
+        for pair in font_runs.windows(2) {
+            end += pair[0].len;
+            if self.loaded_font(pair[0].font_id).features
+                != self.loaded_font(pair[1].font_id).features
+            {
+                cuts.push(end);
+            }
+        }
+        cuts.retain(|cut| 0 < *cut && *cut < text.len());
+        cuts.sort_unstable();
+        cuts.dedup();
+        cuts
     }
 
     fn shape_segment(
@@ -1219,6 +1218,36 @@ mod tests {
             assert!(layout.width > Pixels::ZERO, "{text:?}");
         }
 
+        Ok(())
+    }
+
+    /// cosmic-text shapes spans that differ only in font features as one
+    /// run with the first span's features, so a run with features of its
+    /// own inside a word, such as tabular figures in a time, must be
+    /// shaped apart from its neighbours to keep them.
+    #[test]
+    fn each_run_keeps_its_font_features() -> Result<()> {
+        let text_system = text_system()?;
+        let plain = text_system.font_id(&gpui::font("IBM Plex Sans"))?;
+        let slashed = text_system.font_id(&Font {
+            features: FontFeatures(Arc::new(vec![("zero".into(), 1)])),
+            ..gpui::font("IBM Plex Sans")
+        })?;
+        let glyphs = |runs: &[FontRun]| -> Vec<GlyphId> {
+            let layout = text_system.layout_line("00", gpui::px(14.0), runs);
+            assert_eq!(layout.len, 2);
+            layout
+                .runs
+                .iter()
+                .flat_map(|run| run.glyphs.iter().map(|glyph| glyph.id))
+                .collect()
+        };
+        let one = |font_id| FontRun { len: 1, font_id };
+        let both = |font_id| FontRun { len: 2, font_id };
+        let (zero, slashed_zero) = (glyphs(&[both(plain)])[0], glyphs(&[both(slashed)])[0]);
+        assert_ne!(zero, slashed_zero, "IBM Plex Sans has no `zero` form");
+        assert_eq!(glyphs(&[one(plain), one(slashed)]), [zero, slashed_zero]);
+        assert_eq!(glyphs(&[one(slashed), one(plain)]), [slashed_zero, zero]);
         Ok(())
     }
 
